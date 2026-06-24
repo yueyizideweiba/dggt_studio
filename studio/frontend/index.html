@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DGGT Studio - 4DGS动态物体编辑画布</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部工具栏 -->
+        <header class="toolbar">
+            <div class="toolbar-left">
+                <div class="logo">
+                    <span class="logo-icon">🎬</span>
+                    <span class="logo-text">DGGT Studio</span>
+                </div>
+            </div>
+            <div class="toolbar-center">
+                <div class="frame-controls">
+                    <button id="prevFrame" class="btn btn-icon" title="上一帧">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 6h2v12H6V6zm3.5 6l8.5 6V6l-8.5 6z"/>
+                        </svg>
+                    </button>
+                    <div class="frame-input-group">
+                        <label>帧:</label>
+                        <input type="number" id="frameInput" value="0" min="0">
+                        <span id="totalFrames">/ 0</span>
+                    </div>
+                    <button id="nextFrame" class="btn btn-icon" title="下一帧">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
+                        </svg>
+                    </button>
+                    <button id="playBtn" class="btn btn-primary" title="播放">
+                        <svg id="playIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M8 5v14l11-7z"/>
+                        </svg>
+                        <svg id="pauseIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style="display:none">
+                            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <div class="toolbar-right">
+                <div class="view-mode-toggle">
+                    <button id="view2dBtn" class="btn btn-small view-mode-btn active" title="2D 渲染视图">2D</button>
+                    <button id="view3dBtn" class="btn btn-small view-mode-btn" title="3D 高斯泼溅视图">3D</button>
+                </div>
+                <button id="loadSceneBtn" class="btn btn-secondary">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
+                    </svg>
+                    加载场景
+                </button>
+                <button id="exportBtn" class="btn btn-secondary">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                    </svg>
+                    导出
+                </button>
+            </div>
+        </header>
+
+        <!-- 主内容区 -->
+        <main class="main-content">
+            <!-- 左侧面板 -->
+            <aside class="left-panel">
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>场景信息</h3>
+                        <button id="refreshSceneBtn" class="btn btn-small btn-icon" title="刷新">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div id="sceneInfo" class="scene-info">
+                        <div class="info-item">
+                            <span class="label">场景路径:</span>
+                            <span id="scenePath" class="value">未加载</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">场景ID:</span>
+                            <span id="sceneIdDisplay" class="value">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">总帧数:</span>
+                            <span id="sceneTotalFrames" class="value">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>动态物体列表</h3>
+                        <input type="text" id="objectSearch" placeholder="搜索物体..." class="search-input">
+                    </div>
+                    <div id="objectList" class="object-list">
+                        <div class="empty-state">
+                            <p>请先加载场景</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-corner-case">
+                    <div class="panel-header">
+                        <h3>生成 Corner Case</h3>
+                    </div>
+                    <div id="cornerCasePanel" class="corner-case-panel">
+                        <div class="form-group">
+                            <label>场景类型</label>
+                            <select id="cornerScenarioType" class="cc-select">
+                                <option value="rear-end">追尾事故</option>
+                                <option value="hard-brake">紧急刹车</option>
+                                <option value="lane-change-cutin">变道加塞</option>
+                                <option value="intersection-tbone">路口侧碰 (T-Bone)</option>
+                                <option value="head-on">对向碰撞</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label id="cornerScenarioDesc" class="cc-desc">后车加速撞向前车</label>
+                        </div>
+
+                        <!-- 角色分配：根据场景类型动态生成 -->
+                        <div id="cornerRoles" class="cc-roles"></div>
+
+                        <div class="form-row">
+                            <div class="form-group half">
+                                <label>起始帧</label>
+                                <input type="number" id="cornerStartFrame" value="0" min="0">
+                            </div>
+                            <div class="form-group half">
+                                <label>持续帧数</label>
+                                <input type="number" id="cornerNumFrames" value="20" min="2">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>强度 <span id="cornerIntensityVal">1.0</span></label>
+                            <input type="range" id="cornerIntensity" min="0.3" max="2" step="0.1" value="1.0">
+                        </div>
+
+                        <div class="button-row">
+                            <button id="generateCornerCaseBtn" class="btn btn-primary btn-block">生成事故轨迹</button>
+                        </div>
+                        <div class="button-row">
+                            <button id="clearCornerCaseBtn" class="btn btn-secondary btn-block">清除生成的轨迹</button>
+                        </div>
+                        <div id="cornerCaseStatus" class="cc-status"></div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 中央画布区域 -->
+            <div class="canvas-container">
+                <div class="canvas-wrapper">
+                    <canvas id="mainCanvas" width="1280" height="720"></canvas>
+                    
+                    <!-- 物体覆盖层 -->
+                    <div id="objectOverlay" class="object-overlay"></div>
+                    
+                    <!-- 轨迹可视化层 -->
+                    <svg id="trajectorySvg" class="trajectory-svg"></svg>
+                    
+                    <!-- 选择框 -->
+                    <div id="selectionBox" class="selection-box" style="display:none;"></div>
+
+                    <!-- 3D 高斯泼溅视图容器 -->
+                    <div id="view3dContainer" class="view3d-container" style="display:none;"></div>
+
+                    <!-- 3D 视图工具栏 -->
+                    <div id="view3dToolbar" class="view3d-toolbar" style="display:none;">
+                        <button id="v3dSelectBtn" class="tool-btn active" title="选择 (V)">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M7 2l12 11.2-5.8.5 3.3 7.3-2.2 1-3.2-7.4L7 18.5V2z"/></svg>
+                        </button>
+                        <button id="v3dTranslateBtn" class="tool-btn" title="移动 (G)">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M10 9h4V6h3l-5-5-5 5h3v3zm-1 1H6V7l-5 5 5 5v-3h3v-4zm14 2l-5-5v3h-3v4h3v3l5-5zm-9 3h-4v3H7l5 5 5-5h-3v-3z"/></svg>
+                        </button>
+                        <button id="v3dRotateBtn" class="tool-btn" title="旋转 (R)">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                        </button>
+                        <button id="v3dTrajEditBtn" class="tool-btn" title="编辑运动轨迹（拖动顶点）">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M4 19c4-1 4-12 8-12s4 11 8 10" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="4" cy="19" r="2.5"/><circle cx="12" cy="7" r="2.5"/><circle cx="20" cy="17" r="2.5"/></svg>
+                        </button>
+                        <button id="v3dDeleteBtn" class="tool-btn" title="删除选中物体">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z"/></svg>
+                        </button>
+                        <div class="toolbar-separator"></div>
+                        <button id="v3dBoxesBtn" class="tool-btn active" title="显示/隐藏包围盒">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h18v18H3V3zm2 2v14h14V5H5z"/></svg>
+                        </button>
+                        <button id="v3dTrajBtn" class="tool-btn active" title="显示/隐藏运动轨迹">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M4 19c4-1 4-12 8-12s4 11 8 10" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="4" cy="19" r="2"/><circle cx="20" cy="17" r="2"/></svg>
+                        </button>
+                        <button id="v3dResetViewBtn" class="tool-btn" title="复位视角">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3L2 12h3v8h6v-6h2v6h6v-8h3L12 3z"/></svg>
+                        </button>
+                        <button id="v3dFocusBtn" class="tool-btn" title="聚焦选中物体">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 9a3 3 0 100 6 3 3 0 000-6zm0-7l2.5 3.5h-5L12 2zm0 20l-2.5-3.5h5L12 22zM2 12l3.5-2.5v5L2 12zm20 0l-3.5 2.5v-5L22 12z"/></svg>
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- 画布工具栏 -->
+                <div class="canvas-toolbar">
+                    <button id="selectToolBtn" class="tool-btn active" title="选择工具 (V)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M7 2l12 11.2-5.8.5 3.3 7.3-2.2 1-3.2-7.4L7 18.5V2z"/>
+                        </svg>
+                    </button>
+                    <button id="moveToolBtn" class="tool-btn" title="移动工具 (M)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M10 9h4V6h3l-5-5-5 5h3v3zm-1 1H6V7l-5 5 5 5v-3h3v-4zm14 2l-5-5v3h-3v4h3v3l5-5zm-9 3h-4v3H7l5 5 5-5h-3v-3z"/>
+                        </svg>
+                    </button>
+                    <button id="rotateToolBtn" class="tool-btn" title="旋转工具 (R)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/>
+                        </svg>
+                    </button>
+                    <button id="trajectoryToolBtn" class="tool-btn" title="轨迹编辑工具 (T)">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M21 3L3 10.53v.98l6.84 2.65L12.48 21h.98L21 3z"/>
+                        </svg>
+                    </button>
+                    <div class="toolbar-separator"></div>
+                    <button id="drawTrajectoryBtn" class="tool-btn" title="显示/隐藏轨迹">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/>
+                        </svg>
+                    </button>
+                    <button id="gridBtn" class="tool-btn" title="显示/隐藏网格">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M20 10V8h-4V4h-2v4h-4V4H8v4H4v2h4v4H4v2h4v4h2v-4h4v4h2v-4h4v-2h-4v-4h4zm-6 4h-4v-4h4v4z"/>
+                        </svg>
+                    </button>
+                </div>
+                
+                <!-- 缩放控制 -->
+                <div class="zoom-controls">
+                    <button id="zoomOutBtn" class="btn btn-icon">-</button>
+                    <span id="zoomLevel">100%</span>
+                    <button id="zoomInBtn" class="btn btn-icon">+</button>
+                    <button id="fitToViewBtn" class="btn btn-small">适应视图</button>
+                </div>
+            </div>
+
+            <!-- 右侧面板 -->
+            <aside class="right-panel">
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>选中物体</h3>
+                    </div>
+                    <div id="selectedObjectPanel" class="selected-object-panel">
+                        <div class="empty-state">
+                            <p>点击画布中的物体进行选择</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>编辑历史</h3>
+                    </div>
+                    <div id="historyList" class="history-list">
+                        <div class="empty-state">
+                            <p>暂无编辑记录</p>
+                        </div>
+                    </div>
+                    <div class="history-controls">
+                        <button id="undoBtn" class="btn btn-small btn-secondary" disabled>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/>
+                            </svg>
+                            撤销
+                        </button>
+                        <button id="redoBtn" class="btn btn-small btn-secondary" disabled>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                <path d="M18.4 10.6C16.55 8.99 14.15 8 11.5 8c-4.65 0-8.58 3.03-9.96 7.22L3.9 16c1.05-3.19 4.05-5.5 7.6-5.5 1.95 0 3.73.72 5.12 1.88L13 16h9V7l-3.6 3.6z"/>
+                            </svg>
+                            重做
+                        </button>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- 底部状态栏 -->
+        <footer class="status-bar">
+            <div class="status-left">
+                <span id="statusText" class="status-text">就绪</span>
+            </div>
+            <div class="status-center">
+                <span id="objectCount">物体: 0</span>
+                <span class="separator">|</span>
+                <span id="selectedCount">选中: 0</span>
+            </div>
+            <div class="status-right">
+                <span id="fpsDisplay">FPS: --</span>
+            </div>
+        </footer>
+    </div>
+
+    <!-- 加载场景对话框 -->
+    <div id="loadSceneModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>加载场景</h2>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>场景路径</label>
+                    <input type="text" id="scenePathInput" placeholder="/path/to/scene">
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="loadSkyCheckbox" checked>
+                        加载天空盒
+                    </label>
+                </div>
+                <div class="form-group">
+                    <label>
+                        <input type="checkbox" id="staticOnlyCheckbox">
+                        仅静态场景
+                    </label>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">取消</button>
+                <button id="confirmLoadSceneBtn" class="btn btn-primary">加载</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 导出对话框 -->
+    <div id="exportModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>导出场景</h2>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>导出格式</label>
+                    <select id="exportFormat">
+                        <option value="trajectory">轨迹规格 (JSON)</option>
+                        <option value="scene_spec">场景编辑规格</option>
+                        <option value="video">渲染视频</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>输出路径</label>
+                    <input type="text" id="exportPathInput" placeholder="/path/to/output">
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">取消</button>
+                <button id="confirmExportBtn" class="btn btn-primary">导出</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 轨迹关键帧编辑对话框 -->
+    <div id="keyframeEditorModal" class="modal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h2>轨迹关键帧编辑</h2>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="keyframeTimeline" class="keyframe-timeline">
+                    <!-- 动态生成关键帧时间线 -->
+                </div>
+                <div id="keyframeDetails" class="keyframe-details">
+                    <!-- 显示选中关键帧的详细信息 -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="addKeyframeBtn" class="btn btn-secondary">添加关键帧</button>
+                <button class="btn btn-secondary modal-cancel">取消</button>
+                <button id="saveKeyframesBtn" class="btn btn-primary">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
+    <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
+    <script src="viewer3d.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
