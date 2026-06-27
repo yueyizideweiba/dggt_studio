@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -30,6 +30,7 @@ from dggt_engine import DGGTRenderer, TrajectoryController, CornerCaseGenerator
 sys.path.insert(0, str(Path(__file__).parent))
 from track_manager import TrackManager
 import corner_case
+import quality_report
 
 # 创建FastAPI应用
 app = FastAPI(title="DGGT Studio API V2", version="2.0.0")
@@ -738,6 +739,10 @@ class CornerCaseGenRequest(BaseModel):
     start_frame: int = 0
     num_frames: int = 20
     intensity: float = 1.0
+    enable_physics: bool = True   # 基于包围盒的物理碰撞规则
+    fps: float = 10.0             # 帧率（用于碰撞时间/关键帧计算）
+    sampling_params: Dict[str, Any] = Field(default_factory=dict)
+    sampling_seed: Optional[int] = None
 
 
 @app.post("/api/corner_case/generate")
@@ -745,6 +750,7 @@ async def generate_corner_case(request: CornerCaseGenRequest):
     """基于轨迹编辑生成 corner case 交通事故场景。
 
     底层逻辑：修改相关 track 的轨迹（写入 TrackManager），与渲染/编辑管线统一。
+    启用物理时基于包围盒计算接触距离，避免穿模，并返回碰撞关键帧分析。
     """
     tm = get_track_manager_or_404(request.scene_id)
 
@@ -757,6 +763,15 @@ async def generate_corner_case(request: CornerCaseGenRequest):
             request.start_frame,
             request.num_frames,
             request.intensity,
+            enable_physics=request.enable_physics,
+            fps=request.fps,
+            sampling_params=request.sampling_params,
+            sampling_seed=request.sampling_seed,
+        )
+        result["quality_report"] = quality_report.build_quality_report(
+            tm,
+            result,
+            fps=request.fps,
         )
         if request.scene_id in studio_state["edit_history"]:
             studio_state["edit_history"][request.scene_id].append({
@@ -779,17 +794,73 @@ class CornerCaseClearRequest(BaseModel):
 
 @app.post("/api/corner_case/clear")
 async def clear_corner_case(request: CornerCaseClearRequest):
-    """清除指定 track 的生成轨迹（恢复原始轨迹）。"""
+    """清除指定 track 的生成轨迹（恢复原始轨迹）。合成参与者会被整个移除。"""
     tm = get_track_manager_or_404(request.scene_id)
+    tm.push_history()
+    cleared, removed_synth = [], []
     for tid in request.track_ids:
-        tm.clear_track_edits(tid)
-    return {"success": True, "cleared": request.track_ids}
+        if tm.is_synthetic(tid):
+            tm.remove_synthetic_track(tid)
+            removed_synth.append(int(tid))
+        else:
+            tm.clear_track_edits(tid)
+            cleared.append(int(tid))
+    return {"success": True, "cleared": cleared, "removed_synthetic": removed_synth}
 
 
 @app.get("/api/corner_case/types")
 async def list_corner_case_types():
     """列出支持的 corner case 类型及其角色定义。"""
     return {"success": True, "types": corner_case.list_scenarios()}
+
+
+class CollisionAnalysisRequest(BaseModel):
+    scene_id: str
+    track_a: int
+    track_b: int
+    start_frame: int = 0
+    num_frames: int = 30
+    fps: float = 10.0
+    safety_margin: float = 1.5
+
+
+@app.post("/api/corner_case/analyze_collision")
+async def analyze_collision_endpoint(request: CollisionAnalysisRequest):
+    """分析两个 track 之间的碰撞，识别**最晚反应关键帧**。
+
+    用于自动驾驶系统评估：在 critical_frame 之前必须采取规避动作，
+    否则在 collision_frame 将发生碰撞。返回逐帧距离曲线与关键帧信息。
+    """
+    tm = get_track_manager_or_404(request.scene_id)
+    frames = list(range(request.start_frame, request.start_frame + request.num_frames + 1))
+
+    info = corner_case.analyze_collision(
+        tm, request.track_a, request.track_b, frames,
+        fps=request.fps, safety_margin=request.safety_margin,
+    )
+
+    # 逐帧距离曲线（供前端绘制 + 关键帧高亮）
+    distance_curve = []
+    import numpy as _np
+    for f in frames:
+        pa = tm.get_track_pose(request.track_a, f)
+        pb = tm.get_track_pose(request.track_b, f)
+        if pa is None or pb is None:
+            continue
+        ca = _np.asarray(pa, dtype=_np.float32)[:3, 3]
+        cb = _np.asarray(pb, dtype=_np.float32)[:3, 3]
+        distance_curve.append({
+            "frame_idx": int(f),
+            "distance": float(_np.linalg.norm(ca - cb)),
+        })
+
+    return {
+        "success": True,
+        "track_a": request.track_a,
+        "track_b": request.track_b,
+        "collision_analysis": info,
+        "distance_curve": distance_curve,
+    }
 
 
 @app.post("/api/export/trajectory")
@@ -869,6 +940,7 @@ async def get_scene3d(scene_id: str, frame_idx: int):
                 "center": obj["center"],
                 "dimensions": obj["dimensions"],
                 "edited": obj["edited"],
+                "synthetic": obj.get("synthetic", False),
             })
 
     # 相机参数
@@ -937,6 +1009,8 @@ class FreeViewRenderRequest(BaseModel):
     draw_ids: bool = False
     highlight_track_id: Optional[int] = None
     draw_trajectories: bool = False
+    # 三维极端天气：不是二维贴图；服务端在相机视锥内生成3D粒子并投影渲染
+    weather: Optional[Dict[str, Any]] = None
     # 拖动编辑过程中的临时位姿（未提交），用于实时预览：{track_id, pose_matrix}
     live_track_id: Optional[int] = None
     live_pose_matrix: Optional[List[List[float]]] = None
@@ -951,6 +1025,124 @@ def _fov_to_intrinsics(fov_y_deg: float, width: int, height: int, device: str):
     K = torch.tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
                      device=device, dtype=torch.float32)
     return K
+
+
+def _apply_atmospheric_extinction(image: np.ndarray, weather: Dict[str, Any]) -> np.ndarray:
+    """基于能见度的体积雾/空气散射近似。不是贴图，而是对整幅渲染做物理雾化。"""
+    kind = weather.get("type", "clear")
+    intensity = float(weather.get("intensity", 0.0))
+    if kind == "clear" or intensity <= 0.0:
+        return image
+    visibility = float(weather.get("visibility", 80.0))
+    fog_alpha = float(np.clip(intensity * (1.0 - np.exp(-65.0 / max(1.0, visibility))), 0.0, 0.9))
+    if kind in ("snow", "blizzard"):
+        fog_color = np.array([224, 230, 234], dtype=np.float32)
+    elif kind in ("rain", "storm"):
+        fog_color = np.array([96, 106, 116], dtype=np.float32)
+    else:
+        fog_color = np.array([166, 170, 174], dtype=np.float32)
+
+    img = image.astype(np.float32)
+    out = img * (1.0 - fog_alpha) + fog_color * fog_alpha
+
+    # 垂直方向的空气透视：远处/天空更雾、更低对比；不是贴图，是物理能见度近似。
+    h = image.shape[0]
+    y = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+    sky_haze = (1.0 - y) ** 1.6 * fog_alpha * (0.45 if kind in ("snow", "blizzard", "fog") else 0.28)
+    out = out * (1.0 - sky_haze) + fog_color * sky_haze
+
+    if kind in ("storm", "rain"):
+        out *= (1.0 - (0.18 if kind == "rain" else 0.32) * intensity)  # 暴雨/暴风雨低照度
+        # 微弱蓝灰色调，更接近暴雨天气的白平衡
+        out[..., 2] *= 1.04
+        out[..., 0] *= 0.96
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _stable_weather_seed(kind: str) -> int:
+    seeds = {"rain": 1103, "storm": 2207, "snow": 3301, "blizzard": 4409, "fog": 5501}
+    return seeds.get(kind, 9109)
+
+
+def _render_3d_weather_particles(image: np.ndarray, c2w: torch.Tensor, K: torch.Tensor,
+                                 frame_idx: int, weather: Dict[str, Any]) -> np.ndarray:
+    """持久3D粒子天气场：粒子在相机视锥内循环包裹，避免播放时忽有忽无。"""
+    kind = weather.get("type", "clear")
+    intensity = float(weather.get("intensity", 0.0))
+    if kind == "clear" or intensity <= 0.0:
+        return image
+    h, w = image.shape[:2]
+    scale = w * h / float(960 * 540)
+    base_count = {"rain": 1800, "storm": 3200, "snow": 1400, "blizzard": 2800, "fog": 0}.get(kind, 0)
+    n = int(base_count * np.clip(intensity, 0.05, 2.0) * scale)
+    if n <= 0:
+        return image
+
+    rng = np.random.default_rng(_stable_weather_seed(kind) + int(w) * 3 + int(h) * 5)
+    fx, fy = float(K[0, 0].item()), float(K[1, 1].item())
+    z_near, z_far = 0.8, float(weather.get("depth", 85.0))
+
+    # 使用对数深度：近景粒子更多，远景形成密度层；全部粒子跨帧持久，仅位置包裹循环。
+    z = np.exp(rng.uniform(np.log(z_near), np.log(z_far), n)).astype(np.float32)
+    margin = 96 if kind in ("rain", "storm") else 64
+    u0 = rng.uniform(-margin, w + margin, n).astype(np.float32)
+    v0 = rng.uniform(-margin, h + margin, n).astype(np.float32)
+    phase = rng.uniform(0.0, 1.0, n).astype(np.float32)
+
+    wind = weather.get("wind", [0.0, 0.0]) or [0.0, 0.0]
+    wx = float(wind[0]) if len(wind) > 0 else 0.0
+    wy = float(wind[1]) if len(wind) > 1 else 0.0
+    t = float(frame_idx)
+    depth_speed = np.clip((z_far / z) ** 0.35, 0.55, 3.5)
+
+    if kind in ("rain", "storm"):
+        fall_px = (38.0 if kind == "rain" else 62.0) * (0.65 + intensity) * depth_speed
+        side_px = (wx * 0.9 + 8.0 * np.sin(phase * 6.283)) * depth_speed
+        u = ((u0 + t * side_px * 0.35 + margin) % (w + 2 * margin)) - margin
+        v = ((v0 + t * fall_px + wy * t * 0.25 + margin) % (h + 2 * margin)) - margin
+    else:
+        fall_px = (4.0 if kind == "snow" else 9.0) * (0.6 + intensity) * depth_speed
+        swirl = np.sin(t * 0.18 + phase * 6.283) * (10.0 if kind == "snow" else 24.0)
+        u = ((u0 + wx * t * 0.18 * depth_speed + swirl + margin) % (w + 2 * margin)) - margin
+        v = ((v0 + t * fall_px + wy * t * 0.18 + margin) % (h + 2 * margin)) - margin
+
+    valid = (u >= -margin) & (u < w + margin) & (v >= -margin) & (v < h + margin)
+    u, v, z = u[valid], v[valid], z[valid]
+    near = np.clip(1.0 - z / z_far, 0.08, 1.0)
+    order = np.argsort(z)[::-1]  # 远到近绘制，近景粒子覆盖远景
+    u, v, near, z = u[order], v[order], near[order], z[order]
+
+    canvas = image.copy()
+    overlay = np.zeros_like(canvas)
+
+    if kind in ("rain", "storm"):
+        color_far = np.array([115, 130, 145], dtype=np.float32)
+        color_near = np.array([225, 235, 245], dtype=np.float32)
+        for ui, vi, a, zi in zip(u.astype(np.int32), v.astype(np.int32), near, z):
+            streak = int(np.clip((18 if kind == "rain" else 30) * (0.5 + intensity) * (0.35 + a), 6, 58))
+            dx = int(np.clip(wx * (0.45 + a), -28, 28))
+            thickness = 1 if zi > 8 else 2
+            col = tuple(np.clip(color_far * (1 - a) + color_near * a, 0, 255).astype(np.uint8).tolist())
+            cv2.line(overlay, (ui - dx // 3, vi - streak // 2), (ui + dx, vi + streak), col, thickness, cv2.LINE_AA)
+        alpha = float(np.clip(0.32 + 0.20 * intensity, 0.28, 0.72))
+        canvas = cv2.addWeighted(overlay, alpha, canvas, 1.0, 0)
+        # 近景水汽/水膜轻微模糊，降低锐利度，更接近暴雨镜头。
+        if kind == "storm" and intensity > 0.8:
+            blur = cv2.GaussianBlur(canvas, (0, 0), sigmaX=0.45 + 0.25 * intensity)
+            canvas = cv2.addWeighted(canvas, 0.82, blur, 0.18, 0)
+    elif kind in ("snow", "blizzard"):
+        for ui, vi, a, zi in zip(u.astype(np.int32), v.astype(np.int32), near, z):
+            r = int(np.clip((1.2 if kind == "snow" else 1.8) + a * (3.2 if kind == "snow" else 5.0) * intensity, 1, 7))
+            shade = int(np.clip(190 + 60 * a, 190, 250))
+            cv2.circle(overlay, (ui, vi), r, (shade, shade, shade), -1, cv2.LINE_AA)
+            if kind == "blizzard" and r >= 3:
+                cv2.line(overlay, (ui - int(wx * 0.25), vi - 1), (ui + int(wx * 0.45), vi + 1), (shade, shade, shade), 1, cv2.LINE_AA)
+        alpha = float(np.clip(0.38 + 0.18 * intensity, 0.35, 0.78))
+        canvas = cv2.addWeighted(overlay, alpha, canvas, 1.0, 0)
+        if kind == "blizzard" and intensity > 0.9:
+            blur = cv2.GaussianBlur(canvas, (0, 0), sigmaX=0.25 + 0.18 * intensity)
+            canvas = cv2.addWeighted(canvas, 0.88, blur, 0.12, 0)
+    return np.clip(canvas, 0, 255).astype(np.uint8)
 
 
 @app.post("/api/render/freeview")
@@ -987,6 +1179,8 @@ async def render_freeview(request: FreeViewRenderRequest):
         # 物体覆盖（基于 track 的编辑结果 + 删除）
         tm = None if renderer.static_only else get_track_manager_or_404(request.scene_id)
         object_overrides = tm.build_object_overrides(request.frame_idx) if tm else {}
+        # 合成参与者（自动生成的事故参与者，克隆已有物体的高斯）
+        extra_objects = tm.build_extra_objects(request.frame_idx) if tm else []
 
         # 实时预览：拖动中的临时位姿（未提交）覆盖该 track 在本帧的 raw object
         if tm and request.live_track_id is not None and request.live_pose_matrix is not None:
@@ -994,6 +1188,12 @@ async def render_freeview(request: FreeViewRenderRequest):
             if raw_id is not None:
                 live_pose = torch.tensor(request.live_pose_matrix, device=device).float()
                 object_overrides[raw_id] = live_pose
+            elif tm.is_synthetic(request.live_track_id):
+                # 拖动合成参与者：动态物体高斯为局部坐标，直接使用预览目标位姿。
+                live_pose = np.asarray(request.live_pose_matrix, dtype=np.float32)
+                for ex in extra_objects:
+                    if ex.get("synth_track_id") == request.live_track_id:
+                        ex["transform"] = torch.tensor(live_pose, device=device).float()
 
         image = renderer._render_frame_with_object_overrides(
             request.frame_idx,
@@ -1002,6 +1202,7 @@ async def render_freeview(request: FreeViewRenderRequest):
             K_override=K,
             width_override=request.width,
             height_override=request.height,
+            extra_objects=extra_objects,
         )
 
         # 可选：绘制包围盒/高亮（按 track_id）
@@ -1036,6 +1237,11 @@ async def render_freeview(request: FreeViewRenderRequest):
                 image = draw_trajectory_on_image(
                     image, pts, viewmat, K, color=(255, 200, 0), thickness=2, device=device
                 )
+
+        # 三维极端天气：先做体积雾/能见度衰减，再渲染相机视锥内3D雨雪粒子
+        if request.weather:
+            image = _apply_atmospheric_extinction(image, request.weather)
+            image = _render_3d_weather_particles(image, c2w, K, request.frame_idx, request.weather)
 
         _, buffer = cv2.imencode(".png", cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         image_b64 = base64.b64encode(buffer).decode("utf-8")
@@ -1179,6 +1385,64 @@ async def edit_track_point(request: TrackPointEdit):
         return {"success": True, "track_id": request.track_id, "frame_idx": request.frame_idx}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TrackPointAdaptiveEdit(BaseModel):
+    scene_id: str
+    track_id: int
+    frame_idx: int
+    center: List[float]          # 新的世界坐标中心 [x,y,z]
+    influence: int = 6           # 影响半径（前后多少帧自适应跟随）
+    falloff: str = "smooth"      # smooth | linear | gaussian
+
+
+@app.post("/api/edit/track/point_adaptive")
+async def edit_track_point_adaptive(request: TrackPointAdaptiveEdit):
+    """智能轨迹编辑：拖动某一帧的点，相邻帧按影响范围自适应平滑跟随。
+
+    解决"需要一个个手动调整节点"的问题——拖动一个节点，整条路径自适应调整。
+    """
+    tm = get_track_manager_or_404(request.scene_id)
+    try:
+        tm.push_history()
+        edited = tm.drag_point_adaptive(
+            request.track_id, request.frame_idx, request.center,
+            influence=request.influence, falloff=request.falloff,
+        )
+        if not edited:
+            raise HTTPException(status_code=404, detail="该帧无此 track 或无法编辑")
+        return {
+            "success": True,
+            "track_id": request.track_id,
+            "frame_idx": request.frame_idx,
+            "edited_frames": edited,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TrackSmoothRequest(BaseModel):
+    scene_id: str
+    track_id: int
+    smoothness: float = 0.5
+    keep_endpoints: bool = True
+
+
+@app.post("/api/edit/track/smooth")
+async def smooth_track_endpoint(request: TrackSmoothRequest):
+    """对整条轨迹做平滑，消除手动编辑产生的抖动。"""
+    tm = get_track_manager_or_404(request.scene_id)
+    try:
+        tm.push_history()
+        edited = tm.smooth_track(
+            request.track_id, smoothness=request.smoothness,
+            keep_endpoints=request.keep_endpoints,
+        )
+        return {"success": True, "track_id": request.track_id, "edited_frames": edited}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

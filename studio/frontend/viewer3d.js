@@ -36,6 +36,14 @@ class DGGTViewer3D {
         this.lockHeight = true;     // 轨迹/移动编辑时锁定高度（仅在地面 XZ 平面移动）
         this.trajectory = null;     // 选中 track 的轨迹 {trajectory:[{frame_idx,center,edited}], ...}
 
+        // 智能轨迹编辑：拖动一个节点时整条路径自适应跟随
+        this.adaptiveTrajEdit = true;   // 默认开启智能自适应
+        this.adaptiveInfluence = 6;     // 影响半径（前后帧数）
+        this.criticalFrames = null;     // 碰撞关键帧信息 {critical_frame, collision_frame, ...}
+
+        // 三维极端天气：随渲染请求传给后端，在相机视锥内生成3D粒子
+        this.weather = { type: 'clear', intensity: 0.0, visibility: 80, wind: [0, 0] };
+
         // 轨道相机
         this.target = [0, 0, 0];
         this.radius = 30;
@@ -54,12 +62,17 @@ class DGGTViewer3D {
         // 渲染节流
         this.pendingRender = false;
         this.renderQueued = false;
+        this.renderTimer = null;
+        this.lastRenderRequestedAt = 0;
+        this.renderThrottleMs = 80;
         this.lastC2W = null;
 
-        // 帧图像缓存（用于播放流畅 & 不黑屏）: key=frameIdx -> Image
+        // 帧图像缓存（用于播放流畅 & 不黑屏）: key=frameIdx -> {image: Image, objects: Array}
         this.frameCache = new Map();
         this.cacheLimit = 60;
         this.cacheCameraKey = null;  // 相机不变时缓存才有效
+        this.prefetchInFlight = new Set();
+        this.maxPrefetchInFlight = 3;  // 增加并发预取数量
 
         this.active = false;
         this.initialized = false;
@@ -159,6 +172,11 @@ class DGGTViewer3D {
         // 若选中了 track，刷新它在本帧的轨迹（轨迹本身跨帧不变，只在选中变化时取）
         if (this.selectedTrackId !== null && !this.trajectory) {
             this._fetchTrajectory(this.selectedTrackId);
+        }
+
+        // 先绘制 overlay（如果已有图像），避免完全黑屏
+        if (this.ctx) {
+            this._drawOverlay();
         }
 
         this.requestRender();
@@ -287,8 +305,9 @@ class DGGTViewer3D {
 
     _cameraKey() {
         const c = this._computeC2W();
+        const weatherKey = this.weather ? `${this.weather.type}:${this.weather.intensity}:${this.weather.visibility}:${(this.weather.wind || []).join(',')}` : 'clear';
         return c.map(r => r.map(v => v.toFixed(3)).join(',')).join(';')
-            + `|${this.showBoxes}|${this.showTrajectory}|${this.selectedTrackId}`;
+            + `|${weatherKey}`;
     }
 
     _invalidateCache() {
@@ -298,30 +317,52 @@ class DGGTViewer3D {
 
     // ==================== 渲染请求（节流 + 缓存） ====================
 
-    requestRender() {
+    requestRender(immediate = false) {
         if (!this.active || !this.sceneId) return;
+
+        const scheduleRender = () => {
+            if (this.pendingRender) { this.renderQueued = true; return; }
+            const now = performance.now();
+            const elapsed = now - this.lastRenderRequestedAt;
+            if (!immediate && elapsed < this.renderThrottleMs) {
+                if (this.renderTimer) return;
+                this.renderTimer = setTimeout(() => {
+                    this.renderTimer = null;
+                    this.requestRender(true);
+                }, this.renderThrottleMs - elapsed);
+                return;
+            }
+            this.lastRenderRequestedAt = now;
+            this._doRender();
+        };
 
         // 拖动编辑预览时，始终重新渲染（位姿是临时的，不能用缓存）
         if (this._liveEdit()) {
-            if (this.pendingRender) { this.renderQueued = true; return; }
-            this._doRender();
+            scheduleRender();
             return;
         }
 
         // 缓存命中：相机/显示状态未变且该帧已渲染
         const camKey = this._cameraKey();
         if (this.cacheCameraKey === camKey && this.frameCache.has(this.frameIdx)) {
-            this._blit(this.frameCache.get(this.frameIdx));
+            // 立即显示缓存的图像和对应帧的物体数据，避免黑屏
+            const cached = this.frameCache.get(this.frameIdx);
+            this._blit(cached.image);
+            // 恢复该帧的物体数据，确保包围框和图像严格对应
+            this.objects = cached.objects || [];
             this._drawOverlay();
             return;
         }
+        
+        // 相机改变但有旧图像：先显示旧图像（避免黑屏），然后异步渲染新视角
         if (this.cacheCameraKey !== camKey) {
+            // 保留当前画布内容（不清空），等新图像渲染完成再覆盖
+            // 这样在拖动/缩放时不会出现黑屏
             this.frameCache.clear();
             this.cacheCameraKey = camKey;
         }
 
-        if (this.pendingRender) { this.renderQueued = true; return; }
-        this._doRender();
+        scheduleRender();
     }
 
     async _doRender() {
@@ -343,10 +384,11 @@ class DGGTViewer3D {
                     fov_y: this.fovY,
                     width: this.renderWidth,
                     height: this.renderHeight,
-                    draw_bboxes: this.showBoxes,
-                    draw_ids: this.showBoxes,
-                    draw_trajectories: this.showTrajectory,
+                    draw_bboxes: false,
+                    draw_ids: false,
+                    draw_trajectories: false,
                     highlight_track_id: this.selectedTrackId,
+                    weather: this.weather,
                     live_track_id: live ? live.track_id : null,
                     live_pose_matrix: live ? live.pose : null
                 })
@@ -355,8 +397,12 @@ class DGGTViewer3D {
             if (data && data.success && data.image) {
                 const img = await this._loadImage(data.image);
                 // 拖动预览的图像不写缓存（位姿是临时的）
-                if (!live && this.cacheCameraKey === camKey) {
-                    this.frameCache.set(frameAtRequest, img);
+                if (!live && this.cacheCameraKey === camKey && img) {
+                    // 缓存图像和当前帧的物体数据，确保严格对应
+                    this.frameCache.set(frameAtRequest, {
+                        image: img,
+                        objects: JSON.parse(JSON.stringify(this.objects))  // 深拷贝物体数据
+                    });
                     if (this.frameCache.size > this.cacheLimit) {
                         const first = this.frameCache.keys().next().value;
                         this.frameCache.delete(first);
@@ -373,7 +419,7 @@ class DGGTViewer3D {
             this.pendingRender = false;
             if (this.renderQueued) {
                 this.renderQueued = false;
-                this._doRender();
+                this.requestRender();
             }
         }
     }
@@ -410,25 +456,122 @@ class DGGTViewer3D {
     async prefetchFrame(frameIdx) {
         if (!this.active || !this.sceneId) return;
         if (this.frameCache.has(frameIdx)) return;
+        if (this.pendingRender) return;
+        if (this.prefetchInFlight.has(frameIdx)) return;
+        if (this.prefetchInFlight.size >= this.maxPrefetchInFlight) return;
         const camKey = this._cameraKey();
         if (this.cacheCameraKey !== camKey) return; // 相机变了不预取
+        this.prefetchInFlight.add(frameIdx);
         try {
+            // 先获取该帧的物体信息
+            let frameObjects = [];
+            try {
+                const objResp = await fetch(`${this.apiBase}/scene3d/${this.sceneId}/frame/${frameIdx}`);
+                const objData = await objResp.json();
+                if (objData && objData.success) {
+                    frameObjects = objData.objects || [];
+                }
+            } catch (e) {
+                // 如果获取失败，使用空数组
+            }
+
+            // 再渲染图像
             const resp = await fetch(`${this.apiBase}/render/freeview`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     scene_id: this.sceneId, frame_idx: frameIdx, c2w: this.lastC2W,
                     fov_y: this.fovY, width: this.renderWidth, height: this.renderHeight,
-                    draw_bboxes: this.showBoxes, draw_ids: this.showBoxes,
-                    draw_trajectories: this.showTrajectory, highlight_track_id: this.selectedTrackId
+                    draw_bboxes: false, draw_ids: false,
+                    draw_trajectories: false, highlight_track_id: this.selectedTrackId,
+                    weather: this.weather
                 })
             });
             const data = await resp.json();
             if (data && data.success && data.image && this.cacheCameraKey === camKey) {
                 const img = await this._loadImage(data.image);
-                this.frameCache.set(frameIdx, img);
+                if (img) {
+                    // 将图像和物体数据一起缓存
+                    this.frameCache.set(frameIdx, {
+                        image: img,
+                        objects: frameObjects
+                    });
+                }
             }
         } catch (e) { /* ignore */ }
+        finally { this.prefetchInFlight.delete(frameIdx); }
+    }
+
+    // 播放时的帧加载优化：显示上一帧避免黑屏，异步加载新帧
+    async loadFrameForPlayback(sceneId, frameIdx) {
+        if (!this.initialized) this.init();
+        if (this.sceneId !== sceneId) {
+            await this.loadFrame(sceneId, frameIdx, false);
+            return;
+        }
+        
+        this.frameIdx = frameIdx;
+
+        // 检查缓存
+        const camKey = this._cameraKey();
+        if (this.cacheCameraKey === camKey && this.frameCache.has(frameIdx)) {
+            // 缓存命中：立即显示图像和恢复对应帧的物体数据
+            const cached = this.frameCache.get(frameIdx);
+            this._blit(cached.image);
+            this.objects = cached.objects || [];  // 恢复该帧的物体数据
+            
+            this._drawOverlay();
+            
+            // 预取后续帧
+            this._prefetchNearbyFrames(frameIdx);
+            return;
+        }
+
+        // 缓存未命中：先更新物体信息和overlay，然后异步渲染新图像
+        await this._updateObjectsAsync(sceneId, frameIdx);
+        this._drawOverlay();
+        
+        await this.loadFrame(sceneId, frameIdx, true);
+        
+        // 预取后续帧
+        this._prefetchNearbyFrames(frameIdx);
+    }
+
+    // 异步更新物体信息（不阻塞渲染）
+    async _updateObjectsAsync(sceneId, frameIdx) {
+        try {
+            const resp = await fetch(`${this.apiBase}/scene3d/${sceneId}/frame/${frameIdx}`);
+            const data = await resp.json();
+            if (data && data.success) {
+                this.objects = data.objects || [];
+            }
+        } catch (e) {
+            // 静默失败，不影响播放
+        }
+    }
+
+    // 预取相邻帧（播放优化）
+    _prefetchNearbyFrames(currentFrame) {
+        // 预取接下来的4-5帧（增加预取数量以避免黑屏）
+        const prefetchCount = 5;
+        for (let i = 1; i <= prefetchCount; i++) {
+            const nextFrame = currentFrame + i;
+            if (!this.frameCache.has(nextFrame) && this.prefetchInFlight.size < this.maxPrefetchInFlight) {
+                this.prefetchFrame(nextFrame);
+            }
+        }
+    }
+
+    // 播放前预加载（批量预取前几帧）
+    async preloadForPlayback(startFrame, count = 5) {
+        const promises = [];
+        for (let i = 0; i < count; i++) {
+            const frame = startFrame + i;
+            if (!this.frameCache.has(frame)) {
+                promises.push(this.prefetchFrame(frame));
+            }
+        }
+        await Promise.all(promises);
     }
 
     // ==================== 叠加层 ====================
@@ -440,6 +583,15 @@ class DGGTViewer3D {
         if (!this.lastC2W) return;
         const sx = ow / this.renderWidth;
         const sy = oh / this.renderHeight;
+
+        // 绘制所有动态物体的包围盒
+        if (this.showBoxes && this.objects) {
+            this.objects.forEach(obj => {
+                if (!obj.center || !obj.dimensions) return;
+                const isSelected = obj.track_id === this.selectedTrackId;
+                this._drawBoundingBox(obj, sx, sy, isSelected);
+            });
+        }
 
         // 选中物体高亮圈
         const sel = this.objects.find(o => o.track_id === this.selectedTrackId);
@@ -473,18 +625,54 @@ class DGGTViewer3D {
             });
             this.octx.stroke();
 
-            // 关键点（当前帧高亮，可拖动）
+            // 关键点（当前帧高亮，可拖动；碰撞关键帧特殊标记）
+            // 仅当选中的 track 属于碰撞涉及的 track 时才显示碰撞/最晚反应标注
+            const trackInCollision = this.criticalTracks
+                ? this.criticalTracks.map(Number).includes(Number(this.selectedTrackId))
+                : true;
+            const cf = trackInCollision ? this.criticalFrames : null;
             this._trajScreenPts.forEach(sp => {
                 if (!sp) return;
                 const isCur = sp.frame_idx === this.frameIdx;
-                this.octx.beginPath();
-                this.octx.arc(sp.x, sp.y, isCur ? 6 : 3.5, 0, Math.PI * 2);
-                this.octx.fillStyle = isCur ? '#ffd000' : 'rgba(255,200,0,0.7)';
-                this.octx.fill();
-                if (isCur) {
+                const isCritical = cf && sp.frame_idx === cf.critical_frame;
+                const isCollision = cf && sp.frame_idx === cf.collision_frame;
+
+                if (isCollision) {
+                    // 碰撞帧：红色实心大圆 + 外圈
+                    this.octx.beginPath();
+                    this.octx.arc(sp.x, sp.y, 9, 0, Math.PI * 2);
+                    this.octx.fillStyle = '#ff2b2b';
+                    this.octx.fill();
                     this.octx.strokeStyle = '#fff';
                     this.octx.lineWidth = 2;
                     this.octx.stroke();
+                    this.octx.fillStyle = '#ff2b2b';
+                    this.octx.font = 'bold 12px sans-serif';
+                    this.octx.fillText('碰撞', sp.x + 11, sp.y - 6);
+                } else if (isCritical) {
+                    // 最晚反应关键帧：橙黄色菱形 + 标签
+                    this.octx.save();
+                    this.octx.translate(sp.x, sp.y);
+                    this.octx.rotate(Math.PI / 4);
+                    this.octx.fillStyle = '#ff9500';
+                    this.octx.fillRect(-7, -7, 14, 14);
+                    this.octx.strokeStyle = '#fff';
+                    this.octx.lineWidth = 2;
+                    this.octx.strokeRect(-7, -7, 14, 14);
+                    this.octx.restore();
+                    this.octx.fillStyle = '#ff9500';
+                    this.octx.font = 'bold 12px sans-serif';
+                    this.octx.fillText('最晚反应', sp.x + 11, sp.y + 4);
+                } else {
+                    this.octx.beginPath();
+                    this.octx.arc(sp.x, sp.y, isCur ? 6 : 3.5, 0, Math.PI * 2);
+                    this.octx.fillStyle = isCur ? '#ffd000' : 'rgba(255,200,0,0.7)';
+                    this.octx.fill();
+                    if (isCur) {
+                        this.octx.strokeStyle = '#fff';
+                        this.octx.lineWidth = 2;
+                        this.octx.stroke();
+                    }
                 }
             });
         } else {
@@ -677,8 +865,8 @@ class DGGTViewer3D {
         if (changed) {
             this.trajectory = null;
             this._fetchTrajectory(trackId);
-            this._invalidateCache();  // 高亮变化需重渲染
         }
+        this._drawOverlay();
         this.requestRender();
     }
 
@@ -687,8 +875,7 @@ class DGGTViewer3D {
     deselect() {
         this.selectedTrackId = null;
         this.trajectory = null;
-        this._invalidateCache();
-        this.requestRender();
+        this._drawOverlay();
     }
 
     async _fetchTrajectory(trackId) {
@@ -721,26 +908,146 @@ class DGGTViewer3D {
             this.mode = 'select';        // 退出移动/旋转
             this.showTrajectory = true;  // 强制显示轨迹
             if (!this.trajectory) this._fetchTrajectory(this.selectedTrackId);
-            this._invalidateCache();
         }
         this._updateHint();
         this.canvas.style.cursor = this._sceneLocked() ? 'crosshair' : 'grab';
+        this._drawOverlay();
         this.requestRender();
         return this.trajectoryEditMode;
     }
 
+    // 绘制单个物体的3D包围盒投影
+    _drawBoundingBox(obj, sx, sy, isSelected) {
+        if (!obj.center || !obj.dimensions || !obj.pose_world) return;
+        
+        const [w, h, l] = obj.dimensions;  // width, height, length
+        // 定义包围盒8个顶点（物体坐标系）
+        const corners = [
+            [-w/2, -h/2, -l/2], [w/2, -h/2, -l/2], [w/2, -h/2, l/2], [-w/2, -h/2, l/2],  // 底部4点
+            [-w/2, h/2, -l/2], [w/2, h/2, -l/2], [w/2, h/2, l/2], [-w/2, h/2, l/2]      // 顶部4点
+        ];
+        
+        // 将顶点转换到世界坐标
+        const pose = obj.pose_world;
+        const worldCorners = corners.map(c => {
+            // 旋转 + 平移
+            return [
+                pose[0][0] * c[0] + pose[0][1] * c[1] + pose[0][2] * c[2] + pose[0][3],
+                pose[1][0] * c[0] + pose[1][1] * c[1] + pose[1][2] * c[2] + pose[1][3],
+                pose[2][0] * c[0] + pose[2][1] * c[1] + pose[2][2] * c[2] + pose[2][3]
+            ];
+        });
+        
+        // 投影到屏幕
+        const screenCorners = worldCorners.map(wc => this._worldToScreen(wc, this.lastC2W));
+        
+        // 检查是否有点在视野外
+        const allValid = screenCorners.every(sc => sc !== null);
+        if (!allValid) return;
+        
+        const sc = screenCorners.map(s => ({ x: s.x * sx, y: s.y * sy }));
+        
+        // 绘制包围盒线条
+        this.octx.strokeStyle = isSelected ? '#00c8ff' : 'rgba(78, 205, 196, 0.8)';
+        this.octx.lineWidth = isSelected ? 2 : 1.5;
+        
+        // 底面
+        this.octx.beginPath();
+        this.octx.moveTo(sc[0].x, sc[0].y);
+        this.octx.lineTo(sc[1].x, sc[1].y);
+        this.octx.lineTo(sc[2].x, sc[2].y);
+        this.octx.lineTo(sc[3].x, sc[3].y);
+        this.octx.closePath();
+        this.octx.stroke();
+        
+        // 顶面
+        this.octx.beginPath();
+        this.octx.moveTo(sc[4].x, sc[4].y);
+        this.octx.lineTo(sc[5].x, sc[5].y);
+        this.octx.lineTo(sc[6].x, sc[6].y);
+        this.octx.lineTo(sc[7].x, sc[7].y);
+        this.octx.closePath();
+        this.octx.stroke();
+        
+        // 竖边
+        for (let i = 0; i < 4; i++) {
+            this.octx.beginPath();
+            this.octx.moveTo(sc[i].x, sc[i].y);
+            this.octx.lineTo(sc[i + 4].x, sc[i + 4].y);
+            this.octx.stroke();
+        }
+        
+        // 绘制 track_id 标签（在包围盒顶部中心位置）
+        const centerTop = this._worldToScreen(obj.center, this.lastC2W);
+        if (centerTop) {
+            const labelX = centerTop.x * sx;
+            const labelY = centerTop.y * sy - 15;  // 在中心点上方
+            
+            const label = `T${obj.track_id}`;
+            this.octx.font = 'bold 12px sans-serif';
+            
+            // 绘制背景框
+            const textMetrics = this.octx.measureText(label);
+            const textWidth = textMetrics.width;
+            const padding = 4;
+            
+            this.octx.fillStyle = isSelected ? 'rgba(0, 200, 255, 0.9)' : 'rgba(78, 205, 196, 0.9)';
+            this.octx.fillRect(
+                labelX - textWidth / 2 - padding,
+                labelY - 12,
+                textWidth + padding * 2,
+                16
+            );
+            
+            // 绘制文字
+            this.octx.fillStyle = '#ffffff';
+            this.octx.textAlign = 'center';
+            this.octx.textBaseline = 'middle';
+            this.octx.fillText(label, labelX, labelY - 4);
+        }
+    }
+
     toggleBoxes(show) {
         this.showBoxes = (show === undefined) ? !this.showBoxes : show;
-        this._invalidateCache();
-        this.requestRender();
+        this._drawOverlay();
         return this.showBoxes;
     }
 
     toggleTrajectory(show) {
         this.showTrajectory = (show === undefined) ? !this.showTrajectory : show;
+        this._drawOverlay();
+        return this.showTrajectory;
+    }
+
+    // 设置碰撞关键帧信息（用于在轨迹上高亮最晚反应帧/碰撞帧）
+    // collisionTracks: 仅在这些 track 的轨迹上显示标注（避免误标到无关物体）
+    setCriticalFrames(info, collisionTracks) {
+        this.criticalFrames = info;
+        this.criticalTracks = collisionTracks || (info && [info.attacker, info.victim].filter(v => v !== undefined && v !== null)) || null;
+        this._drawOverlay();
+    }
+
+    clearCriticalFrames() {
+        this.criticalFrames = null;
+        this.criticalTracks = null;
+        this._drawOverlay();
+    }
+
+    // 设置智能轨迹编辑参数
+    setAdaptiveEdit(enabled, influence) {
+        this.adaptiveTrajEdit = !!enabled;
+        if (influence !== undefined) this.adaptiveInfluence = influence;
+    }
+
+    // 设置三维极端天气。后端会在相机视锥内生成3D粒子，而非二维贴图。
+    setWeather(weather) {
+        this.weather = Object.assign({ type: 'clear', intensity: 0.0, visibility: 80, wind: [0, 0] }, weather || {});
         this._invalidateCache();
         this.requestRender();
-        return this.showTrajectory;
+    }
+
+    weatherActive() {
+        return this.weather && this.weather.type && this.weather.type !== 'clear' && Number(this.weather.intensity || 0) > 0;
     }
 
     // ==================== 物体拖动编辑（按 track） ====================
@@ -849,6 +1156,10 @@ class DGGTViewer3D {
         for (let i = 0; i < 3; i++) {
             pt.center[i] += delta[i];
         }
+        // 智能自适应：相邻帧按平滑衰减跟随，整条路径实时弯曲
+        if (this.adaptiveTrajEdit) {
+            this._applyAdaptiveFollow(fi, delta);
+        }
         // 若拖的是当前帧的点，同步更新物体显示并重渲染
         if (fi === this.frameIdx) {
             const obj = this.objects.find(o => o.track_id === this.selectedTrackId);
@@ -863,26 +1174,87 @@ class DGGTViewer3D {
         }
     }
 
+    // 拖动某帧节点时，相邻帧按平滑衰减自适应跟随（前端实时预览，与后端逻辑一致）
+    _applyAdaptiveFollow(fi, delta) {
+        if (!this.trajectory || !this.trajectory.trajectory) return;
+        const pts = this.trajectory.trajectory;
+        const centerPos = pts.findIndex(p => p.frame_idx === fi);
+        if (centerPos < 0) return;
+        const influence = this.adaptiveInfluence || 6;
+        for (let offset = -influence; offset <= influence; offset++) {
+            if (offset === 0) continue;
+            const idx = centerPos + offset;
+            if (idx < 0 || idx >= pts.length) continue;
+            const dist = Math.abs(offset) / influence;
+            if (dist > 1.0) continue;
+            // smoothstep 反向衰减
+            const w = 1.0 - (dist * dist * (3 - 2 * dist));
+            if (w <= 1e-4) continue;
+            for (let i = 0; i < 3; i++) {
+                pts[idx].center[i] += delta[i] * w;
+            }
+        }
+    }
+
     async _commitTrajPoint(frameIdx) {
         if (!this.trajectory) return;
         const pt = this.trajectory.trajectory.find(p => p.frame_idx === frameIdx);
         if (!pt) return;
         try {
-            await fetch(`${this.apiBase}/edit/track/point`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    scene_id: this.sceneId,
-                    track_id: this.selectedTrackId,
-                    frame_idx: frameIdx,
-                    center: pt.center
-                })
-            });
+            if (this.adaptiveTrajEdit) {
+                // 智能模式：拖动一个节点，整条路径自适应平滑跟随
+                await fetch(`${this.apiBase}/edit/track/point_adaptive`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.sceneId,
+                        track_id: this.selectedTrackId,
+                        frame_idx: frameIdx,
+                        center: pt.center,
+                        influence: this.adaptiveInfluence || 6,
+                        falloff: 'smooth'
+                    })
+                });
+            } else {
+                await fetch(`${this.apiBase}/edit/track/point`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.sceneId,
+                        track_id: this.selectedTrackId,
+                        frame_idx: frameIdx,
+                        center: pt.center
+                    })
+                });
+            }
             this.onObjectEdited(this.selectedTrackId, null);
             this._invalidateCache();
             this._fetchTrajectory(this.selectedTrackId);
         } catch (e) {
             console.error('[Viewer3D] 轨迹点回写失败:', e);
+        }
+    }
+
+    // 平滑整条选中轨迹
+    async smoothSelectedTrajectory(smoothness = 0.5) {
+        if (this.selectedTrackId === null) return;
+        try {
+            await fetch(`${this.apiBase}/edit/track/smooth`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.sceneId,
+                    track_id: this.selectedTrackId,
+                    smoothness: smoothness,
+                    keep_endpoints: true
+                })
+            });
+            this._invalidateCache();
+            this._fetchTrajectory(this.selectedTrackId);
+            this.onObjectEdited(this.selectedTrackId, null);
+            this.requestRender();
+        } catch (e) {
+            console.error('[Viewer3D] 平滑轨迹失败:', e);
         }
     }
 

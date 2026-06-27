@@ -38,7 +38,9 @@ class DGGTStudio {
             lastRenderTime: 0,
             frameCount: 0,
             fps: 0,
-            viewMode: '2d'  // '2d' | '3d'
+            viewMode: '2d',  // '2d' | '3d'
+            lastQualityReport: null,
+            lastSamplingParams: null
         };
 
         this.canvas = null;
@@ -122,6 +124,26 @@ class DGGTStudio {
             }
         });
 
+        const v3dAdaptive = document.getElementById('v3dAdaptiveBtn');
+        if (v3dAdaptive) v3dAdaptive.addEventListener('click', () => {
+            if (!this.viewer3d) return;
+            const on = !this.viewer3d.adaptiveTrajEdit;
+            this.viewer3d.setAdaptiveEdit(on);
+            v3dAdaptive.classList.toggle('active', on);
+            this.updateStatus(on ? '智能轨迹已开启：拖动节点整条路径自适应跟随' : '智能轨迹已关闭：仅调整单个节点');
+        });
+
+        const v3dSmooth = document.getElementById('v3dSmoothBtn');
+        if (v3dSmooth) v3dSmooth.addEventListener('click', () => {
+            if (!this.viewer3d) return;
+            if (this.viewer3d.selectedTrackId === null) {
+                this.updateStatus('请先选中一个物体再平滑轨迹');
+                return;
+            }
+            this.viewer3d.smoothSelectedTrajectory(0.5);
+            this.updateStatus('已平滑选中物体的轨迹');
+        });
+
         const v3dDelete = document.getElementById('v3dDeleteBtn');
         if (v3dDelete) v3dDelete.addEventListener('click', () => {
             if (!this.viewer3d) return;
@@ -133,6 +155,52 @@ class DGGTStudio {
                 this.viewer3d.deleteSelected();
             }
         });
+
+        this.setupWeatherControls();
+    }
+
+    setupWeatherControls() {
+        const typeEl = document.getElementById('weatherType');
+        const intEl = document.getElementById('weatherIntensity');
+        const visEl = document.getElementById('weatherVisibility');
+        const applyBtn = document.getElementById('applyWeatherBtn');
+        const clearBtn = document.getElementById('clearWeatherBtn');
+        if (intEl) intEl.addEventListener('input', () => {
+            document.getElementById('weatherIntensityVal').textContent = parseFloat(intEl.value).toFixed(1);
+        });
+        if (visEl) visEl.addEventListener('input', () => {
+            document.getElementById('weatherVisibilityVal').textContent = parseInt(visEl.value);
+        });
+        if (typeEl) typeEl.addEventListener('change', () => this.applyWeatherFromUI(false));
+        if (applyBtn) applyBtn.addEventListener('click', () => this.applyWeatherFromUI(true));
+        if (clearBtn) clearBtn.addEventListener('click', () => {
+            if (typeEl) typeEl.value = 'clear';
+            this.applyWeatherFromUI(true);
+        });
+    }
+
+    getWeatherFromUI() {
+        const type = document.getElementById('weatherType')?.value || 'clear';
+        const intensity = parseFloat(document.getElementById('weatherIntensity')?.value || '1.0');
+        const visibility = parseFloat(document.getElementById('weatherVisibility')?.value || '45');
+        const windX = parseFloat(document.getElementById('weatherWindX')?.value || '0');
+        const windY = parseFloat(document.getElementById('weatherWindY')?.value || '0');
+        return {
+            type,
+            intensity: type === 'clear' ? 0.0 : intensity,
+            visibility,
+            wind: [windX, windY]
+        };
+    }
+
+    applyWeatherFromUI(showStatus = true) {
+        const viewer = this.ensureViewer3d();
+        const weather = this.getWeatherFromUI();
+        viewer.setWeather(weather);
+        if (showStatus) {
+            const names = { clear: '晴朗', rain: '大雨', storm: '暴风雨', snow: '大雪', blizzard: '暴风雪', fog: '浓雾' };
+            this.updateStatus(`已应用三维天气: ${names[weather.type] || weather.type}`);
+        }
     }
 
     ensureViewer3d() {
@@ -168,6 +236,7 @@ class DGGTStudio {
             }
         });
         this.viewer3d.init();
+        this.viewer3d.setWeather(this.getWeatherFromUI());
         return this.viewer3d;
     }
 
@@ -646,6 +715,11 @@ class DGGTStudio {
                 this.state.scenePath = data.scene.scene_path;
                 this.state.totalFrames = data.scene.num_frames;
                 this.state.currentFrame = 0;
+                this.cornerAffectedTracks = [];
+                this.cornerSynthesizedTracks = [];
+                this.state.lastQualityReport = null;
+                this.state.lastSamplingParams = null;
+                this._updateQualityReportButton();
                 this.state.renderCache.clear();
                 
                 document.getElementById('scenePath').textContent = this.state.scenePath;
@@ -1027,21 +1101,29 @@ class DGGTStudio {
         const fps = 10;
         const interval = 1000 / fps;
 
+        // 播放前先预加载前几帧，避免初始黑屏
+        if (viewer.preloadForPlayback) {
+            this.updateStatus('正在预加载帧...');
+            await viewer.preloadForPlayback(this.state.currentFrame, 5);
+            this.updateStatus('播放中...');
+        }
+
         const step = async () => {
             if (!this.state.isPlaying || this.state.viewMode !== '3d') return;
             const t0 = performance.now();
 
-            // 预取后续几帧到缓存
-            for (let k = 1; k <= 3; k++) {
-                const f = this.state.currentFrame + k;
-                if (f < this.state.totalFrames) viewer.prefetchFrame(f);
-            }
-
             if (this.state.currentFrame < this.state.totalFrames - 1) {
                 this.state.currentFrame += 1;
                 document.getElementById('frameInput').value = this.state.currentFrame;
-                viewer.frameIdx = this.state.currentFrame;
-                await viewer.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+                
+                // 使用优化的播放加载方法：保留上一帧避免黑屏，异步加载新帧，自动预取
+                if (viewer.loadFrameForPlayback) {
+                    await viewer.loadFrameForPlayback(this.state.sceneId, this.state.currentFrame);
+                } else {
+                    // 回退方案
+                    viewer.frameIdx = this.state.currentFrame;
+                    await viewer.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+                }
             } else {
                 this.pausePlayback();  // 播到末尾自动停在最后一帧，不自动回到开头
                 return;
@@ -1221,6 +1303,8 @@ class DGGTStudio {
         this.cornerRoleAssign = {};      // {role_key: track_id}
         this.cornerActiveRole = null;    // 当前等待指派的 role_key
         this.cornerAffectedTracks = [];  // 上次生成影响的 track（用于清除）
+        this.cornerSynthesizedTracks = [];
+        this._updateQualityReportButton();
 
         const sel = document.getElementById('cornerScenarioType');
         if (sel) {
@@ -1237,28 +1321,51 @@ class DGGTStudio {
         if (genBtn) genBtn.addEventListener('click', () => this.generateCornerCase());
         const clearBtn = document.getElementById('clearCornerCaseBtn');
         if (clearBtn) clearBtn.addEventListener('click', () => this.clearCornerCase());
+        const jumpBtn = document.getElementById('jumpCriticalFrameBtn');
+        if (jumpBtn) jumpBtn.addEventListener('click', () => this.jumpToCriticalFrame());
+        const qualityBtn = document.getElementById('viewQualityReportBtn');
+        if (qualityBtn) qualityBtn.addEventListener('click', () => this.showQualityReportModal());
+        
+        // 场景参数折叠面板
+        const paramsHeader = document.getElementById('scenarioParamsHeader');
+        const paramsContent = document.getElementById('cornerSamplingParams');
+        if (paramsHeader && paramsContent) {
+            paramsHeader.addEventListener('click', () => {
+                const isCollapsed = paramsHeader.classList.toggle('collapsed');
+                paramsContent.style.display = isCollapsed ? 'none' : 'flex';
+            });
+        }
     }
 
     renderCornerRoles() {
         const sel = document.getElementById('cornerScenarioType');
         const rolesDiv = document.getElementById('cornerRoles');
+        const samplingDiv = document.getElementById('cornerSamplingParams');
         const descEl = document.getElementById('cornerScenarioDesc');
         if (!sel || !rolesDiv) return;
         const scenario = this.cornerScenarios[sel.value];
-        if (!scenario) { rolesDiv.innerHTML = ''; return; }
+        if (!scenario) {
+            rolesDiv.innerHTML = '';
+            if (samplingDiv) samplingDiv.innerHTML = '';
+            return;
+        }
         if (descEl) descEl.textContent = scenario.desc || '';
 
         // 切换场景时重置角色指派
         this.cornerRoleAssign = {};
         this.cornerActiveRole = null;
+        if (this.viewer3d) this.viewer3d.clearCriticalFrames();
 
-        rolesDiv.innerHTML = scenario.roles.map(r => `
+        rolesDiv.innerHTML = scenario.roles.map(r => {
+            const auto = r.optional || r.auto || (r.label && r.label.includes('可选'));
+            const hint = auto ? '<span class="cc-role-auto" title="不指定则自动生成">自动生成</span>' : '';
+            return `
             <div class="cc-role" data-role="${r.key}">
-                <span class="cc-role-label">${r.label}</span>
+                <span class="cc-role-label">${r.label}${hint}</span>
                 <button class="btn btn-small cc-role-btn" data-role="${r.key}">指定</button>
-                <span class="cc-role-value" data-role="${r.key}">未指定</span>
-            </div>
-        `).join('');
+                <span class="cc-role-value" data-role="${r.key}">${auto ? '自动' : '未指定'}</span>
+            </div>`;
+        }).join('');
 
         rolesDiv.querySelectorAll('.cc-role-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1276,6 +1383,79 @@ class DGGTStudio {
                 }
             });
         });
+
+        if (samplingDiv) {
+            samplingDiv.innerHTML = this._renderSamplingControls(scenario.sampling_schema || {});
+            samplingDiv.querySelectorAll('.cc-sampling-range input').forEach(input => {
+                input.addEventListener('input', () => this._normalizeSamplingRange(input));
+            });
+        }
+    }
+
+    _renderSamplingControls(schema) {
+        const entries = Object.entries(schema || {});
+        if (entries.length === 0) {
+            return '<div class="cc-sampling-empty">该场景暂无可采样参数</div>';
+        }
+        return entries.map(([key, spec]) => {
+            const label = this._escapeHtml(spec.label || key);
+            const unit = spec.unit ? `<span class="cc-param-unit">${this._escapeHtml(spec.unit)}</span>` : '';
+            if (spec.type === 'enum') {
+                const options = (spec.options || []).map(opt => {
+                    const selected = opt === spec.default ? 'selected' : '';
+                    return `<option value="${this._escapeHtml(opt)}" ${selected}>${this._samplingOptionLabel(opt)}</option>`;
+                }).join('');
+                return `<div class="cc-param" data-param="${this._escapeHtml(key)}" data-type="enum">
+                    <label>${label}${unit}</label>
+                    <select class="cc-select cc-param-value" data-param="${this._escapeHtml(key)}">${options}</select>
+                </div>`;
+            }
+            const def = Array.isArray(spec.default) ? spec.default : [spec.min, spec.max];
+            const lo = Number(def[0] ?? spec.min ?? 0);
+            const hi = Number(def[1] ?? spec.max ?? lo);
+            return `<div class="cc-param cc-sampling-range" data-param="${this._escapeHtml(key)}" data-type="range">
+                <label>${label}${unit}</label>
+                <div class="cc-param-range-row">
+                    <input type="number" class="cc-param-min" data-param="${this._escapeHtml(key)}" value="${lo}" min="${spec.min}" max="${spec.max}" step="${spec.step || 0.1}">
+                    <span>至</span>
+                    <input type="number" class="cc-param-max" data-param="${this._escapeHtml(key)}" value="${hi}" min="${spec.min}" max="${spec.max}" step="${spec.step || 0.1}">
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    _samplingOptionLabel(value) {
+        const labels = {
+            near_miss: 'near-miss',
+            minor: '轻微',
+            severe: '严重',
+            clear: '晴朗',
+            rain: '雨天',
+            fog: '雾天',
+            night: '夜间',
+            straight: '直路',
+            curve: '弯道',
+            intersection: '路口',
+            ramp: '匝道',
+            none: '无遮挡',
+            vehicle: '车辆遮挡',
+            roadside: '路侧遮挡'
+        };
+        return this._escapeHtml(labels[value] || value);
+    }
+
+    _normalizeSamplingRange(input) {
+        const row = input.closest('.cc-sampling-range');
+        if (!row) return;
+        const minInput = row.querySelector('.cc-param-min');
+        const maxInput = row.querySelector('.cc-param-max');
+        if (!minInput || !maxInput) return;
+        const minVal = Number(minInput.value);
+        const maxVal = Number(maxInput.value);
+        if (Number.isFinite(minVal) && Number.isFinite(maxVal) && minVal > maxVal) {
+            if (input === minInput) maxInput.value = minVal;
+            else minInput.value = maxVal;
+        }
     }
 
     _cornerRoleLabel(roleKey) {
@@ -1283,6 +1463,31 @@ class DGGTStudio {
         const scenario = this.cornerScenarios[sel.value];
         const r = scenario && scenario.roles.find(x => x.key === roleKey);
         return r ? r.label : roleKey;
+    }
+
+    _collectSamplingParams() {
+        const params = {};
+        const container = document.getElementById('cornerSamplingParams');
+        if (!container) return params;
+        container.querySelectorAll('.cc-param').forEach(row => {
+            const key = row.dataset.param;
+            const type = row.dataset.type;
+            if (!key) return;
+            if (type === 'enum') {
+                const select = row.querySelector('.cc-param-value');
+                if (select) params[key] = select.value;
+            } else if (type === 'range') {
+                const minInput = row.querySelector('.cc-param-min');
+                const maxInput = row.querySelector('.cc-param-max');
+                if (!minInput || !maxInput) return;
+                const minVal = Number(minInput.value);
+                const maxVal = Number(maxInput.value);
+                if (Number.isFinite(minVal) && Number.isFinite(maxVal)) {
+                    params[key] = [Math.min(minVal, maxVal), Math.max(minVal, maxVal)];
+                }
+            }
+        });
+        return params;
     }
 
     assignCornerRole(roleKey, trackId) {
@@ -1310,22 +1515,34 @@ class DGGTStudio {
         if (!scenario) { alert('请选择场景类型'); return; }
 
         // 校验必填角色（label 含"可选"的可不填）
+        // 校验角色：optional/auto 的角色可不指定（后端会自动合成参与者）
         const roles = {};
+        let assignedCount = 0;
         for (const r of scenario.roles) {
             const tid = this.cornerRoleAssign[r.key];
             if (tid === undefined || tid === null) {
-                if (!r.label.includes('可选')) {
+                const skippable = r.optional || r.auto || (r.label && r.label.includes('可选'));
+                if (!skippable) {
                     alert(`请指定角色：${r.label}`);
                     return;
                 }
             } else {
                 roles[r.key] = tid;
+                assignedCount += 1;
             }
+        }
+        const allowAllAuto = scenario.roles.every(r => r.optional || r.auto || (r.label && r.label.includes('可选')));
+        if (assignedCount === 0 && !allowAllAuto) {
+            alert('请至少指定一个参与者，未指定的角色将自动生成');
+            return;
         }
 
         const startFrame = parseInt(document.getElementById('cornerStartFrame').value) || 0;
         const numFrames = parseInt(document.getElementById('cornerNumFrames').value) || 20;
         const intensity = parseFloat(document.getElementById('cornerIntensity').value) || 1.0;
+        const physicsEl = document.getElementById('cornerEnablePhysics');
+        const enablePhysics = physicsEl ? physicsEl.checked : true;
+        const samplingParams = this._collectSamplingParams();
 
         try {
             const response = await fetch(`${API_BASE}/corner_case/generate`, {
@@ -1337,12 +1554,18 @@ class DGGTStudio {
                     roles: roles,
                     start_frame: startFrame,
                     num_frames: numFrames,
-                    intensity: intensity
+                    intensity: intensity,
+                    enable_physics: enablePhysics,
+                    sampling_params: samplingParams
                 })
             });
             const data = await response.json();
             if (data.success) {
                 this.cornerAffectedTracks = data.affected_tracks || [];
+                this.cornerSynthesizedTracks = data.synthesized_tracks || [];
+                this.state.lastQualityReport = data.quality_report || null;
+                this.state.lastSamplingParams = data.sampling_params || null;
+                this._updateQualityReportButton();
                 this.state.renderCache.clear();
                 if (this.viewer3d) {
                     this.viewer3d._invalidateCache();
@@ -1350,11 +1573,31 @@ class DGGTStudio {
                     if (this.viewer3d.selectedTrackId !== null) {
                         this.viewer3d._fetchTrajectory(this.viewer3d.selectedTrackId);
                     }
+                    // 在轨迹上高亮碰撞关键帧（仅限碰撞涉及的 track）
+                    if (data.collision_analysis) {
+                        this.viewer3d.setCriticalFrames(data.collision_analysis, data.collision_tracks);
+                    } else {
+                        this.viewer3d.clearCriticalFrames();
+                    }
                 }
                 await this.loadFrame(this.state.currentFrame);
                 this.saveEditHistory('corner_case', scenarioType);
                 const statusEl = document.getElementById('cornerCaseStatus');
-                if (statusEl) statusEl.textContent = `已生成「${scenario.name}」，影响 ${this.cornerAffectedTracks.length} 个物体的轨迹`;
+                if (statusEl) {
+                    let msg = `已生成「${scenario.name}」，影响 ${this.cornerAffectedTracks.length} 个物体的轨迹`;
+                    const ca = data.collision_analysis;
+                    if (ca) {
+                        msg += this._formatCollisionInfo(ca);
+                    }
+                    if (data.sampling_params) {
+                        msg += this._formatSamplingSummary(data.sampling_params);
+                    }
+                    if (data.quality_report) {
+                        msg += this._formatQualityReport(data.quality_report);
+                        msg += '<div class="cc-quality-note">可点击“查看质量报告”查看完整检查结果和原始 JSON。</div>';
+                    }
+                    statusEl.innerHTML = msg;
+                }
                 this.updateStatus(`已生成 Corner Case: ${scenario.name}`);
             } else {
                 alert('生成失败: ' + (data.detail || '未知错误'));
@@ -1365,8 +1608,189 @@ class DGGTStudio {
         }
     }
 
+    _formatCollisionInfo(ca) {
+        if (!ca) return '';
+        const sevMap = { high: '高危', medium: '中等', low: '较低', near_miss: '险情' };
+        let html = '<div class="cc-collision-info">';
+        if (ca.collision_frame !== null && ca.collision_frame !== undefined) {
+            html += `<div>碰撞帧: <b>${ca.collision_frame}</b></div>`;
+            html += `<div>最晚反应帧: <b style="color:#ff9500">${ca.critical_frame}</b></div>`;
+            if (ca.time_to_collision !== null && ca.time_to_collision !== undefined) {
+                html += `<div>反应窗口: ${ca.time_to_collision.toFixed(2)} 秒 (${ca.reaction_frames} 帧)</div>`;
+            }
+            if (ca.distance_at_critical !== undefined) {
+                html += `<div>关键帧距离: ${ca.distance_at_critical.toFixed(2)} m</div>`;
+            }
+            html += `<div>严重程度: ${sevMap[ca.collision_severity] || ca.collision_severity}</div>`;
+        } else if (ca.collision_severity === 'near_miss') {
+            html += `<div>险情(未实际碰撞)，最接近帧: <b>${ca.critical_frame}</b></div>`;
+            html += `<div>最近距离: ${ca.distance_at_critical.toFixed(2)} m</div>`;
+        }
+        html += '</div>';
+        return html;
+    }
+
+    _formatSamplingSummary(params) {
+        const entries = Object.entries(params || {});
+        if (entries.length === 0) return '';
+        let html = '<div class="cc-sampling-summary"><b>本次采样参数</b>';
+        entries.slice(0, 8).forEach(([key, value]) => {
+            const v = typeof value === 'number' ? value.toFixed(2) : value;
+            html += `<div><span>${this._escapeHtml(key)}</span><em>${this._escapeHtml(v)}</em></div>`;
+        });
+        html += '</div>';
+        return html;
+    }
+
+    _formatQualityReport(report) {
+        if (!report) return '';
+        const valid = report.valid === true;
+        const statusText = valid ? '通过质量准入' : '未通过质量准入';
+        const statusClass = valid ? 'pass' : 'fail';
+        const fmt = (v, digits = 2, suffix = '') => {
+            if (v === null || v === undefined || Number.isNaN(Number(v))) return '未知';
+            return `${Number(v).toFixed(digits)}${suffix}`;
+        };
+        const failedChecks = (report.checks || []).filter(c => c.passed === false);
+        const unknownChecks = (report.checks || []).filter(c => c.passed === null);
+        let html = `<div class="cc-quality-info ${statusClass}">`;
+        html += `<div class="cc-quality-header"><span>质量准入</span><b>${statusText}</b></div>`;
+        html += '<div class="cc-quality-grid">';
+        html += `<div><span>最近距离</span><b>${fmt(report.min_distance, 2, ' m')}</b></div>`;
+        html += `<div><span>TTC</span><b>${fmt(report.ttc_at_critical, 2, ' s')}</b></div>`;
+        html += `<div><span>最大加速度</span><b>${fmt(report.max_accel, 2, ' m/s²')}</b></div>`;
+        html += `<div><span>最大穿透</span><b>${fmt(report.bbox_penetration, 2, ' m')}</b></div>`;
+        html += '</div>';
+        if (failedChecks.length > 0) {
+            html += '<div class="cc-quality-list"><span>未通过项</span>';
+            failedChecks.slice(0, 4).forEach(check => {
+                html += `<div class="cc-quality-check fail">${this._qualityCheckLabel(check.name)}</div>`;
+            });
+            html += '</div>';
+        }
+        if (unknownChecks.length > 0) {
+            const names = unknownChecks.map(c => this._qualityCheckLabel(c.name)).join('、');
+            html += `<div class="cc-quality-note">待接入检查: ${names}</div>`;
+        }
+        html += '</div>';
+        return html;
+    }
+
+    _qualityCheckLabel(name) {
+        const labels = {
+            event_present: '碰撞或 near-miss 事件',
+            ttc_range: 'TTC 合理范围',
+            motion_physical: '轨迹动力学合理性',
+            bbox_penetration: '包围盒穿透深度',
+            annotation_consistency: '标注一致性',
+            offroad: '道路区域约束',
+            visibility: '可见性'
+        };
+        return this._escapeHtml(labels[name] || name || '未知检查');
+    }
+
+    _updateQualityReportButton() {
+        const btn = document.getElementById('viewQualityReportBtn');
+        if (btn) btn.disabled = !this.state.lastQualityReport;
+    }
+
+    showQualityReportModal() {
+        const modal = document.getElementById('qualityReportModal');
+        const content = document.getElementById('qualityReportContent');
+        const report = this.state.lastQualityReport;
+        if (!modal || !content) return;
+        if (!report) {
+            content.innerHTML = '<div class="empty-state"><p>生成 Corner Case 后可查看质量报告</p></div>';
+        } else {
+            content.innerHTML = this._formatQualityReportDetail(report);
+        }
+        modal.classList.add('active');
+    }
+
+    _formatQualityReportDetail(report) {
+        const valid = report.valid === true;
+        const fmt = (v, digits = 2, suffix = '') => {
+            if (v === null || v === undefined || Number.isNaN(Number(v))) return '未知';
+            return `${Number(v).toFixed(digits)}${suffix}`;
+        };
+        const status = valid ? '通过质量准入' : '未通过质量准入';
+        const checks = report.checks || [];
+        let html = `<div class="quality-report-banner ${valid ? 'pass' : 'fail'}">`;
+        html += `<span>${status}</span><b>${this._escapeHtml(report.case_type || '未知类型')}</b>`;
+        html += '</div>';
+        html += '<div class="quality-report-grid">';
+        html += this._qualityMetricCell('碰撞帧', report.collision_frame ?? '无');
+        html += this._qualityMetricCell('最晚反应帧', report.critical_frame ?? '无');
+        html += this._qualityMetricCell('TTC', fmt(report.ttc_at_critical, 2, ' s'));
+        html += this._qualityMetricCell('最近距离', fmt(report.min_distance, 2, ' m'));
+        html += this._qualityMetricCell('最大加速度', fmt(report.max_accel, 2, ' m/s²'));
+        html += this._qualityMetricCell('最大偏航率', fmt(report.max_yaw_rate, 2, ' rad/s'));
+        html += this._qualityMetricCell('最大穿透', fmt(report.bbox_penetration, 2, ' m'));
+        html += this._qualityMetricCell('标注一致性', report.annotation_consistency ? '通过' : '失败');
+        html += '</div>';
+        html += '<div class="quality-report-section"><h3>分项检查</h3>';
+        html += '<div class="quality-check-table">';
+        checks.forEach(check => {
+            const state = check.passed === true ? 'pass' : (check.passed === false ? 'fail' : 'unknown');
+            const stateText = check.passed === true ? '通过' : (check.passed === false ? '失败' : '待接入');
+            html += `<div class="quality-check-row ${state}">`;
+            html += `<span>${this._qualityCheckLabel(check.name)}</span>`;
+            html += `<b>${stateText}</b>`;
+            html += `<small>${this._escapeHtml(check.description || '')}</small>`;
+            html += '</div>';
+        });
+        html += '</div></div>';
+        html += this._formatSamplingDetailFromReport(report);
+        html += '<div class="quality-report-section"><h3>原始 JSON</h3>';
+        html += `<pre class="quality-json">${this._escapeHtml(JSON.stringify(report, null, 2))}</pre>`;
+        html += '</div>';
+        return html;
+    }
+
+    _formatSamplingDetailFromReport(report) {
+        const params = this.state.lastSamplingParams || {};
+        const entries = Object.entries(params);
+        if (entries.length === 0) return '';
+        let html = '<div class="quality-report-section"><h3>场景族采样参数</h3>';
+        html += '<div class="quality-report-grid">';
+        entries.forEach(([key, value]) => {
+            const v = typeof value === 'number' ? value.toFixed(3) : value;
+            html += this._qualityMetricCell(key, v);
+        });
+        html += '</div></div>';
+        return html;
+    }
+
+    _qualityMetricCell(label, value) {
+        return `<div><span>${this._escapeHtml(label)}</span><b>${this._escapeHtml(value)}</b></div>`;
+    }
+
+    _escapeHtml(value) {
+        return String(value).replace(/[&<>'"]/g, ch => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            "'": '&#39;',
+            '"': '&quot;'
+        }[ch]));
+    }
+
+    // 跳转到关键帧
+    jumpToCriticalFrame() {
+        const ca = this.viewer3d && this.viewer3d.criticalFrames;
+        if (ca && ca.critical_frame !== null && ca.critical_frame !== undefined) {
+            this.loadFrame(ca.critical_frame);
+            this.state.currentFrame = ca.critical_frame;
+            this.updateStatus(`已跳转到最晚反应关键帧: ${ca.critical_frame}`);
+        }
+    }
+
     async clearCornerCase() {
         const tracks = [...(this.cornerAffectedTracks || [])];
+        // 合成参与者也要一并清除
+        (this.cornerSynthesizedTracks || []).forEach(t => {
+            if (!tracks.includes(t)) tracks.push(t);
+        });
         // 也包含当前已指派的角色
         Object.values(this.cornerRoleAssign || {}).forEach(t => {
             if (!tracks.includes(t)) tracks.push(t);
@@ -1379,10 +1803,15 @@ class DGGTStudio {
                 body: JSON.stringify({ scene_id: this.state.sceneId, track_ids: tracks })
             });
             this.cornerAffectedTracks = [];
+            this.cornerSynthesizedTracks = [];
+            this.state.lastQualityReport = null;
+            this.state.lastSamplingParams = null;
+            this._updateQualityReportButton();
             this.state.renderCache.clear();
             if (this.viewer3d) {
                 this.viewer3d._invalidateCache();
                 this.viewer3d.trajectory = null;
+                this.viewer3d.clearCriticalFrames();
                 if (this.viewer3d.selectedTrackId !== null) {
                     this.viewer3d._fetchTrajectory(this.viewer3d.selectedTrackId);
                 }

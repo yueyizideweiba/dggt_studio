@@ -1022,6 +1022,129 @@ body {
     width: 100%;
 }
 
+/* Corner Case 物理碰撞 + 关键帧信息 */
+.cc-checkbox {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.cc-checkbox input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+}
+
+.cc-collision-info {
+    margin-top: 6px;
+    padding: 8px;
+    background: rgba(255, 149, 0, 0.08);
+    border-left: 3px solid #ff9500;
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-primary);
+}
+
+.cc-collision-info b {
+    color: #ff9500;
+}
+
+.cc-quality-info {
+    margin-top: 8px;
+    padding: 8px;
+    background: rgba(15, 23, 42, 0.45);
+    border-left: 3px solid var(--success-color);
+    border-radius: 4px;
+    color: var(--text-primary);
+}
+
+.cc-quality-info.fail {
+    border-left-color: var(--danger-color);
+}
+
+.cc-quality-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+
+.cc-quality-header span {
+    color: var(--text-secondary);
+}
+
+.cc-quality-info.pass .cc-quality-header b {
+    color: var(--success-color);
+}
+
+.cc-quality-info.fail .cc-quality-header b {
+    color: var(--danger-color);
+}
+
+.cc-quality-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.cc-quality-grid div {
+    min-width: 0;
+    padding: 6px;
+    border-radius: 4px;
+    background: var(--bg-dark);
+}
+
+.cc-quality-grid span,
+.cc-quality-list span,
+.cc-quality-note {
+    display: block;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.cc-quality-grid b {
+    display: block;
+    margin-top: 2px;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.cc-quality-list {
+    margin-top: 8px;
+}
+
+.cc-quality-check {
+    margin-top: 4px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    background: rgba(239, 68, 68, 0.12);
+    color: #fca5a5;
+    font-size: 11px;
+}
+
+.cc-quality-note {
+    margin-top: 8px;
+    line-height: 1.4;
+}
+
+.cc-role-auto {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    border-radius: 8px;
+    background: rgba(0, 200, 255, 0.15);
+    color: #00c8ff;
+    vertical-align: middle;
+}
+
 /* 选中物体面板按钮行 */
 .selected-object-info .button-row {
     display: flex;
@@ -1035,3 +1158,295 @@ body {
     padding: 3px 0;
 }
 .selected-object-info .info-row .label { color: var(--text-secondary); }
+
+/* 极端天气 Corner Case 面板 */
+.weather-panel input[type="range"],
+.weather-panel input[type="number"],
+.weather-panel select {
+    width: 100%;
+}
+
+.panel-weather-case .cc-status {
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+/* Corner Case 质量报告弹窗 */
+.quality-report-content {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.quality-report-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: rgba(16, 185, 129, 0.12);
+    border-left: 3px solid var(--success-color);
+}
+
+.quality-report-banner.fail {
+    background: rgba(239, 68, 68, 0.12);
+    border-left-color: var(--danger-color);
+}
+
+.quality-report-banner span {
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+.quality-report-banner b {
+    color: var(--success-color);
+    font-size: 14px;
+}
+
+.quality-report-banner.fail b {
+    color: var(--danger-color);
+}
+
+.quality-report-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.quality-report-grid div {
+    min-width: 0;
+    padding: 10px;
+    border-radius: 6px;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-color);
+}
+
+.quality-report-grid span {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.quality-report-grid b {
+    display: block;
+    color: var(--text-primary);
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.quality-report-section h3 {
+    margin-bottom: 8px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.quality-check-table {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.quality-check-row {
+    display: grid;
+    grid-template-columns: 150px 64px 1fr;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--bg-dark);
+    border-left: 3px solid var(--text-muted);
+}
+
+.quality-check-row.pass {
+    border-left-color: var(--success-color);
+}
+
+.quality-check-row.fail {
+    border-left-color: var(--danger-color);
+}
+
+.quality-check-row.unknown {
+    border-left-color: var(--warning-color);
+}
+
+.quality-check-row span {
+    color: var(--text-primary);
+    font-size: 12px;
+}
+
+.quality-check-row b {
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.quality-check-row.pass b {
+    color: var(--success-color);
+}
+
+.quality-check-row.fail b {
+    color: var(--danger-color);
+}
+
+.quality-check-row.unknown b {
+    color: var(--warning-color);
+}
+
+.quality-check-row small {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.quality-json {
+    max-height: 280px;
+    overflow: auto;
+    padding: 12px;
+    border-radius: 6px;
+    background: #020617;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+}
+
+@media (max-width: 900px) {
+    .quality-report-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .quality-check-row {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+}
+
+/* Corner Case 场景族采样参数 */
+.cc-sampling-section {
+    margin: 10px 0;
+    padding: 8px;
+    border-radius: 6px;
+    background: rgba(15, 23, 42, 0.45);
+    border: 1px solid var(--border-color);
+}
+
+.cc-subheader {
+    margin-bottom: 8px;
+    color: var(--text-secondary);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+
+.cc-subheader.collapsible {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+    padding: 4px 0;
+    transition: color 0.2s;
+}
+
+.cc-subheader.collapsible:hover {
+    color: var(--text-primary);
+}
+
+.cc-subheader .collapse-icon {
+    transition: transform 0.2s;
+}
+
+.cc-subheader.collapsed .collapse-icon {
+    transform: rotate(-90deg);
+}
+
+.cc-sampling-params {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.cc-param label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+    color: var(--text-primary);
+    font-size: 12px;
+}
+
+.cc-param-unit {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 400;
+}
+
+.cc-param-range-row {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    gap: 6px;
+}
+
+.cc-param-range-row span {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.cc-param-range-row input {
+    min-width: 0;
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+    font-size: 12px;
+}
+
+.cc-sampling-empty {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.cc-sampling-summary {
+    margin-top: 8px;
+    padding: 8px;
+    border-radius: 4px;
+    background: rgba(59, 130, 246, 0.08);
+    border-left: 3px solid var(--primary-color);
+    color: var(--text-primary);
+}
+
+.cc-sampling-summary b {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--primary-color);
+    font-size: 12px;
+}
+
+.cc-sampling-summary div {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 2px 0;
+    font-size: 11px;
+}
+
+.cc-sampling-summary span {
+    color: var(--text-muted);
+}
+
+.cc-sampling-summary em {
+    color: var(--text-primary);
+    font-style: normal;
+    text-align: right;
+    overflow-wrap: anywhere;
+}

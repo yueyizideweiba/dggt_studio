@@ -25,9 +25,40 @@
 - **Corner Case生成**
   - 紧急刹车场景
   - 追尾预碰撞场景
-  - 变道场景
-  - 路口交叉场景
-  - 支持自定义参数配置
+  - 变道加塞场景
+  - 路口侧碰 (T-Bone) 场景
+  - 对向碰撞场景
+  - 行人横穿（鬼探头）场景
+  - 前车闪开露出障碍（幽灵障碍）场景
+  - 支持场景族参数采样：初始距离、相对速度、制动强度、反应延迟、横向偏置、碰撞强度、天气/道路上下文等
+
+- **物理碰撞模拟** ✨ 新增
+  - 基于定向包围盒 (OBB) 的碰撞检测（分离轴定理 SAT）
+  - 事故生成时按包围盒尺寸计算接触距离，避免车辆互相穿模
+  - 动量守恒的碰撞响应
+  - 碰撞时间预测
+
+- **碰撞关键帧识别** ✨ 新增
+  - 自动识别每个事故的"最晚反应关键帧"
+  - 在轨迹上高亮标记碰撞帧（红色）和最晚反应帧（橙色菱形）
+  - 计算反应时间窗口、关键帧距离、严重程度
+  - 帮助自动驾驶系统评估最晚何时必须采取规避动作
+
+- **质量准入报告** ✨ 新增
+  - 事故生成后可在前端点击"查看质量报告"
+  - 展示碰撞/near-miss、TTC、轨迹动力学、包围盒穿透和标注一致性检查
+  - 支持查看完整原始 JSON，便于调参和批量生产筛选
+
+- **三维极端天气 Corner Case** ✨ 新增
+  - 3D 视图支持大雨、暴风雨、大雪、暴风雪、浓雾
+  - 雨滴/雪花不是二维贴图，而是在相机视锥中生成的 3D 粒子，具备深度、风偏、时间连续性和投影缩放
+  - 支持体积雾化/能见度衰减，模拟极端天气下传感器可视性降低
+  - 支持横风、垂直风、强度和能见度参数调节
+
+- **智能轨迹编辑** ✨ 增强
+  - 拖动一个节点时，整条路径按平滑衰减自适应跟随（无需逐个调整节点）
+  - 可调影响范围与衰减方式（smooth / linear / gaussian）
+  - 一键平滑整条轨迹，消除手动编辑抖动
 
 ### 🎬 渲染与预览
 
@@ -159,6 +190,7 @@ python -m http.server 3000
 
 ### 渲染
 - `POST /api/render/frame` - 渲染单帧
+- `POST /api/render/freeview` - 服务端自由视角渲染，支持 `weather` 字段生成三维极端天气粒子
 - `POST /api/render/sequence` - 渲染视频序列
 
 ### 编辑
@@ -168,8 +200,16 @@ python -m http.server 3000
 - `DELETE /api/edit/object/{scene_id}/{object_id}` - 删除物体
 
 ### Corner Case
-- `POST /api/corner_case/generate` - 生成corner case
+- `POST /api/corner_case/generate` - 生成corner case（支持 `enable_physics` 物理碰撞规则，返回碰撞关键帧分析与 `quality_report` 质量准入报告）
 - `GET /api/corner_case/types` - 获取支持的类型
+- `POST /api/corner_case/analyze_collision` - 分析两个 track 的碰撞，识别最晚反应关键帧，返回逐帧距离曲线
+- `POST /api/corner_case/clear` - 清除生成的事故轨迹
+
+### 智能轨迹编辑
+- `POST /api/edit/track/point` - 编辑单帧轨迹点
+- `POST /api/edit/track/point_adaptive` - 智能自适应编辑（拖动一个节点整条路径跟随）
+- `POST /api/edit/track/smooth` - 平滑整条轨迹
+- `POST /api/edit/track/trajectory` - 用关键帧列表设置整条轨迹
 
 ### 导出
 - `POST /api/export/trajectory` - 导出轨迹
