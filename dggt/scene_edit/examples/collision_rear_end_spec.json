@@ -1,0 +1,37 @@
+{
+  "scene_path": "/root/autodl-fs/dggt-main/output/waymo_eval/001",
+  "output_dir": "/root/autodl-fs/dggt-main/output/waymo_eval/001/collision_rear_end",
+  "num_frames": 20,
+  "start_idx": 0,
+  "draw_bboxes": false,
+  "draw_ids": true,
+  "save_video": true,
+  "video_name": "collision_rear_end.mp4",
+  "video_fps": 10,
+  "load_sky": true,
+  "static_only": false,
+  "metadata": {
+    "export_id_map": true,
+    "case_type": "rear_end_collision"
+  },
+  "actions": [
+    {
+      "type": "collision_course",
+      "params": {
+        "lead_track_id": 3,
+        "follow_track_id": 5,
+        "mode": "rear_end",
+        "collision_frame": 11,
+        "decel_start": 4,
+        "approach_start": 3,
+        "hold_after": 18,
+        "collision_hold_frames": 2,
+        "approach_ratio": 0.72,
+        "slow_down_scale": 0.55,
+        "post_collision_gap": 0.24,
+        "lead_drift": 0.0,
+        "follow_gain": 1.0
+      }
+    }
+  ]
+}

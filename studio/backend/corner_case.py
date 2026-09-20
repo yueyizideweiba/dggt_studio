@@ -1,21 +1,5 @@
-"""
-Corner Case（交通事故场景）生成模块
-
-底层逻辑：通过 **修改动态物体的轨迹**（写入 TrackManager 的 track 编辑）来制造
-事故效果，与轨迹编辑/渲染管线完全统一。
-
-核心特性：
-- **两体前向物理仿真**：肇事车追击/接近受害车，在包围盒接触时按动量守恒发生
-  非弹性碰撞，受害车被撞后获得速度并沿合理方向运动，之后双方因摩擦逐渐减速
-  直至停止。整个过程逐帧积分，不会出现"瞬移"。
-- **参与者自动合成**：若事故所需的某个参与者未指定，可基于已有物体克隆出一个
-  合成参与者（synthetic track），自动放置初始轨迹并参与仿真。
-- **碰撞关键帧识别**：识别最晚反应帧/碰撞帧，供自动驾驶评估。
-
-坐标约定（与数据集一致）：
-- 世界 Y 轴为竖直方向，车辆在 XZ 地平面运动；位姿 pose_world 为 4x4。
-"""
-
+import math
+import os
 import random
 import numpy as np
 
@@ -24,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from dggt.scene_edit.collision_physics import (
     check_collision,
+    separating_axis,
     compute_critical_frame,
 )
 
@@ -144,7 +129,12 @@ def _heading(tm, track_id, frame_idx):
     d[1] = 0.0
     n = np.linalg.norm(d)
     if n < 1e-4:
-        pose = np.array(tm.get_track_pose(track_id, frame_idx))
+        pose = tm.get_track_pose(track_id, frame_idx)
+        if pose is None:
+            return np.array([1.0, 0.0, 0.0])
+        pose = np.array(pose, dtype=np.float32)
+        if pose.ndim != 2 or pose.shape[0] < 3 or pose.shape[1] < 3:
+            return np.array([1.0, 0.0, 0.0])
         d = pose[:3, 2].copy()
         d[1] = 0.0
         n = np.linalg.norm(d)
@@ -153,21 +143,35 @@ def _heading(tm, track_id, frame_idx):
     return d / n
 
 
-def _speed_mps(tm, track_id, frame_idx, fps):
-    """估计某 track 在该帧的速率（米/秒）。"""
-    frames = tm.get_track_frames(track_id)
+def _speed_mps(tm, track_id, frame_idx, fps, max_speed=28.0):
+    """估计某 track 在该帧的速率（米/秒）。
+
+    用 frame_idx 附近 ±6 帧的**逐帧位移中位数**，避免原始数据里的单帧跳变
+    （稀疏/噪声轨迹常有 10~20m 的跳变，中心差分会把速度估成 100~200 m/s，
+    再被当成"参考车速"写进生成轨迹 → 整个实例因为超速被判不通过）。
+    同时夹到 `max_speed` 以内，保证生成结果落在质量门的物理范围内。
+    """
+    frames = sorted(tm.get_track_frames(track_id) or [])
     if len(frames) < 2:
         return 0.0
-    f1 = frame_idx + 1 if (frame_idx + 1) in frames else frame_idx
-    fm = frame_idx - 1 if (frame_idx - 1) in frames else frame_idx
-    p1 = tm.get_track_pose(track_id, f1)
-    p0 = tm.get_track_pose(track_id, fm)
-    if p1 is None or p0 is None:
+    idx = min(range(len(frames)), key=lambda i: abs(frames[i] - int(frame_idx)))
+    lo = max(0, idx - 6)
+    hi = min(len(frames), idx + 7)
+    sp = []
+    for i in range(lo, hi - 1):
+        f0, f1 = frames[i], frames[i + 1]
+        p0 = tm.get_track_pose(track_id, f0)
+        p1 = tm.get_track_pose(track_id, f1)
+        if p0 is None or p1 is None:
+            continue
+        d = np.array(p1)[:3, 3] - np.array(p0)[:3, 3]
+        d[1] = 0.0
+        sp.append(float(np.linalg.norm(d) / (max(1, f1 - f0) / fps)))
+    if not sp:
         return 0.0
-    d = np.array(p1)[:3, 3] - np.array(p0)[:3, 3]
-    d[1] = 0.0
-    span = max(1, (f1 - fm))
-    return float(np.linalg.norm(d) / (span / fps))
+    sp.sort()
+    med = sp[len(sp) // 2]
+    return float(min(max(med, 0.0), float(max_speed)))
 
 
 def _ground_right(heading):
@@ -246,6 +250,24 @@ def _write_pose(tm, track_id, frame_idx, pose):
         tm.set_synthetic_pose(track_id, frame_idx, pose)
     else:
         tm.set_track_pose(track_id, frame_idx, pose)
+
+
+def _pose_or_nearest(tm, track_id, frame_idx):
+    """获取某 track 在 frame_idx 的位姿；若该帧不存在，则回退到该 track 最近的有效帧。
+
+    某些数据集中，用户指定的车辆 track 并不覆盖所请求的起始/拦截帧，
+    直接 get_track_pose 会返回 None，导致下游 np.array(None)[i, j] 触发
+    “0-dimensional array”错误。此处提供稳健回退。
+    """
+    pose = tm.get_track_pose(track_id, frame_idx)
+    if pose is not None:
+        return np.asarray(pose, dtype=np.float32)
+    avail = tm.get_track_frames(track_id)
+    if not avail:
+        return None
+    nearest = min(avail, key=lambda f: abs(int(f) - int(frame_idx)))
+    pose = tm.get_track_pose(track_id, nearest)
+    return np.asarray(pose, dtype=np.float32) if pose is not None else None
 
 
 # ==================== 参与者自动合成 ====================
@@ -382,7 +404,7 @@ def _ensure_participant(tm, role_track, scenario_type, role_key, anchor_track, f
                                      ped_speed, frames, fps)
         dims = ped_dims
     elif scenario_type == "cut-out-reveal" and role_key == "obstacle":
-        # 静止障碍车：在遮挡车前方，速度 0
+        # 静止障碍车：在遮挡车前方，速度 0（放远一点，留出"闪开"动作的时间）
         offset = anchor_head * (dims_anchor[0] + 14.0)
         poses = _synth_initial_poses(tm, anchor_pose, offset, anchor_head, 0.0, frames, fps)
         dims = vehicle_dims
@@ -400,21 +422,225 @@ def _ensure_participant(tm, role_track, scenario_type, role_key, anchor_track, f
         dims = vehicle_dims
 
     type_name = "合成行人" if pedestrian else "合成车辆"
-    synth_id = tm.create_synthetic_track(donor, poses, dimensions=dims, type_name=type_name)
+    if pedestrian:
+        # 行人优先用真实行人 3D 模型；没有模型才退回克隆 donor 外观
+        synth_id = _create_pedestrian_track(tm, poses, dims=ped_dims, type_name=type_name)
+    else:
+        synth_id = tm.create_synthetic_track(donor, poses, dimensions=dims, type_name=type_name)
     return synth_id, True
 
 
 # ==================== 两体物理仿真 ====================
 
+def _velocity_vec(tm, track_id, frame_idx, fps):
+    """某 track 在 frame_idx 的速度向量（3D，含方向）。"""
+    frames = tm.get_track_frames(track_id)
+    if not frames:
+        return np.zeros(3, dtype=np.float32)
+    f1 = frame_idx + 1 if (frame_idx + 1) in frames else frame_idx
+    fm = frame_idx - 1 if (frame_idx - 1) in frames else frame_idx
+    p1 = tm.get_track_pose(track_id, f1)
+    p0 = tm.get_track_pose(track_id, fm)
+    if p1 is None or p0 is None:
+        return np.zeros(3, dtype=np.float32)
+    d = np.asarray(p1, dtype=np.float32)[:3, 3] - np.asarray(p0, dtype=np.float32)[:3, 3]
+    span = max(1, f1 - fm)
+    return (d / (span / fps)).astype(np.float32)
+
+
+def _obb_radius_along(pose, dims, normal):
+    """OBB 沿某单位向量的"半宽"（支撑距离），用于精确的防穿模接触距离。"""
+    R = np.asarray(pose, dtype=np.float32)[:3, :3]
+    half = np.asarray(dims, dtype=np.float32)[:3] / 2.0
+    return float(np.abs(R @ np.asarray(normal, dtype=np.float32)).dot(half))
+
+
+def _horizontal_normal(pa, pv, axis=None):
+    """水平的分离方向：优先 SAT 最小平移轴的水平投影，退化时用两心水平连线。"""
+    if axis is not None:
+        n = np.array([axis[0], 0.0, axis[2]], dtype=np.float64)
+        ln = float(np.linalg.norm(n))
+        if ln >= 0.05:
+            return n / ln
+    d = np.asarray(pv, dtype=np.float64)[:3, 3] - np.asarray(pa, dtype=np.float64)[:3, 3]
+    d[1] = 0.0
+    ln = float(np.linalg.norm(d))
+    if ln < 1e-6:
+        return np.array([0.0, 0.0, 1.0])
+    return d / ln
+
+
+def separate_pair(tm, a, b, frames, dims_a=None, dims_v=None, eps=0.02,
+                  from_frame=None, max_shift_per_frame=0.8, rounds=6):
+    """【corner case / 语言轨迹编辑 共用】逐帧消除两车 OBB 重叠（防穿模）。
+
+    只做两件事：沿 SAT 的**最小平移轴**把两车推开、推到"刚好接触"为止。
+    - 用 `separating_axis` 拿到最小穿透轴（15 轴 SAT，穿透最浅的那条即 MTV 方向），
+      再取 `_obb_radius_along` 的**支撑距离**算"刚好接触"需要的间距——比直接用
+      穿透深度更稳（穿透深度是按投影算的，沿轴推开后还要再验一次）。
+    - 竖直方向不算穿模：碰撞发生在路面平面内，所以把轴投影到 XZ；投影后几乎退化的
+      （例如两车基本只是上下重叠）就改用两心水平连线。
+    - 按质量分配位移：轻的车挪得多、重的挪得少，保持"谁撞谁"的力量关系。
+    - 只平移，不改朝向。
+
+    Args:
+        frames: 需要检查的帧；`from_frame` 之后（含）才处理，None=全部。
+        rounds: 每帧最多迭代几次（推开后重新检测，处理斜碰）。
+    Returns:
+        dict: 处理了几帧、推开前最严重的穿透、处理后是否仍有重叠。
+    """
+    dims_a = list(dims_a) if dims_a is not None else _get_dimensions(tm, a)
+    dims_v = list(dims_v) if dims_v is not None else _get_dimensions(tm, b)
+    mass_a = _estimate_mass(dims_a)
+    mass_v = _estimate_mass(dims_v)
+    tot = max(1e-6, mass_a + mass_v)
+    wa = mass_v / tot          # a 的位移权重（对方越重，a 挪得越多）
+    wv = mass_a / tot
+
+    fixed_frames = 0
+    worst_before = 0.0
+    worst_after = 0.0
+    for f in frames:
+        if from_frame is not None and f < from_frame:
+            continue
+        pa = tm.get_track_pose(a, f)
+        pv = tm.get_track_pose(b, f)
+        if pa is None or pv is None:
+            continue
+        pa = np.asarray(pa, dtype=np.float32).copy()
+        pv = np.asarray(pv, dtype=np.float32).copy()
+        touched = False
+        for _ in range(max(1, int(rounds))):
+            hit, depth, axis = separating_axis(pa, dims_a, pv, dims_v)
+            if not hit:
+                break           # 只有 SAT 真的说"不再重叠"才收工
+            touched = True
+            worst_before = max(worst_before, float(depth))
+            # 沿"最小平移向量"方向推开。用 SAT 给出的穿透深度而不是支撑距离：
+            # 支撑距离只保证"沿这条轴分开"，而 SAT 是 15 条轴取最小，两者不等于
+            # （斜碰时支撑距离会**低估**，于是推开后仍然重叠——曾经就残留 7cm）。
+            n = _horizontal_normal(pa, pv, axis)
+            align = abs(float(np.dot(n, np.asarray(axis, dtype=np.float64))))
+            push = (float(depth) + float(eps)) / max(0.25, align)   # 折算到水平方向
+            push = min(push, float(max_shift_per_frame))
+            if push <= 1e-5:
+                break
+            pa[:3, 3] -= (n * (push * wa)).astype(np.float32)
+            pv[:3, 3] += (n * (push * wv)).astype(np.float32)
+        if touched:
+            fixed_frames += 1
+            _, d_after, _ = separating_axis(pa, dims_a, pv, dims_v)
+            worst_after = max(worst_after, float(d_after))
+        _write_pose(tm, a, f, pa)
+        _write_pose(tm, b, f, pv)
+    return {"applied": bool(fixed_frames), "frames_fixed": int(fixed_frames),
+            "max_penetration_before": round(worst_before, 4),
+            "max_penetration_after": round(worst_after, 4)}
+
+
+def _step_toward_2d(v, target, accel, decel, dt):
+    """把速度向量朝目标速度做一步"限加速度"逼近（XZ 地面平面）。
+
+    速率变化受 accel/decel 限制（加速≤accel*dt、减速≤decel*dt），方向朝目标旋转
+    且转向率受限（约 60°/s），因此生成的速度剖面是连续的，不会再出现瞬时跳变。
+    """
+    v = np.asarray(v, dtype=np.float64)[[0, 2]].copy()
+    t = np.asarray(target, dtype=np.float64)[[0, 2]].copy()
+    vn = float(np.linalg.norm(v))
+    tn = float(np.linalg.norm(t))
+    if tn < 1e-6:
+        # 目标是停下：直接按 decel 减速
+        step = min(vn, decel * dt)
+        if vn < 1e-6:
+            return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        d = v / vn
+        spd = vn - step
+        return np.array([d[0] * spd, 0.0, d[1] * spd], dtype=np.float32)
+    tdir = t / tn
+    # 速率约束（加减速限幅）
+    target_spd = tn
+    lo = max(0.0, vn - decel * dt)
+    hi = vn + accel * dt
+    target_spd = min(hi, max(lo, target_spd))
+    if vn < 1e-3:
+        newdir = tdir
+    else:
+        vdir = v / vn
+        cross = vdir[0] * tdir[1] - vdir[1] * tdir[0]
+        dot = float(np.clip(np.dot(vdir, tdir), -1.0, 1.0))
+        ang = math.atan2(cross, dot)                 # 有符号转角
+        max_turn = math.radians(60.0) * dt           # 约 60°/s 转向率上限
+        ang = max(-max_turn, min(max_turn, ang))
+        c, s = math.cos(ang), math.sin(ang)
+        newdir = np.array([vdir[0] * c - vdir[1] * s, vdir[0] * s + vdir[1] * c])
+    newv = newdir * target_spd
+    return np.array([newv[0], 0.0, newv[1]], dtype=np.float32)
+
+
+def _own_pose_series(tm, victim, frames):
+    """取受害车**本来的**逐帧位姿（缺帧用相邻帧线性插值补齐、两端夹取）。
+
+    用于 `victim_follow_track=True`：受害车沿它自己的轨迹走（转弯的车继续转弯），
+    而不是被仿真的"首帧朝向 + 常速度"拉成一条直线。
+    """
+    known = {}
+    for f in frames:
+        p = tm.get_track_pose(victim, f)
+        if p is not None:
+            known[int(f)] = np.asarray(p, dtype=np.float32)
+    if not known:
+        return {}
+    keys = sorted(known)
+    out = {}
+    for f in frames:
+        f = int(f)
+        if f in known:
+            out[f] = known[f]
+            continue
+        if f <= keys[0]:
+            out[f] = known[keys[0]]
+            continue
+        if f >= keys[-1]:
+            out[f] = known[keys[-1]]
+            continue
+        for f0, f1 in zip(keys[:-1], keys[1:]):
+            if f0 <= f <= f1:
+                a = (f - f0) / float(max(1, f1 - f0))
+                out[f] = np.asarray(
+                    tm.renderer._interp_pose(known[f0], known[f1], a), dtype=np.float32)
+                break
+    return out
+
+
 def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                                 enable_physics=True,
-                                victim_evasive=False):
+                                victim_evasive=False,
+                                victim_brake_decel=0.0,
+                                victim_brake_frame=None,
+                                attacker_lateral=0.0,
+                                victim_lateral=0.0,
+                                lateral_ramp=(0.0, 1.0),
+                                victim_follow_track=False,
+                                impact_frame=None,
+                                attacker_target_speed=None):
     """通用两体追击-碰撞仿真（适用于追尾/侧碰/对向）。
 
     enable_physics=True：碰撞按动量守恒分配速度，受害车被撞后真实位移，
         双方因摩擦逐渐减速。
     enable_physics=False：碰撞后简单"粘连"——受害车被推到接触面外但不获得
         明显动量（不会被撞飞），用于对比物理效果。
+    victim_brake_decel / victim_brake_frame：受害车（前车）从 brake_frame 起以
+        该减速度制动，制造"前车减速、后车来不及"的**反应时间窗口**（追尾场景用）。
+    attacker_lateral / victim_lateral：在追击动力学之上叠加的**横向偏移**（沿各自右向量，
+    按 lateral_ramp 做 smoothstep 渐变）。变道加塞靠它把"切入相邻车道"和"追击碰撞"
+    结合起来——纯追击会把之前做好的横移覆盖掉。
+    victim_follow_track：受害车**沿它自己的轨迹**继续走（转弯的车转弯、加速的车加速），
+        碰撞冲量只作为"额外位移"叠加在它自己的轨迹上。False=旧行为（用受害车首帧的
+        朝向 + 速度重放它的运动，会把它拉成直线），corner case 的参数化场景仍用 False。
+    impact_frame：期望的碰撞帧。给了就用它反推追击所需速度
+        （`need_speed = 距离/期望时长 + 受害车速度`），让"撞击发生在第几帧"可控，
+        而不是"能追上就撞上"。这样 40 帧的事故窗口能自然包含
+        **事故发生前 → 发生时 → 发生后** 三个阶段。
 
     Returns: sim dict
     """
@@ -438,20 +664,84 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
     y_a, y_v = pos_a[1], pos_v[1]  # 锁定高度
 
     head_a = _heading(tm, attacker, f0)
-    speed_a0 = max(_speed_mps(tm, attacker, f0, fps), 2.0)
-    speed_v0 = _speed_mps(tm, victim, f0, fps)
+    speed_a0 = min(35.0, max(_speed_mps(tm, attacker, f0, fps), 2.0))
+    speed_v0 = min(35.0, max(0.0, _speed_mps(tm, victim, f0, fps)))
     head_v = _heading(tm, victim, f0)
 
-    # 追击速度：保证能在窗口内追上（强度提升）
+    # 受害车"自己的轨迹"（victim_follow_track）：逐帧位姿 + 逐帧自身速度
+    own_v, own_vel = {}, {}
+    if victim_follow_track:
+        own_v = _own_pose_series(tm, victim, frames)
+        okeys = sorted(own_v)
+        for i, f in enumerate(okeys):
+            if i == 0:
+                own_vel[f] = np.zeros(3, dtype=np.float64)
+                continue
+            fa = okeys[i - 1]
+            ca = np.asarray(own_v[fa], dtype=np.float64)[:3, 3]
+            cb = np.asarray(own_v[f], dtype=np.float64)[:3, 3]
+            vv = (cb - ca) / float(max(1, f - fa)) / dt
+            vv[1] = 0.0
+            own_vel[f] = vv
+        # 真实轨迹常有"某一帧位置跳一下"的检测噪声（实测 T:13 单帧跳 6.8m = 68m/s）。
+        # 直接用相邻帧差分算速度，会让冲量项爆掉（把肇事车打飞、或把它甩到天上）。
+        # 这里对速度序列做 3 帧中值滤波 + 限幅（≤40m/s）。
+        oks = sorted(own_vel)
+        if len(oks) >= 3:
+            arr = np.array([own_vel[k] for k in oks], dtype=np.float64)
+            pad = np.vstack([arr[:1], arr, arr[-1:]])
+            sm = np.stack([np.median(pad[i:i + 3], axis=0) for i in range(len(arr))])
+            nrm = np.linalg.norm(sm, axis=1)
+            cap = 30.0
+            sc = np.where(nrm > cap, cap / np.maximum(nrm, 1e-6), 1.0)
+            sm = sm * sc[:, None]
+            for i, k in enumerate(oks):
+                own_vel[k] = sm[i]
+        elif oks:
+            for k in oks:
+                nv = float(np.linalg.norm(own_vel[k]))
+                if nv > 30.0:
+                    own_vel[k] = own_vel[k] / nv * 30.0
+        if own_v:
+            pos_v = np.asarray(own_v[int(f0)], dtype=np.float64)[:3, 3].copy()
+            y_v = float(pos_v[1])
+            if okeys:
+                vel_v = np.asarray(own_vel.get(int(okeys[min(1, len(okeys) - 1)]),
+                                               np.zeros(3)), dtype=np.float64).copy()
+                if float(np.linalg.norm(vel_v)) < 1e-3:
+                    vel_v = head_v * speed_v0
+
+    # 追击目标速度：给了 impact_frame 就按"期望在第几帧撞上"反推需要的接近速度；
+    # 否则退回旧口径（窗口 70% 内追上），但通过"限加速度"逐步逼近，避免瞬时加速
     n = len(frames)
-    dist0 = np.linalg.norm((pos_v - pos_a) * np.array([1, 0, 1]))
-    need_speed = dist0 / max(1e-3, (n * 0.55) * dt) + speed_v0
-    vel_a = head_a * max(speed_a0, need_speed) * (0.9 + 0.3 * intensity)
-    vel_v = head_v * speed_v0
+    dist0 = float(np.linalg.norm((pos_v - pos_a) * np.array([1, 0, 1])))
+    if attacker_target_speed is not None:
+        # 上层已经用"实测撞击帧"迭代出更准的目标速度了（见 traj_llm._op_collide）
+        target_speed_a = float(np.clip(float(attacker_target_speed), 0.5, 45.0))
+    elif impact_frame is not None:
+        t_close = max(0.2, (float(impact_frame) - float(f0)) / max(1e-6, float(fps)))
+        # 需要的接近速度 = 中心距 / 期望时长 + 受害车自己的速度。
+        # 注意**不要**在这里减"两车半长"：斜碰时两车的支撑距离远小于半长之和，减了会
+        # 让"其实还没贴上"的车慢慢蹭（实测把追尾变成 0.3m/s 的爬行）。
+        # 真实撞击帧由上层迭代校正（跑一次 → 看实测撞击帧 → 按比例修正速度）。
+        need_speed = dist0 / t_close + speed_v0
+        # 允许为了"晚一点撞"而松油门/刹车（旧写法的下界是"初始速度"，永远降不下来，
+        # 于是撞得比期望早）
+        target_speed_a = float(np.clip(need_speed, 0.5, 45.0))
+    else:
+        need_speed = dist0 / max(1e-3, (n * 0.7) * dt) + speed_v0
+        target_speed_a = float(np.clip(need_speed * (0.9 + 0.3 * intensity), speed_a0, 45.0))
+    max_accel = 4.0 + 3.0 * intensity   # 追击加速度上限 m/s²
+    max_decel = 8.0                     # 制动减速度上限 m/s²
+    vel_a = head_a * speed_a0
+    if not victim_follow_track:
+        vel_v = head_v * speed_v0
 
     friction_decel = 7.0  # m/s^2 摩擦减速度
     collided = False
     collision_frame = None
+    push_v = np.zeros(3, dtype=np.float64)      # 受害车的"冲量额外位移"
+    push_vel = np.zeros(3, dtype=np.float64)    # 冲量带来的额外速度
 
     pose_a_cur = np.array(pose_a0, dtype=np.float32).copy()
     pose_v_cur = np.array(pose_v0, dtype=np.float32).copy()
@@ -459,33 +749,85 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
     for i, f in enumerate(frames):
         if i > 0:
             if not collided:
-                # 追击：肇事车持续指向受害车当前位置
-                to_v = pos_v - pos_a
+                # 追击：朝受害车的**拦截点**（它接下来会到的地方）限加速度逼近。
+                # 旧实现朝受害车"当前"位置追（跟踪制导）：对向/侧向碰撞时两车是"迎面"
+                # 关系，朝当前位置追会让肇事车必须先掉头（转向率上限 60°/s → 掉头要 3s），
+                # 窗口内根本撞不上，于是每次都退化成兜底的"刚好接触"摆放；同时受害车
+                # 若在转弯，朝当前位置追也会明显偏。
+                pv_pred = pos_v
+                t_int = 0.4
+                for _ in range(4):
+                    pv_pred = pos_v + vel_v * t_int
+                    dd = pv_pred - pos_a
+                    dd[1] = 0.0
+                    t_int = float(np.clip(
+                        float(np.linalg.norm(dd)) / max(2.0, float(np.linalg.norm(vel_a))),
+                        0.05, 3.0))
+                to_v = pv_pred - pos_a
                 to_v[1] = 0.0
                 d = np.linalg.norm(to_v)
-                if d > 1e-4:
-                    aim = to_v / d
-                    spd = np.linalg.norm(vel_a)
-                    vel_a = aim * spd
+                aim = (to_v / d) if d > 1e-4 else head_a
+                target_v = aim * target_speed_a
+                vel_a = _step_toward_2d(vel_a, target_v, max_accel, max_decel, dt)
+                # 受害车制动：前车从 brake_frame 起减速，制造反应窗口
+                if (victim_brake_frame is not None and f >= victim_brake_frame
+                        and victim_brake_decel > 0):
+                    sv = float(np.linalg.norm(vel_v))
+                    if sv > 1e-3:
+                        vel_v = vel_v / sv * max(0.0, sv - victim_brake_decel * dt)
                 pos_a = pos_a + vel_a * dt
-                pos_v = pos_v + vel_v * dt
+                if own_v:
+                    # 受害车沿**它自己的轨迹**继续走（转弯的车继续转弯）
+                    own_c = np.asarray(own_v.get(int(f), own_v.get(f0)), dtype=np.float64)[:3, 3]
+                    pos_v = own_c.copy()
+                    vel_v = np.asarray(own_vel.get(int(f), np.zeros(3)), dtype=np.float64).copy()
+                    if float(np.linalg.norm(vel_v)) < 1e-3:
+                        vel_v = head_v * speed_v0
+                else:
+                    pos_v = pos_v + vel_v * dt
             else:
-                # 碰后：双方摩擦减速
+                # 碰后：肇事车摩擦减速；受害车 = 自己的轨迹 + 冲量额外位移（摩擦衰减）
                 sa = np.linalg.norm(vel_a)
-                sv = np.linalg.norm(vel_v)
                 if sa > 1e-3:
                     vel_a = vel_a / sa * max(0.0, sa - friction_decel * dt)
-                if sv > 1e-3:
-                    vel_v = vel_v / sv * max(0.0, sv - friction_decel * dt)
                 pos_a = pos_a + vel_a * dt
-                pos_v = pos_v + vel_v * dt
+                if own_v:
+                    sp = float(np.linalg.norm(push_vel))
+                    if sp > 1e-3:
+                        push_vel = push_vel / sp * max(0.0, sp - friction_decel * dt)
+                    push_v = push_v + push_vel * dt
+                    own_c = np.asarray(own_v.get(int(f), own_v.get(f0)), dtype=np.float64)[:3, 3]
+                    pos_v = own_c + push_v
+                    vel_v = np.asarray(own_vel.get(int(f), np.zeros(3)),
+                                       dtype=np.float64).copy() + push_vel
+                else:
+                    sv = np.linalg.norm(vel_v)
+                    if sv > 1e-3:
+                        vel_v = vel_v / sv * max(0.0, sv - friction_decel * dt)
+                    pos_v = pos_v + vel_v * dt
 
             pos_a[1] = y_a
-            pos_v[1] = y_v
+            if not own_v:
+                pos_v[1] = y_v
+
+        # 叠加横向偏移（变道用）：只影响"写入与碰撞检测"的位置，不污染纵向动力学
+        wa, wv = pos_a, pos_v
+        if attacker_lateral or victim_lateral:
+            t = i / max(1, n - 1)
+            u = (t - lateral_ramp[0]) / max(1e-6, lateral_ramp[1] - lateral_ramp[0])
+            s_lat = _smoothstep(max(0.0, min(1.0, u)))
+            if attacker_lateral:
+                wa = pos_a + _ground_right(head_a) * (float(attacker_lateral) * s_lat)
+                wa[1] = y_a
+            if victim_lateral:
+                wv = pos_v + _ground_right(head_v) * (float(victim_lateral) * s_lat)
+                wv[1] = float(pos_v[1]) if own_v else y_v
 
         # 写入位姿（保持各自朝向，仅更新中心）
-        pa = _pose_with_center(pose_a_cur, pos_a)
-        pv = _pose_with_center(pose_v_cur, pos_v)
+        # 受害车跟随自己的轨迹时，用它**自己那一帧的朝向**（转弯的车保持转角）
+        pv_base = np.asarray(own_v[int(f)], dtype=np.float32) if own_v else pose_v_cur
+        pa = _pose_with_center(pose_a_cur, wa)
+        pv = _pose_with_center(pv_base, wv)
 
         # 碰撞检测（用当前帧位姿）
         if not collided and i > 0:
@@ -493,7 +835,7 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
             if hit:
                 collided = True
                 collision_frame = f
-                normal = pos_v - pos_a
+                normal = np.asarray(wv, dtype=np.float32) - np.asarray(wa, dtype=np.float32)
                 normal[1] = 0.0
                 nn = np.linalg.norm(normal)
                 normal = normal / nn if nn > 1e-4 else head_a
@@ -504,25 +846,94 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                     if rel > 0:  # 正在接近才有冲量
                         j = -(1 + restitution) * rel / (1 / mass_a + 1 / mass_v)
                         impulse = j * normal
-                        vel_a = vel_a + impulse / mass_a
-                        vel_v = vel_v - impulse / mass_v
+                        dva = impulse / mass_a
+                        dvv = impulse / mass_v
+                        # 冲量限幅：真实轨迹有噪声/极端几何时，动量守恒会算出"把车弹飞"
+                        # 的速度（实测肇事车被推到 14m/s 后一直飞）。这里限制单次撞击的
+                        # 速度增量：肇事车 ≤8m/s、受害车 ≤12m/s。
+                        na = float(np.linalg.norm(dva))
+                        if na > 8.0:
+                            dva = dva * (8.0 / na)
+                        nv_ = float(np.linalg.norm(dvv))
+                        if nv_ > 12.0:
+                            dvv = dvv * (12.0 / nv_)
+                        vel_a = vel_a + dva
+                        vel_v = vel_v - dvv
                 else:
                     # 无物理：双方碰撞后都停下（受害车不被撞飞）
                     vel_a = vel_a * 0.0
                     vel_v = vel_v * 0.0
-                # 防穿模：把受害车沿法线推到接触面外
-                contact = dims_a[0] / 2.0 + min(dims_v[0], dims_v[1]) / 2.0
-                pos_v = pos_a + normal * contact
-                pos_v[1] = y_v
-                pv = _pose_with_center(pose_v_cur, pos_v)
+                if own_v:
+                    # 受害车：冲量只作为"额外速度"叠加在它自己的运动之上，
+                    # 它自己的轨迹（含转弯）不被改写
+                    push_vel = np.asarray(vel_v, dtype=np.float64) - \
+                        np.asarray(own_vel.get(int(f), np.zeros(3)), dtype=np.float64)
+                # 防穿模：沿法线用各自 OBB 的半宽，把受害车精确推到接触面外
+                contact = (_obb_radius_along(pose_a_cur, dims_a, normal)
+                           + _obb_radius_along(pv_base, dims_v, normal))
+                pos_v = np.asarray(wa, dtype=np.float32) + normal * contact
+                if own_v:
+                    own_c = np.asarray(own_v[int(f)], dtype=np.float64)[:3, 3]
+                    push_v = np.asarray(pos_v, dtype=np.float64) - own_c
+                    push_v[1] = 0.0
+                pos_v[1] = float(own_c[1]) if own_v else y_v
+                pv = _pose_with_center(pv_base, pos_v)
+                # 防穿模后再把横向偏移补回去（否则该帧会丢掉变道偏移）
+                if victim_lateral:
+                    wv2 = pos_v + _ground_right(head_v) * (float(victim_lateral) * s_lat)
+                    wv2[1] = float(pos_v[1]) if own_v else y_v
+                    pv = _pose_with_center(pv_base, wv2)
 
         _write_pose(tm, attacker, f, pa)
-        _write_pose(tm, victim, f, pv)
+        # 受害车跟随自己的轨迹时：**撞前完全不写它**（写进去也只是把原值抄一遍，还会
+        # 在 track_edits 里留一堆"编辑"）；撞后（或用户显式要求它变道）才写。
+        if (not own_v) or collided or victim_lateral:
+            _write_pose(tm, victim, f, pv)
 
+    # 碰撞后逐帧防穿模：首次碰撞虽有精确分离，但之后两车可能再次贴上/压进去
+    # （肇事车仍比受害车快时会二次接触），这里统一兜底——与语言轨迹编辑共享同一套逻辑。
+    separation = {"applied": False, "frames_fixed": 0,
+                  "max_penetration_before": 0.0, "max_penetration_after": 0.0}
+    if collided:
+        separation = separate_pair(tm, attacker, victim, frames,
+                                   dims_a=dims_a, dims_v=dims_v,
+                                   from_frame=collision_frame)
     return {"collided": collided, "collision_frame": collision_frame,
             "frames": list(frames), "fps": fps,
             "attacker": int(attacker), "victim": int(victim),
-            "dims_a": dims_a, "dims_v": dims_v}
+            "dims_a": dims_a, "dims_v": dims_v,
+            "target_speed_a": float(target_speed_a),
+            "separation": separation}
+
+
+def simulate_pair_collision(tm, attacker, victim, frames, fps=10.0, intensity=1.0,
+                            enable_physics=True, attacker_lateral=0.0, victim_lateral=0.0,
+                            lateral_ramp=(0.0, 1.0), victim_brake_decel=0.0,
+                            victim_brake_frame=None, victim_follow_track=False,
+                            impact_frame=None, attacker_target_speed=None):
+    """【语言轨迹编辑 / corner case 共用】两车事故编排的唯一入口。
+
+    追击（限加速度）→ 首次接触（OBB-SAT + 非弹性动量冲量）→ 碰撞后摩擦减速
+    → **逐帧防穿模分离**。语言驱动轨迹编辑的 `collide` 操作直接调它，
+    corner case 的 `prim_pursue` 也走同一条 `_simulate_pursuit_collision`，
+    所以两条路径的事故表现、碰撞判定、防穿模行为完全一致，先后编辑也不会互相打架。
+
+    `attacker_lateral` / `victim_lateral`：叠加在追击动力学之上的横向偏移
+    （按 `lateral_ramp` 做 smoothstep 渐变）——"变道 + 撞"要用它，否则
+    纯粹的追击会把之前做好的横移覆盖掉。
+    """
+    return _simulate_pursuit_collision(
+        tm, attacker, victim, list(frames), fps, intensity,
+        enable_physics=enable_physics,
+        victim_brake_decel=victim_brake_decel,
+        victim_brake_frame=victim_brake_frame,
+        attacker_lateral=attacker_lateral,
+        victim_lateral=victim_lateral,
+        lateral_ramp=lateral_ramp,
+        victim_follow_track=victim_follow_track,
+        impact_frame=impact_frame,
+        attacker_target_speed=attacker_target_speed,
+    )
 
 
 # ==================== 入口 ====================
@@ -554,15 +965,22 @@ def _analysis_from_sim(tm, sim, safety_margin=1.5):
         ca = np.asarray(pa, dtype=np.float32)[:3, 3]
         cv = np.asarray(pv, dtype=np.float32)[:3, 3]
         distance = float(np.linalg.norm(ca - cv))
-        va = _speed_mps(tm, attacker, f, fps)
-        vv = _speed_mps(tm, victim, f, fps)
-        rel_vel = abs(va - vv)
+        # 用"相对速度向量"的模长作为接近速度：对向/侧碰时等于两车速度之和，
+        # 而不是 |v_a|-|v_v|（标量相减在对向时会被抵消成 0，导致关键帧=碰撞帧）。
+        va_vec = _velocity_vec(tm, attacker, f, fps)
+        vv_vec = _velocity_vec(tm, victim, f, fps)
+        rel_vel = float(np.linalg.norm(va_vec - vv_vec))
         braking = (rel_vel ** 2) / (2 * 6.0) if rel_vel > 0 else 0.0
         if distance > braking + safety_margin:
             critical_idx = i + 1
             break
         critical_idx = i
 
+    # 兜底：若向前搜索没有找到"仍可避免"的更早帧（例如两车速度差很小、或中间帧位姿缺失），
+    # critical_idx 会停在碰撞帧上，此时 TTC 会被算成 0.0s——物理上等价于"零反应时间"，
+    # 在 10fps 采样下也超出分辨率含义。至少给出"撞击前一帧"（=1 帧 ≈0.1s 反应窗口）。
+    if critical_idx >= collision_idx and collision_idx > 0:
+        critical_idx = collision_idx - 1
     critical_frame = frames[critical_idx]
     reaction_frames = collision_idx - critical_idx
     time_to_collision = reaction_frames * dt
@@ -600,6 +1018,15 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
     if scenario_type not in SCENARIOS:
         raise ValueError(f"未知场景类型: {scenario_type}")
 
+    # 夹取到可用的真实帧范围，避免请求帧超出数据导致位姿为 None
+    # （多视角数据已合并为真实帧；num_frames 超出会引发下游 0 维数组索引错误）
+    total = getattr(tm, "num_frames", 0) or 0
+    if total > 0:
+        last = total - 1                      # 最后一个有效真实帧
+        start_frame = int(min(max(0, start_frame), max(0, last - 1)))
+        # end_frame（含）不得超过最后一帧
+        num_frames = int(max(1, min(num_frames, last - start_frame)))
+
     end_frame = start_frame + num_frames
     frames = list(range(start_frame, end_frame + 1))
     sampling = _normalize_sampling_params(scenario_type, sampling_params, sampling_seed)
@@ -609,27 +1036,12 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
     collision_pair = None
     sim_result = None          # 物理仿真结果（若有）
 
-    if scenario_type == "rear-end":
-        affected, synthesized, collision_pair, sim_result = _gen_rear_end(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "hard-brake":
-        affected = _gen_hard_brake(tm, roles, frames, intensity, fps=fps, sampling=sampling)
-    elif scenario_type == "lane-change-cutin":
-        affected, synthesized, collision_pair = _gen_lane_change(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "intersection-tbone":
-        affected, synthesized, collision_pair, sim_result = _gen_tbone(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "head-on":
-        affected, synthesized, collision_pair, sim_result = _gen_head_on(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "pedestrian-crossing":
-        affected, synthesized, collision_pair, sim_result = _gen_pedestrian_crossing(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "cut-out-reveal":
-        affected, synthesized, collision_pair = _gen_cut_out_reveal(tm, roles, frames, fps, intensity, enable_physics, sampling)
-    elif scenario_type == "chain-reaction-rear-end":
-        affected, synthesized, collision_pair, sim_result = _gen_chain_reaction_rear_end(tm, roles, frames, fps, intensity, enable_physics)
-    elif scenario_type == "cutin-brake-pileup":
-        affected, synthesized, collision_pair, sim_result = _gen_cutin_brake_pileup(tm, roles, frames, fps, intensity, enable_physics)
-    elif scenario_type == "occluded-pedestrian-pileup":
-        affected, synthesized, collision_pair, sim_result = _gen_occluded_pedestrian_pileup(tm, roles, frames, fps, intensity, enable_physics)
-
+    # 统一参数化生成引擎：已迁移到"运动原语 + 场景计划"的类型走这里；
+    # 未迁移的复合场景（行人横穿 / 三车连环）退回旧 _gen_*。
+    import scenario_engine
+    if scenario_type in scenario_engine.SCENARIO_PLANS:
+        affected, synthesized, collision_pair, sim_result = scenario_engine.execute(
+            tm, scenario_type, roles, frames, fps, intensity, enable_physics, sampling)
     result = {
         "scenario_type": scenario_type,
         "affected_tracks": affected,
@@ -714,6 +1126,8 @@ def _gen_rear_end(tm, roles, frames, fps, intensity, enable_physics, sampling=No
     attacker_speed = max(victim_speed + rel_speed, 3.0)
     if sampling.get("collision_severity") == "near_miss":
         lateral = lateral if abs(lateral) >= 0.8 else (0.9 if lateral >= 0 else -0.9)
+    # 保证至少 ~0.6s 的接近时间，避免"起步即撞"（无反应窗口）
+    gap = max(gap, rel_speed * 0.6)
     _apply_initial_pair_layout(
         tm, attacker, victim, frames, fps, gap,
         lateral_offset_m=lateral,
@@ -721,11 +1135,12 @@ def _gen_rear_end(tm, roles, frames, fps, intensity, enable_physics, sampling=No
         front_speed_mps=victim_speed,
     )
     brake_frame = frames[min(len(frames) - 1, max(0, int(round(reaction_delay * fps))))]
-    _apply_brake_decel(tm, victim, frames, fps, brake_frame, decel)
-
+    # 前车制动放进追击仿真里做（旧做法会被仿真覆盖，导致前车从不减速）
     collided = _simulate_pursuit_collision(
         tm, attacker, victim, frames, fps, intensity * severity,
         enable_physics=enable_physics,
+        victim_brake_decel=decel,
+        victim_brake_frame=brake_frame,
     )
     return [int(attacker), int(victim)], synth, (attacker, victim), collided
 
@@ -817,7 +1232,9 @@ def _interception_setup(tm, vehicle, frames, fps, ped_speed):
     veh_pose_fc = tm.get_track_pose(vehicle, fc)
     f0 = frames[0]
     if veh_pose_fc is None:
-        veh_pose_fc = tm.get_track_pose(vehicle, f0)
+        veh_pose_fc = _pose_or_nearest(tm, vehicle, fc)
+    if veh_pose_fc is None:
+        raise ValueError("受影响车辆在事故帧区间内没有可用位姿，无法生成行人横穿")
     veh_c_fc = np.array(veh_pose_fc, dtype=np.float32)[:3, 3].copy()
     veh_head = _heading(tm, vehicle, fc)
     cross_dir = _ground_right(veh_head)  # 垂直于车辆前向横穿
@@ -829,12 +1246,39 @@ def _interception_setup(tm, vehicle, frames, fps, ped_speed):
     return start, move_dir, fc
 
 
+def _create_pedestrian_track(tm, poses, dims=None, type_name="合成行人"):
+    """创建行人物体：**只用真实行人 3D 模型**（person_*.ply，稳定哈希选择）。
+
+    注意：旧实现会在没有模型时"克隆场景里某个已有动态物体的外观"来冒充行人
+    （`_pick_donor(prefer_pedestrian=True)` + `create_synthetic_track`）。这条路径已按需求删除：
+    它会静默改变行人的外观（往往克隆出一辆车），并且会让"用 person_*.ply"的新逻辑永远不触发。
+    现在没有可用模型就直接报错，便于暴露环境问题。
+    """
+    key = None
+    try:
+        f0 = sorted(poses.keys())[0]
+        c = np.asarray(poses[f0], dtype=np.float32)[:3, 3]
+        key = f"{round(float(c[0]), 3)},{round(float(c[1]), 3)},{round(float(c[2]), 3)}"
+    except Exception:  # noqa: BLE001
+        key = None
+    try:
+        return tm.add_pedestrian_track(poses, dimensions=dims, type_name=type_name, choice_key=key)
+    except Exception as e:  # noqa: BLE001
+        spec = os.environ.get("DGGT_PED_PLYS",
+                              "sam-3d-objects/person_0.ply:sam-3d-objects/person_1.ply")
+        raise ValueError(
+            f"没有可用的行人 3D 模型（{e}）。请用 DGGT_PED_PLYS 指定 person_*.ply，"
+            f"或把模型放到：{spec}") from e
+
+
 def _make_intercepting_pedestrian(tm, vehicle, frames, fps, intensity):
     """合成一个会拦截车辆路径的行人。"""
     ped_speed = 1.6 * max(0.6, intensity)
     start, move_dir, fc = _interception_setup(tm, vehicle, frames, fps, ped_speed)
     f0 = frames[0]
-    ref_pose = tm.get_track_pose(vehicle, f0)
+    ref_pose = _pose_or_nearest(tm, vehicle, f0)
+    if ref_pose is None:
+        raise ValueError("受影响车辆没有可用位姿，无法合成横穿行人")
     y_ground = np.array(ref_pose, dtype=np.float32)[1, 3]
     dt = 1.0 / fps
     poses = {}
@@ -843,10 +1287,8 @@ def _make_intercepting_pedestrian(tm, vehicle, frames, fps, intensity):
         c = start + move_dir * (ped_speed * dt * i)
         c[1] = y_ground
         poses[f] = _pose_with_center(base, c)
-    donor = _pick_donor(tm, prefer_pedestrian=True)
-    donor_dims = _get_dimensions(tm, donor)
-    dims = donor_dims if (donor_dims[0] * donor_dims[1] * donor_dims[2] < 2.0) else [0.6, 0.6, 1.7]
-    return tm.create_synthetic_track(donor, poses, dimensions=dims, type_name="合成行人")
+    # 行人尺寸/外观都来自 person_*.ply（不再从场景里挑 donor 冒充行人）
+    return _create_pedestrian_track(tm, poses)
 
 
 def _retarget_pedestrian(tm, pedestrian, vehicle, frames, fps, intensity):

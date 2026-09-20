@@ -1,0 +1,42 @@
+{
+  "scene_path": "/root/autodl-fs/dggt-main/output/waymo_eval/001",
+  "output_dir": "/root/autodl-fs/dggt-main/output/waymo_eval/001/collision_lane_change",
+  "num_frames": 20,
+  "start_idx": 0,
+  "draw_bboxes": false,
+  "draw_ids": true,
+  "save_video": true,
+  "video_name": "collision_lane_change.mp4",
+  "video_fps": 10,
+  "load_sky": true,
+  "static_only": false,
+  "metadata": {
+    "case_name": "collision_lane_change",
+    "export_id_map": true,
+    "description": "基于原始场景中 track_id=2 已向左变道、track_id=5 正常直行的情况，让 track_id=5 也向左变道并与 track_id=2 发生侧向碰撞。"
+  },
+  "actions": [
+    {
+      "type": "collision_course",
+      "target": {},
+      "params": {
+        "lead_track_id": 2,
+        "follow_track_id": 5,
+        "mode": "lane_change",
+        "collision_frame": 11,
+        "decel_start": 4,
+        "approach_start": 3,
+        "hold_after": 18,
+        "collision_hold_frames": 2,
+        "lateral_axis": "x",
+        "lateral_offset": 1.8,
+        "approach_ratio": 0.78,
+        "slow_down_scale": 0.55,
+        "post_collision_gap": 0.12,
+        "follow_gain": 1.0,
+        "lead_drift": 0.0,
+        "temporal_upsample_factor": 1
+      }
+    }
+  ]
+}

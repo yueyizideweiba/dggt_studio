@@ -1,16 +1,29 @@
-# DGGT Studio 运行依赖（4DGS 渲染引擎 + Studio 后端）
-# 注意：torch / gsplat 需与你的 CUDA 版本匹配，建议参考官方安装说明单独安装。
-
-torch>=2.0.0
-gsplat>=0.1.0
-numpy>=1.24
-scipy>=1.10
-opencv-python>=4.8
-plyfile>=0.8
-imageio>=2.31
-
-# Studio 后端 (FastAPI)
-fastapi>=0.104
-uvicorn[standard]>=0.24
-python-multipart>=0.0.6
-websockets>=12.0
+av
+IPython
+open3d
+gsplat
+lpips
+scikit-image
+transformers==4.46.3
+imageio-ffmpeg
+diffusers==0.30.3
+typed-argument-parser
+hydra-core
+einops
+rich
+tqdm
+scipy
+h5py
+kornia
+peft
+sophuspy
+opencv-python
+rerun-sdk==0.21.0
+numpy==1.26.4
+matplotlib
+imageio
+trimesh
+huggingface_hub
+python-box[all]~=7.0
+timm
+wandb

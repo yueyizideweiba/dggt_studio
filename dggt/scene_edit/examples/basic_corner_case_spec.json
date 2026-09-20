@@ -1,0 +1,51 @@
+{
+  "scene_path": "/root/autodl-fs/dggt-main/output/waymo_eval/001",
+  "output_dir": "/root/autodl-fs/dggt-main/output/waymo_eval/001//basic_corner_case",
+  "num_frames": 20,
+  "start_idx": 0,
+  "draw_bboxes": true,
+  "draw_ids": true,
+  "save_video": true,
+  "video_name": "basic_corner_case.mp4",
+  "video_fps": 10,
+  "load_sky": true,
+  "static_only": false,
+  "metadata": {
+    "case_name": "basic_corner_case",
+    "export_id_map": true,
+    "description": "基础示例：把某个 track 进行平移编辑，用于验证规则引擎闭环。"
+  },
+  "actions": [
+    {
+      "type": "translate_track",
+      "target": {
+        "track_id": 1
+      },
+      "params": {
+        "dx": 2.0,
+        "dy": 0.0,
+        "dz": 0.0
+      }
+    },
+    {
+      "type": "heading_perturb",
+      "target": {
+        "track_id": 1
+      },
+      "params": {
+        "yaw_deg": 12.0,
+        "begin_frame": 6
+      }
+    },
+    {
+      "type": "clip_track",
+      "target": {
+        "track_id": 3
+      },
+      "params": {
+        "begin_frame": 5,
+        "end_frame": 14
+      }
+    }
+  ]
+}

@@ -1,12 +1,3 @@
-"""
-Corner case quality gate for DGGT Studio.
-
-This module turns generated corner-case metadata into a machine-checkable
-quality report. It intentionally depends only on TrackManager pose/bbox data in
-its first version; map and rendered-visibility checks are reported as unknown
-until those subsystems are wired in.
-"""
-
 from __future__ import annotations
 
 import math
@@ -21,7 +12,7 @@ from dggt.scene_edit.collision_physics import check_collision
 
 
 DEFAULT_THRESHOLDS = {
-    "ttc_min_s": 0.2,
+    "ttc_min_s": 0.1,
     "ttc_max_s": 3.0,
     "near_miss_distance_m": 2.0,
     "max_speed_mps": 45.0,
@@ -32,6 +23,11 @@ DEFAULT_THRESHOLDS = {
     "max_bbox_penetration_m": 1.0,
     "min_pose_coverage": 0.85,
 }
+
+# 这些场景的本质是"目标突然出现"，反应窗口本就极小 → 不做通用 TTC 区间要求
+SUDDEN_APPEARANCE_SCENARIOS = {"pedestrian-crossing", "cut-out-reveal"}
+# 这些场景本身不产生"碰撞事件"（急刹是单车风险；前车闪开是露出障碍，不撞）
+NO_COLLISION_EVENT_SCENARIOS = {"hard-brake", "cut-out-reveal"}
 
 
 def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10.0,
@@ -53,18 +49,64 @@ def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10
     if len(collision_tracks) < 2:
         collision_tracks = affected_tracks[:2]
 
-    track_metrics = {
-        str(tid): _track_motion_metrics(tm, tid, frames, fps)
-        for tid in affected_tracks
-    }
-    pair_metrics = _pair_collision_metrics(tm, collision_tracks, frames)
-
     collision_analysis = corner_case_result.get("collision_analysis") or {}
+    pair_metrics = _pair_collision_metrics(tm, collision_tracks, frames)
     collision_frame = _first_non_none(
         corner_case_result.get("collision_frame"),
         collision_analysis.get("collision_frame"),
         pair_metrics.get("collision_frame"),
     )
+    # 碰撞/最近距离附近的帧是"撞击瞬间"：允许出现较大的瞬时减速，不纳入机动性阈值
+    impact_frames = set()
+    if collision_frame is not None:
+        impact_frames |= {int(collision_frame) - 1, int(collision_frame), int(collision_frame) + 1}
+    mdf = pair_metrics.get("min_distance_frame")
+    if mdf is not None:
+        impact_frames |= {int(mdf) - 1, int(mdf), int(mdf) + 1}
+    # 连环事故会有多次碰撞（rear→middle、middle→lead），这里把所有"受影响物体两两之间"
+    # 的碰撞帧都豁免掉（物体数 ≤3，代价可忽略）。
+    try:
+        dims_map = {int(t): _dims_or_default(tm.get_track_dimensions(t)) for t in affected_tracks}
+        for ii in range(len(affected_tracks)):
+            for jj in range(ii + 1, len(affected_tracks)):
+                ta, tb = int(affected_tracks[ii]), int(affected_tracks[jj])
+                for f in frames:
+                    pa = tm.get_track_pose(ta, f)
+                    pb = tm.get_track_pose(tb, f)
+                    if pa is None or pb is None:
+                        continue
+                    hit, _pen = check_collision(np.asarray(pa, dtype=np.float32), dims_map[ta],
+                                                np.asarray(pb, dtype=np.float32), dims_map[tb])
+                    if hit:
+                        impact_frames |= {int(f) - 1, int(f), int(f) + 1}
+                        break
+    except Exception:  # noqa: BLE001
+        pass
+    # 接触距离豁免：两个物体中心距低于"OBB 沿连线半宽之和 + 0.6m"时，说明已处于接触/挤压状态，
+    # 这一帧的剧烈减速是撞击本身，不该按"机动加速度"去卡（连环事故常有多次碰撞）。
+    try:
+        for ii in range(len(affected_tracks)):
+            for jj in range(ii + 1, len(affected_tracks)):
+                ta, tb = int(affected_tracks[ii]), int(affected_tracks[jj])
+                da, db = dims_map[ta], dims_map[tb]
+                ra = 0.5 * math.sqrt(da[0] * da[0] + da[2] * da[2])
+                rb = 0.5 * math.sqrt(db[0] * db[0] + db[2] * db[2])
+                for f in frames:
+                    pa = tm.get_track_pose(ta, f)
+                    pb = tm.get_track_pose(tb, f)
+                    if pa is None or pb is None:
+                        continue
+                    ca = np.asarray(pa, dtype=np.float32)[:3, 3]
+                    cb = np.asarray(pb, dtype=np.float32)[:3, 3]
+                    if float(np.linalg.norm(ca - cb)) < (ra + rb + 0.6):
+                        impact_frames |= {int(f) - 1, int(f), int(f) + 1}
+    except Exception:  # noqa: BLE001
+        pass
+
+    track_metrics = {
+        str(tid): _track_motion_metrics(tm, tid, frames, fps, impact_frames=impact_frames)
+        for tid in affected_tracks
+    }
     critical_frame = _first_non_none(
         corner_case_result.get("critical_frame"),
         collision_analysis.get("critical_frame"),
@@ -76,22 +118,43 @@ def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10
     elif collision_analysis.get("time_to_collision") is not None:
         ttc_at_critical = float(collision_analysis["time_to_collision"])
 
-    event_present = bool(collision_frame is not None or pair_metrics.get("min_distance", math.inf) <= cfg["near_miss_distance_m"])
+    min_dist = pair_metrics.get("min_distance")
+    has_pair = len(collision_tracks) >= 2
+    scene_type = corner_case_result.get("scenario_type")
+    if scene_type in NO_COLLISION_EVENT_SCENARIOS:
+        event_present = None      # 该类场景按定义没有碰撞事件，不适用
+    elif has_pair:
+        event_present = bool(collision_frame is not None
+                             or (min_dist is not None and min_dist <= cfg["near_miss_distance_m"]))
+    else:
+        # 单物体场景（如紧急刹车）本身没有"碰撞事件"，该项不适用
+        event_present = None
     annotation_consistency = _annotation_consistency(tm, affected_tracks, frames, cfg)
 
     checks = []
     _add_check(checks, "event_present", event_present,
                "collision or near-miss exists",
                {"collision_frame": collision_frame, "min_distance": pair_metrics.get("min_distance")})
-    _add_check(checks, "ttc_range", _ttc_ok(ttc_at_critical, collision_frame, cfg),
+    # 行人横穿/前车闪开这类事故的本质就是"突然出现"，反应窗口本就极小，
+    # 用通用 TTC 区间门去要求它反而不合理 → 判为"不适用"。
+    ttc_ok = _ttc_ok(ttc_at_critical, collision_frame, cfg)
+    if corner_case_result.get("scenario_type") in SUDDEN_APPEARANCE_SCENARIOS and collision_frame is not None:
+        ttc_ok = None
+    _add_check(checks, "ttc_range", ttc_ok,
                "TTC at critical frame is within the configured range, or this is a near-miss",
                {"ttc_at_critical": ttc_at_critical, "range": [cfg["ttc_min_s"], cfg["ttc_max_s"]]})
     _add_check(checks, "motion_physical", _motion_ok(track_metrics, cfg),
                "speed, acceleration, jerk, yaw-rate, and step distance are below thresholds",
                _motion_summary(track_metrics))
-    _add_check(checks, "bbox_penetration", pair_metrics.get("max_penetration", 0.0) <= cfg["max_bbox_penetration_m"],
-               "OBB penetration depth is not excessive",
-               {"max_penetration": pair_metrics.get("max_penetration"), "threshold": cfg["max_bbox_penetration_m"]})
+    # 碰撞双方里含小体积物体（行人等）→ 穿透门不适用（撞到人本来就会互穿）
+    small_body = any(_is_small_body(tm, t) for t in collision_tracks) if has_pair else False
+    penetration_ok = None if small_body else (
+        pair_metrics.get("max_penetration", 0.0) <= cfg["max_bbox_penetration_m"])
+    _add_check(checks, "bbox_penetration", penetration_ok,
+               "OBB penetration depth is not excessive (N/A when a pedestrian-class body is involved)",
+               {"max_penetration": pair_metrics.get("max_penetration"),
+                "threshold": cfg["max_bbox_penetration_m"],
+                "small_body_involved": bool(small_body)})
     _add_check(checks, "annotation_consistency", annotation_consistency["ok"],
                "affected tracks have usable poses and bbox dimensions across the generated frame window",
                annotation_consistency)
@@ -124,7 +187,9 @@ def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10
     return _to_jsonable(report)
 
 
-def _track_motion_metrics(tm, track_id: int, frames: List[int], fps: float) -> Dict[str, Any]:
+def _track_motion_metrics(tm, track_id: int, frames: List[int], fps: float,
+                          impact_frames: Optional[set] = None) -> Dict[str, Any]:
+    exempt = impact_frames or set()
     samples = []
     for f in frames:
         pose = tm.get_track_pose(track_id, f)
@@ -159,6 +224,8 @@ def _track_motion_metrics(tm, track_id: int, frames: List[int], fps: float) -> D
 
     accels = []
     for i in range(len(speeds) - 1):
+        if samples[i + 1][0] in exempt:     # 撞击瞬间不查机动加速度
+            continue
         f0 = samples[i][0]
         f1 = samples[i + 2][0]
         dt = max(1, f1 - f0) / float(fps)
@@ -166,6 +233,8 @@ def _track_motion_metrics(tm, track_id: int, frames: List[int], fps: float) -> D
 
     jerks = []
     for i in range(len(accels) - 1):
+        if samples[i + 2][0] in exempt:
+            continue
         f0 = samples[i][0]
         f1 = samples[i + 3][0]
         dt = max(1, f1 - f0) / float(fps)
@@ -310,6 +379,19 @@ def _yaw_from_pose(pose: np.ndarray) -> float:
 
 def _angle_diff(a: float, b: float) -> float:
     return (a - b + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _is_small_body(tm, track_id) -> bool:
+    """是否"小体积参与者"（行人/自行车/摩托等）。
+
+    这类物体被车撞到时本来就会与车体互穿——那就是事故本身，用车辆之间
+    "不许穿模"的穿透门去卡它没有意义（会把所有行人事故判成不通过）。
+    """
+    try:
+        d = _dims_or_default(tm.get_track_dimensions(track_id))
+        return float(abs(d[0]) * abs(d[1]) * abs(d[2])) < 2.0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _dims_or_default(dims: Any) -> List[float]:

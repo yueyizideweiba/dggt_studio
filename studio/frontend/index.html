@@ -3,9 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- 避免浏览器缓存旧页面（改了 UI 后普通刷新即可生效） -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=20260920m">
 </head>
 <body>
     <div id="app">
@@ -13,7 +17,6 @@
         <header class="toolbar">
             <div class="toolbar-left">
                 <div class="logo">
-                    <span class="logo-icon">🎬</span>
                     <span class="logo-text">DGGT Studio</span>
                 </div>
             </div>
@@ -29,6 +32,8 @@
                         <input type="number" id="frameInput" value="0" min="0">
                         <span id="totalFrames">/ 0</span>
                     </div>
+                    <input type="range" id="frameSlider" class="frame-slider" min="0" max="0" step="1"
+                           value="0" title="拖动查看任意帧（帧数很多时不用一直点左右箭头）">
                     <button id="nextFrame" class="btn btn-icon" title="下一帧">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/>
@@ -61,6 +66,12 @@
                     </svg>
                     导出
                 </button>
+                <button id="labBtn" class="btn btn-primary">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M9 3v6l-4.5 8A2 2 0 006.3 20h11.4a2 2 0 001.8-3L15 9V3h2V1H7v2h2zm2 0h2v6.3l1.6 2.7H9.4L11 9.3V3z"/>
+                    </svg>
+                    Corner Case 工作台
+                </button>
             </div>
         </header>
 
@@ -89,6 +100,25 @@
                         <div class="info-item">
                             <span class="label">总帧数:</span>
                             <span id="sceneTotalFrames" class="value">0</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">时间轴:</span>
+                            <span class="value"><span id="tlDataFrames">0</span> 数据帧
+                                · 可渲染 <span id="tlTotalFrames">0</span></span>
+                        </div>
+                        <div class="timeline-extend">
+                            <input type="number" id="tlExtendInput" value="50" min="1" max="2000" step="10"
+                                   title="要延长多少帧">
+                            <button id="tlExtendBtn" class="btn btn-small btn-secondary">延长</button>
+                            <button id="tlExtend50" class="btn btn-small btn-secondary" data-extra="50">+50</button>
+                            <button id="tlExtend200" class="btn btn-small btn-secondary" data-extra="200">+200</button>
+                        </div>
+                        <label class="tl-check" title="勾选：延长的帧里相机固定在末帧（画质最稳），动态物体照常沿轨迹继续运动；不勾：相机也沿自车轨迹外推（跟车往前走）">
+                            <input type="checkbox" id="tlHoldCamera">
+                            <span>相机固定在末帧（物体继续动）</span>
+                        </label>
+                        <div id="tlStatus" class="detail" style="margin-top:4px;">
+                            原场景帧数不再是上限：延长后动态物体沿各自轨迹继续，相机沿自车轨迹外推。
                         </div>
                     </div>
                 </div>
@@ -175,54 +205,190 @@
                         <div class="button-row">
                             <button id="viewQualityReportBtn" class="btn btn-secondary btn-block" disabled>查看质量报告</button>
                         </div>
+                        <div class="button-row">
+                            <button id="renderCaseVideoBtn" class="btn btn-primary btn-block">录制该案例视频（主车视角 + 俯视视角）</button>
+                        </div>
+                        <div class="button-row">
+                            <button id="carlaQuickBtn" class="btn btn-secondary btn-block">送进 CARLA 仿真（看事故回放 / 实时）</button>
+                        </div>
                         <div id="cornerCaseStatus" class="cc-status"></div>
                     </div>
                 </div>
 
-                <div class="panel-section panel-weather-case">
+                <div class="panel-section panel-sam3d">
                     <div class="panel-header">
-                        <h3>极端天气 Corner Case</h3>
+                        <h3>自然语言编辑轨迹</h3>
                     </div>
-                    <div class="weather-panel">
+                    <div class="sam3d-panel">
                         <div class="form-group">
-                            <label>天气类型</label>
-                            <select id="weatherType" class="cc-select">
-                                <option value="clear">晴朗 / 关闭</option>
-                                <option value="rain">大雨</option>
-                                <option value="storm">暴风雨</option>
-                                <option value="snow">大雪</option>
-                                <option value="blizzard">暴风雪</option>
-                                <option value="fog">浓雾</option>
+                            <label>用自然语言描述怎么改 / 怎么撞</label>
+                            <textarea id="trajEditInstruction" rows="3" style="width:100%;box-sizing:border-box;"
+                                placeholder="例如：让 T:4 向左变道，然后和 T:2 相撞；T:5 减速到 4m/s；删掉 T:7；生成一辆红色轿车变道撞 T:2，持续 40 帧（也可以写“4 秒”）"></textarea>
+                        </div>
+                        <div class="button-row">
+                            <button id="trajEditApplyBtn" class="btn btn-primary btn-block">规划并应用</button>
+                        </div>
+                        <div class="form-group">
+                            <label>新建车在相撞里的角色</label>
+                            <select id="trajEditNewRole" class="cc-select">
+                                <option value="auto" selected>自动（按指令措辞判断，判不准会提示）</option>
+                                <option value="attacker">肇事车（新车去撞对方）</option>
+                                <option value="victim">被撞车（对方来撞新车）</option>
                             </select>
                         </div>
                         <div class="form-group">
-                            <label>强度 <span id="weatherIntensityVal">1.0</span></label>
-                            <input type="range" id="weatherIntensity" min="0" max="2" step="0.1" value="1.0">
+                            <label>轨迹帧数（默认值 · 指令里写"持续 40 帧 / 4 秒"优先）</label>
+                            <input type="number" id="trajEditNumFrames" class="cc-select" min="2" max="600" step="1"
+                                   value="30">
+                            <div class="detail" style="margin-top:4px;">
+                                原场景帧数不够时会自动延长时间轴
+                            </div>
                         </div>
                         <div class="form-group">
-                            <label>能见度(m) <span id="weatherVisibilityVal">45</span></label>
-                            <input type="range" id="weatherVisibility" min="8" max="120" step="1" value="45">
+                            <label>参考图（可选 · 指令里要"生成一辆车"时用）</label>
+                            <input type="file" id="trajEditRefFile" accept="image/*"
+                                   style="width:100%;box-sizing:border-box;">
                         </div>
-                        <div class="form-row">
-                            <div class="form-group half">
-                                <label>横风</label>
-                                <input type="number" id="weatherWindX" value="8" step="1">
-                            </div>
-                            <div class="form-group half">
-                                <label>垂直风</label>
-                                <input type="number" id="weatherWindY" value="0" step="1">
-                            </div>
+                        <div id="trajEditImages" class="traj-imgs" style="display:none;">
+                            <div class="detail" id="trajEditRefLabel">参考图（实际用于重建）</div>
+                            <img id="trajEditRefImg" class="traj-img" alt="参考图">
+                            <div class="detail">插入效果预览</div>
+                            <img id="trajEditPrevImg" class="traj-img" alt="插入预览">
                         </div>
-                        <div class="button-row">
-                            <button id="applyWeatherBtn" class="btn btn-primary btn-block">应用三维天气</button>
-                        </div>
-                        <div class="button-row">
-                            <button id="clearWeatherBtn" class="btn btn-secondary btn-block">清除天气</button>
-                        </div>
-                        <div class="cc-status">雨雪为相机视锥内3D粒子，带深度、风偏和体积雾化。</div>
+                        <div id="trajEditStatus" class="cc-status">LLM 解析 → 速度 / 变道 / 转向 / 删除 / 相撞（insert 会走生成车辆）</div>
+                        <div id="trajEditPreview" class="detail" style="white-space:pre-wrap;max-height:200px;overflow:auto;"></div>
                     </div>
                 </div>
-            </aside>
+
+                <div class="panel-section panel-heading">
+                    <div class="panel-header">
+                        <h3>车头朝向（自动跟随运动方向）</h3>
+                    </div>
+                    <div class="sam3d-panel">
+                        <div class="cc-status">默认对**全部动态物体**生效：车头始终朝向其运动方向。</div>
+                        <div class="rot-row">
+                            <label>平滑</label>
+                            <input type="range" id="autoHeadingSmooth" min="0" max="1" step="0.05" value="0.65">
+                            <span class="rot-val" id="autoHeadingSmoothVal">0.65</span>
+                        </div>
+                        <div id="autoHeadingStatus" class="cc-status">按运动轨迹逐帧计算车头方向并做平滑过渡（静止时保持上一朝向）。若个别物体方向相反，用物体面板的「翻转180°」单独修正。</div>
+                    </div>
+                </div>
+            <div class="panel-section panel-sam3d">
+                    <div class="panel-header">
+                        <h3>SAM 3D 交互重建</h3>
+                    </div>
+                    <div class="sam3d-panel">
+                        <div class="form-group">
+                            <label>源帧：<span id="sam3dSrcFrameLabel">当前帧</span></label>
+                            <div class="button-row">
+                                <button id="sam3dToggleBtn" class="btn btn-primary btn-block">开始交互分割</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>替换目标物体</label>
+                            <select id="sam3dTargetObject" class="cc-select">
+                                <option value="">（选择要替换的物体）</option>
+                            </select>
+                            <div class="button-row">
+                                <button id="sam3dPickTargetBtn" class="btn btn-small btn-secondary btn-block">在视图中点击选择目标</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>分割模型</label>
+                            <select id="sam3dModelSelect" class="cc-select">
+                                <option value="vit_b">ViT-B（快）</option>
+                                <option value="vit_l">ViT-L（均衡）</option>
+                                <option value="vit_h">ViT-H（最准）</option>
+                            </select>
+                        </div>
+                        <div class="button-row">
+                            <button id="sam3dAddObjectBtn" class="btn btn-secondary btn-block">添加物体（下一个）</button>
+                        </div>
+                        <div class="button-row">
+                            <a id="sam3dDownloadBtn" class="btn btn-secondary btn-block" style="display:none; text-decoration:none;">导出最近生成的 .ply</a>
+                        </div>
+                        <div class="button-row">
+                            <button id="sam3dPreviewBtn" class="btn btn-secondary btn-block" style="display:none;">预览最近生成的 .ply（旋转）</button>
+                        </div>
+                        <div class="form-group" id="sam3dScaleGroup" style="display:none;">
+                            <label>替换模型大小：<span id="sam3dScaleVal">100%</span></label>
+                            <input type="range" id="sam3dScaleRange" min="0.5" max="1.3" step="0.01" value="1.0" style="width:100%">
+                            <div class="detail" style="margin-top:4px;">替换后若比原模型偏大，往左拉即可（相对后端自动算出的尺寸）。</div>
+                        </div>
+                        <div id="sam3dStatus" class="cc-status">① 选目标物体 → ② 开始交互分割 → ③ 源图上点前景/背景 → ④ 生成</div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-sam3d">
+                    <div class="panel-header">
+                        <h3>文本添加实体（LLaDA-Image + SAM3D）</h3>
+                    </div>
+                    <div class="sam3d-panel">
+                        <div class="form-group">
+                            <label>描述要添加的物体</label>
+                            <textarea id="nlEntityPrompt" rows="2" style="width:100%;box-sizing:border-box;"
+                                placeholder="例如：一辆红色轿车 / 一个黄色施工锥桶 / 一辆白色厢式货车"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label>参考图（可选：上传后跳过文生图，直接用它重建）</label>
+                            <input type="file" id="nlEntityRefFile" accept="image/*" style="width:100%;box-sizing:border-box;">
+                        </div>
+                        <div class="form-group">
+                            <label>放置方式</label>
+                            <select id="nlEntityMode" class="cc-select">
+                                <option value="ahead" selected>自车前方（同向行驶）</option>
+                                <option value="oncoming">对向车道（迎面驶来）</option>
+                                <option value="roadside">路边停放（静止）</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>起始距离(m) / 速度(m/s，0=自动跟车) / 时长(帧)</label>
+                            <div class="button-row" style="display:flex;gap:6px;">
+                                <input type="number" id="nlEntityDistance" value="12" step="1" style="width:33%">
+                                <input type="number" id="nlEntitySpeed" value="0" step="0.5" style="width:33%">
+                                <input type="number" id="nlEntityFrames" value="20" step="1" style="width:33%">
+                            </div>
+                        </div>
+                        <div class="button-row">
+                            <button id="nlEntityBtn" class="btn btn-primary btn-block">生成并插入</button>
+                        </div>
+                        <div class="button-row">
+                            <button id="nlEntityReplanBtn" class="btn btn-secondary btn-block">重排选中物体（避碰 &amp; 物理合理）</button>
+                        </div>
+                        <div id="nlEntityStatus" class="cc-status">一句话描述 → LLaDA-Image 出图 → SAM3D 重建 → VLM 定尺寸/朝向 → 无冲突插入</div>
+                        <div class="form-group" id="nlEntityPreviewGroup" style="display:none;">
+                            <label>参考图</label>
+                            <img id="nlEntityPreviewImg" style="width:100%;border-radius:6px;" alt="参考图"/>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-ego">
+                    <div class="panel-header">
+                        <h3>主车视角</h3>
+                    </div>
+                    <div class="form-group">
+                        <label class="cc-checkbox">
+                            <input type="checkbox" id="egoVisible" checked>
+                            显示主车实体（3D 视图 / 俯视 / BEV）
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label>以谁的视角渲染</label>
+                        <select id="egoSource" class="cc-select">
+                            <option value="">真实主车（自车相机）</option>
+                        </select>
+                        <div class="detail" style="margin-top:4px;">也可以在视图里点击任意物体 →「以此物体视角渲染」</div>
+                    </div>
+                    <div class="form-group">
+                        <button id="egoGroundBtn" class="btn btn-secondary btn-block">自动贴地（按当前场景地面调整主车高度）</button>
+                        <div class="detail" style="margin-top:4px;">不同场景自车相机安装高度不同；若主车沉进路面/穿模，点此按 4DGS 地面重新摆放。</div>
+                    </div>
+                    <div id="egoStatus" class="cc-status">正在检测主车模型…</div>
+                </div>
+
+                </aside>
 
             <!-- 中央画布区域 -->
             <div class="canvas-container">
@@ -483,9 +649,453 @@
         </div>
     </div>
 
+    <!-- SAM 交互分割源图模态框 -->
+    <div id="samSourceModal" class="modal">
+        <div class="modal-content sam-source-modal">
+            <div class="modal-header">
+                <h2>源图交互分割</h2>
+                <button class="modal-close" id="samSourceCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body sam-source-body">
+                <div class="sam-source-frames">
+                    <button id="samSrcPrevBtn" class="btn btn-small">&larr; 上一帧</button>
+                    <span id="samSrcFrameLabel" class="sam-src-frame-label">帧 -</span>
+                    <button id="samSrcNextBtn" class="btn btn-small">下一帧 &rarr;</button>
+                    <button id="samSrcBestBtn" class="btn btn-small btn-primary">跳到遮挡最少的帧</button>
+                </div>
+                <div id="samSrcCandidates" class="sam-src-candidates"></div>
+                <div class="sam-source-canvas-wrap">
+                    <canvas id="samSourceCanvas"></canvas>
+                </div>
+                <div class="sam-source-controls">
+                    <button id="samSrcFgBtn" class="btn btn-small active">前景点</button>
+                    <button id="samSrcBgBtn" class="btn btn-small">背景点</button>
+                    <button id="samSrcUndoBtn" class="btn btn-small">撤销</button>
+                    <button id="samSrcClearBtn" class="btn btn-small">清除</button>
+                    <button id="samSrcGenerateBtn" class="btn btn-primary">生成并替换</button>
+                </div>
+                <div id="samSourceStatus" class="cc-status">左键=当前类型点，右键=撤销上一点</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ply 旋转预览模态框 -->
+    <div id="samPreviewModal" class="modal">
+        <div class="modal-content modal-large sam-preview-modal">
+            <div class="modal-header">
+                <h2>物体预览</h2>
+                <button class="modal-close" id="samPreviewCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body sam-preview-body">
+                <div class="sam-preview-canvas-wrap">
+                    <img id="samPreviewImg" alt="物体预览" />
+                </div>
+                <div class="sam-preview-controls">
+                    <button id="samPreviewPlayBtn" class="btn btn-small">旋转</button>
+                    <button id="samPreviewStopBtn" class="btn btn-small">暂停</button>
+                    <input type="range" id="samPreviewSlider" min="0" max="35" value="0" />
+                    <span id="samPreviewFrameLabel">0 / 0</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 实验台（测试各改动） -->
+    <div id="labModal" class="modal">
+        <div class="modal-content modal-large lab-modal">
+            <div class="modal-header">
+                <h2>Corner Case 工作台</h2>
+                <button class="modal-close" id="labCloseBtn">&times;</button>
+            </div>
+            <div class="lab-tabs">
+                <button class="lab-tab active" data-tab="batch">① 批量生成（起点·含视频）</button>
+                <button class="lab-tab" data-tab="graph">② 挑事故（关系图·可选）</button>
+                <button class="lab-tab" data-tab="sim">③ 渲染可信域评估（4DGS）</button>
+                <button class="lab-tab" data-tab="carla">④ CARLA 闭环仿真（可编辑/播放）</button>
+            </div>
+            <div id="labFlowBar" class="lab-flow">
+                <span class="lab-flow-step">流程</span>
+                <span id="labCaseCtx" class="cc-status" style="flex:1">还没有案例 —— 先在 ① 批量生成里跑一批，再点某一行右侧「载入场景」或「CARLA 这条」</span>
+                <button id="labPrevStepBtn" class="btn btn-secondary btn-small">← 上一步</button>
+                <button id="labNextStepBtn" class="btn btn-primary btn-small">下一步 →</button>
+            </div>
+            <div class="modal-body lab-body">
+                <!-- ① 关系图 -->
+                <div class="lab-panel" data-panel="graph">
+                    <div class="lab-row">
+                        <label>帧</label>
+                        <input type="number" id="labGraphFrame" value="0" min="0">
+                        <label>时间窗(帧)</label>
+                        <input type="number" id="labGraphWindow" value="10" min="1">
+                        <button id="labGraphRunBtn" class="btn btn-primary btn-small">读取关系图</button>
+                        <label class="cc-checkbox"><input type="checkbox" id="labGraphAuto" checked>切帧自动刷新</label>
+                    </div>
+                    <div id="labGraphStatus" class="cc-status">加载场景后点「读取关系图」。</div>
+                    <div id="labGraphSummary" class="lab-summary"></div>
+                    <div class="lab-split">
+                        <div class="lab-split-left">
+                            <div class="lab-subtitle">俯视图：节点=动态物体，连线=关系（越红=冲突关键度越高），箭头=运动方向</div>
+                            <svg id="labGraphSvg" class="lab-graph-svg" viewBox="0 0 520 380" preserveAspectRatio="xMidYMid meet"></svg>
+                        </div>
+                        <div class="lab-split-right">
+                            <div class="lab-subtitle">关系边（按冲突关键度排序）</div>
+                            <div id="labGraphEdges" class="lab-table-wrap"></div>
+                        </div>
+                    </div>
+                    <div class="lab-subtitle">参与者提案（点「用此组合」自动填入「生成 Corner Case」面板）</div>
+                    <div id="labGraphProposals" class="lab-proposals"></div>
+                </div>
+
+                <!-- ② 批量生产 -->
+                <div class="lab-panel active" data-panel="batch">
+                    <div class="lab-subtitle">选择事故类型（多样性的"类型"维度）</div>
+                    <div id="labBatchTypes" class="lab-types"></div>
+                    <div class="lab-row">
+                        <label>每类条数</label><input type="number" id="labBatchNum" value="3" min="1">
+                        <label>随机种子</label><input type="number" id="labBatchSeed" value="7">
+                        <label>起始帧</label><input type="number" id="labBatchStart" value="0" min="0">
+                        <label>帧数</label><input type="number" id="labBatchFrames" value="20" min="2">
+                    </div>
+                    <div class="lab-row">
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchSave" checked>落盘为数据集(JSON+manifest)</label>
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchRenderVideo" checked>为每条渲染可播放视频(mp4)</label>
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchOnlyValid">只保留通过质量门的实例</label>
+                    </div>
+                    <div class="lab-row">
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchVidBev" checked>每条额外输出俯视(BEV)示意图</label>
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchVidTop" checked>额外输出俯视(3D渲染)视频</label>
+                        <label class="cc-checkbox"><input type="checkbox" id="labBatchFollowEgo" checked>主车视角跟随编辑后的主车轨迹</label>
+                        <label>运行名</label><input type="text" id="labBatchRunName" placeholder="(默认时间戳)">
+                        <button id="labBatchRunBtn" class="btn btn-primary btn-small">开始批量生产</button>
+                    </div>
+                    <div id="labBatchStatus" class="cc-status">每条默认输出两个可播放视频：<b>主车视角</b>（与播放效果一致，不加包围盒/ID）+ <b>俯视视角(BEV)</b>（上帝视角，看得到谁从哪来）；同一种子结果可复现。</div>
+                    <div id="labBatchSummary" class="lab-summary"></div>
+                    <div id="labBatchTable" class="lab-table-wrap"></div>
+                </div>
+
+                <!-- ④ 自检诊断 -->
+                <!-- ⑤ 闭环仿真工具：可信域 / actor 资产库 / 多视角 / 扩散精修 / 俯视3D -->
+                <div class="lab-panel" data-panel="sim">
+                    <div class="cc-status" style="margin-bottom:8px">
+                        <b>③ 闭环评估</b>（用你们自己的 4DGS 重建渲染）和 <b>④ CARLA 验证</b>（第三方物理仿真器）是
+                        <b>两条独立的验证通道</b>，都吃同一份事故轨迹：③ 回答"这个视角渲染可不可信、自车按动作推进会怎样"，
+                        ④ 回答"在真仿真器里会不会撞、撞得有多严重"。<b>不必</b>先 ③ 再 ④；只关心物理效果可以直接 ④。
+                        推荐用法：③ 快速筛（便宜）→ ④ 复核（有物理/碰撞事件）。<br>
+                        下面这些按钮都是对 <b>当前场景状态</b> 做评估；要对"批量生成的某一条"评估，回
+                        ① 批量生成，点那一行的「载入场景」。
+                    </div>
+                    <div class="lab-subtitle">扩散渲染精修（Difix）：把渲染画面精修一遍（独立可用，不必先跑一键自检）</div>
+                    <div class="lab-row">
+                        <button id="simDifixStatusBtn" class="btn btn-secondary btn-small">检查扩散模型依赖</button>
+                        <label>帧</label><input type="number" id="simDifixFrame" value="0" min="0" style="width:70px">
+                        <button id="simDifixRefineBtn" class="btn btn-primary btn-small">对当前帧做扩散精修</button>
+                        <button id="simDifixSeqBtn" class="btn btn-primary btn-small">精修所有帧（出一段视频）</button>
+                        <label>俯视视野(m)</label><input type="number" id="simTdSpan" value="0" min="0" step="2" style="width:70px">
+                        <span class="detail">精修前 / 精修后 并排显示；首次会加载扩散模型（较慢）</span>
+                    </div>
+                    <div id="simDifixImages" class="lab-row" style="gap:12px;align-items:flex-start"></div>
+                    <div id="simDifixOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:6px;">可信域（novel-view trust）：标定 → 扫描 → 逐帧判定</div>
+                    <div class="lab-row">
+                        <label>可信阈值</label><input type="number" id="simTrustMin" value="0.55" step="0.05" min="0" max="1">
+                        <label>横移档位(m)</label><input type="text" id="simSweep" value="0,0.5,1,1.5,2,2.5,3,4" style="width:180px">
+                        <button id="simTrustModelBtn" class="btn btn-secondary btn-small">标定 trust 模型</button>
+                        <button id="simEnvelopeBtn" class="btn btn-primary btn-small">扫描可信域</button>
+                        <button id="simTrajBtn" class="btn btn-primary btn-small">轨迹逐帧 trust</button>
+                    </div>
+                    <div id="simTrustStatus" class="cc-status">trust 模型用留出视角的真实误差（PSNR/SSIM/LPIPS）+ coverage 标定；R² 会显示在结果里。</div>
+                    <div id="simTrustOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:12px;">actor 资产库（俯视 3D 会用真模型渲染，不再画方框）</div>
+                    <div class="lab-row">
+                        <label class="cc-checkbox"><input type="checkbox" id="simBankSolidify" checked>体素化成体积代理（任意视角有实体）</label>
+                        <button id="simBankBuildBtn" class="btn btn-primary btn-small">构建 actor 资产库</button>
+                        <button id="simBankInfoBtn" class="btn btn-secondary btn-small">查看状态</button>
+                    </div>
+                    <div id="simBankStatus" class="cc-status">资产库让"每辆车/行人"变成可任意摆位的对象中心 3D 资产。</div>
+                    <div id="simBankOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:12px;">多视角重建（预算检查 → 后台跑 → 看日志）</div>
+                    <div class="lab-row">
+                        <label>预处理场景</label><input type="text" id="simMvScene" value="001" style="width:70px">
+                        <label>相机</label><input type="text" id="simMvCameras" value="0,1,2" style="width:80px">
+                        <label>留出相机</label><input type="text" id="simMvHoldout" value="3,4" style="width:70px">
+                        <label>帧数</label><input type="number" id="simMvFrames" value="8" min="1" style="width:60px">
+                        <label class="cc-checkbox"><input type="checkbox" id="simMvEval" checked>评测留出视角</label>
+                        <label class="cc-checkbox"><input type="checkbox" id="simMvBank" checked>顺带建资产库</label>
+                        <button id="simMvPlanBtn" class="btn btn-secondary btn-small">预算/命令</button>
+                        <button id="simMvRunBtn" class="btn btn-primary btn-small">后台启动</button>
+                        <button id="simMvLogBtn" class="btn btn-secondary btn-small">看日志</button>
+                        <input type="text" id="simMvLogPath" placeholder="日志路径（启动后自动填/可手填）" style="flex:1;min-width:220px">
+                    </div>
+                    <div id="simMvStatus" class="cc-status">实测 24 张图（3 视角×8 帧）可跑；40 张（5 视角×8 帧）在 24GB 卡上 OOM，脚本会提前拦下。</div>
+                    <div id="simMvOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:12px;">P2/P3：相机 rig 传感器 + 闭环 rollout（越界截断）</div>
+                    <div class="lab-row">
+                        <label>标定场景</label><input type="text" id="simRigSeg" value="001" style="width:70px">
+                        <label>相机</label><input type="text" id="simRigCams" value="0,1,2,3,4" style="width:80px">
+                        <label class="cc-checkbox"><input type="checkbox" id="simRigDistort">加镜头畸变</label>
+                        <button id="simRigBtn" class="btn btn-primary btn-small">渲染相机 rig</button>
+                    </div>
+                    <div class="lab-row">
+                        <label>rollout 步数</label><input type="number" id="simSteps" value="8" min="1" style="width:60px">
+                        <label>速度(m/s)</label><input type="number" id="simSpeed" value="8" step="1" style="width:60px">
+                        <label>转向(rad)</label><input type="number" id="simSteer" value="0" step="0.05" style="width:70px">
+                        <label>相对阈值</label><input type="number" id="simFrac" value="0.8" step="0.05" min="0" max="2" style="width:70px">
+                        <button id="simRunBtn" class="btn btn-primary btn-small">跑闭环 rollout</button>
+                    </div>
+                    <div id="simP23Status" class="cc-status">rollout = 自车按动作运动 → 逐帧观测 + trust → 越界/碰撞/超帧窗即终止；相对阈值 = × 起始帧预测 SSIM。</div>
+                    <div id="simRigOut" class="lab-table-wrap"></div>
+                    <div id="simRollOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:12px;">P4：导出标准格式（OpenSCENARIO + CommonRoad）</div>
+                    <div class="lab-row">
+                        <label>事故类型</label><input type="text" id="simExpType" value="rear-end" style="width:110px">
+                        <label>seed</label><input type="number" id="simExpSeed" value="7" style="width:70px">
+                        <label>帧数</label><input type="number" id="simExpFrames" value="20" style="width:60px">
+                        <label class="cc-checkbox"><input type="checkbox" id="simExpAll">导出全部物体</label>
+                        <button id="simExpBtn" class="btn btn-primary btn-small">导出 .xosc + .cr.xml</button>
+                        <button id="simToCarlaBtn" class="btn btn-primary btn-small">→ 送去 CARLA 验证</button>
+                    </div>
+                    <div id="simExpStatus" class="cc-status">道路/车道是占位（预处理数据没有 roadgraph）；轨迹/尺寸/速度真实；导出后会解析回来逐帧比对。</div>
+                    <div id="simExpOut" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:12px;">一键自检 / 渲染精修 A/B（后台任务 + 报告）</div>
+                    <div class="lab-row">
+                        <label>标定场景</label><input type="text" id="simDemoSeg" value="001" style="width:60px">
+                        <label>事故</label><input type="text" id="simDemoScenario" value="rear-end" style="width:100px">
+                        <label>帧数</label><input type="number" id="simDemoFrames" value="8" min="2" style="width:60px">
+                        <label>rollout 步数</label><input type="number" id="simDemoSteps" value="5" min="1" style="width:60px">
+                        <button id="simDemoRunBtn" class="btn btn-primary btn-small">跑一键自检</button>
+                        <button id="simDemoReportBtn" class="btn btn-secondary btn-small">看报告</button>
+                    </div>
+                    <div class="lab-row">
+                        <label>精修方式</label>
+                        <select id="simAbRefine" class="cc-select" style="width:110px;">
+                            <option value="stub">stub（验证管道）</option>
+                            <option value="difix">difix（扩散精修）</option>
+                            <option value="none">none（只看原始）</option>
+                        </select>
+                        <label>留出相机</label><input type="text" id="simAbHeldout" value="3,4" style="width:70px">
+                        <button id="simAbRunBtn" class="btn btn-primary btn-small">跑精修 A/B</button>
+                        <button id="simAbReportBtn" class="btn btn-secondary btn-small">看 A/B 报告</button>
+                        <span class="detail">difix 未就绪时会被拦下并提示缺哪个权重</span>
+                    </div>
+                    <div id="simDemoStatus" class="cc-status">一键自检会依次跑：trust 模型 → 可信域 → actor 资产库 → 相机 rig → 闭环 rollout → 导出 → 扩散状态，并写一份总报告。</div>
+                    <div id="simDemoOut" class="lab-table-wrap"></div>
+
+                </div>
+
+                <!-- ⑥ CARLA 仿真：把 corner case 送进 CARLA 跑，出视频 / 看实时 / 导出标准格式 -->
+                <div class="lab-panel" data-panel="carla">
+                    <div class="lab-subtitle">CARLA 闭环仿真：corner case 场景 → CARLA 里跑（含碰撞事件）→ 出视频 / 看实时画面 / 导出标准 OpenSCENARIO</div>
+                    <div class="cc-status" style="margin-bottom:6px">
+                        <b>④ CARLA 闭环仿真</b>：CARLA 本身就是物理闭环仿真器（自车在环、有物理和碰撞），
+                        "闭环"说的就是它；③ 是<b>渲染层的可信度评估</b>（你们 4DGS 渲染出来的画面可不可信），
+                        <b>不是仿真器</b>，两者互相独立、不分先后。<br>
+                        送场景两种方式：<b>用当前编辑的场景</b>（现场导出）或
+                        <b>从 ① 批量生成里点「CARLA 这条」</b>（直接吃该实例的 world.json，不依赖内存场景，最稳）。<br>
+                        想边看边改就用下面的 <b>仿真引擎</b>：播放/暂停、拖时间轴、选中车辆平移旋转删除、加车、存成新场景。
+                    </div>
+
+                    <div class="lab-row">
+                        <span id="carlaSvcDot" class="carla-dot off"></span>
+                        <span id="carlaSvcText" class="cc-status" style="flex:1;min-width:220px">检查中…</span>
+                        <label>画质</label>
+                        <select id="carlaQuality" class="cc-select" style="width:90px">
+                            <option>High</option><option>Low</option><option>Epic</option>
+                        </select>
+                        <label>地图</label>
+                        <select id="carlaMap" class="cc-select" style="width:150px"></select>
+                        <button id="carlaStatusBtn" class="btn btn-secondary btn-small">刷新状态</button>
+                        <button id="carlaStartBtn" class="btn btn-primary btn-small">启动 CARLA</button>
+                        <button id="carlaStopBtn" class="btn btn-secondary btn-small">停止</button>
+                        <span id="carlaVram" class="carla-vram" title="鼠标悬停看是谁在占">显存 —</span>
+                        <button id="carlaReleaseBtn" class="btn btn-secondary btn-small">释放显存(停 CARLA/直播)</button>
+                        <button id="carlaEnvBtn" class="btn btn-secondary btn-small">环境自检</button>
+                    </div>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">1) 选场景</div>
+                    <div class="lab-row">
+                        <label class="cc-checkbox"><input type="checkbox" id="carlaUseCurrent" checked>用当前编辑的场景（含刚生成/编辑的事故轨迹）</label>
+                        <select id="carlaSceneSel" class="cc-select" style="flex:1;min-width:280px"></select>
+                        <button id="carlaSceneReloadBtn" class="btn btn-secondary btn-small">刷新场景列表</button>
+                    </div>
+                    <div class="lab-row">
+                        <span class="detail">CARLA 实际吃的是 <b>world.json</b>（轨迹/位姿）；勾选上面的复选框就用"当前编辑的场景"现场导出 json。
+                        下拉里的 <b>.xosc</b> 只有勾"顺带导出对齐版 xosc"时才生成，是给 ScenarioRunner 等标准工具用的，CARLA 渲染不用它。</span>
+                    </div>
+                    <div class="lab-row">
+                        <label>事故类型</label>
+                        <input type="text" id="carlaScenarioType" placeholder="留空=直接导出当前场景" style="width:190px">
+                        <label>seed</label><input type="number" id="carlaSeed" value="7" style="width:60px">
+                        <label>起始帧</label><input type="number" id="carlaStart" value="0" style="width:60px">
+                        <label>帧数</label><input type="number" id="carlaFrames" value="20" style="width:60px">
+                        <label>fps</label><input type="number" id="carlaFps" value="20" style="width:60px">
+                    </div>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">2) 仿真/相机参数</div>
+                    <div class="lab-row">
+                        <label>相机</label><input type="text" id="carlaCameras" value="chase,birdseye" style="width:140px">
+                        <label>分辨率</label><input type="text" id="carlaCamSize" value="960x540" style="width:80px">
+                        <label>跟随</label>
+                        <select id="carlaFocus" class="cc-select" style="width:100px">
+                            <option value="crash">事故双方</option><option value="ego">自车</option><option value="all">全部</option>
+                        </select>
+                        <label>参与者</label>
+                        <select id="carlaActors" class="cc-select" style="width:110px">
+                            <option value="dynamic">动态参与者</option><option value="core">仅核心(ego/双方)</option>
+                            <option value="all">全部车/人</option><option value="raw">原始全部</option>
+                        </select>
+                        <label>天气</label>
+                        <select id="carlaWeather" class="cc-select" style="width:120px">
+                            <option>ClearNoon</option><option>CloudyNoon</option><option>ClearSunset</option>
+                            <option>ClearNight</option><option>MidRainyNoon</option>
+                        </select>
+                        <label>ego</label>
+                        <select id="carlaEgoMode" class="cc-select" style="width:120px">
+                            <option value="playback">按轨迹回放</option><option value="autopilot">CARLA 自己开(闭环)</option>
+                        </select>
+                        <label class="cc-checkbox"><input type="checkbox" id="carlaExportXosc">顺带导出对齐版 xosc</label>
+                    </div>
+                    <div class="lab-row">
+                        <label>输出名</label>
+                        <input type="text" id="carlaRunName" placeholder="给这次仿真起个名字（留空=按场景名）" style="width:220px">
+                        <label>贴地</label>
+                        <select id="carlaRoadSnap" class="cc-select" style="width:200px">
+                            <option value="z" selected>贴合路面（默认，保留事故几何）</option>
+                            <option value="lane">吸到车道中心（好看，会改动几何）</option>
+                            <option value="none">不处理（可能悬空）</option>
+                        </select>
+                        <span class="detail">默认"贴合路面"：只按路面修高度，不飘，且平面位置完全忠于原轨迹（做评测用这个）；
+                        "吸到车道中心"会把每辆车挪到最近行车道，画面规整，但事故相对位置会变</span>
+                    </div>
+                    <div id="carlaWillRun" class="cc-status" style="color:#93c5fd">将跑：—</div>
+
+                    <div class="lab-row">
+                        <button id="carlaRenderBtn" class="btn btn-primary btn-small">开始 CARLA 仿真并出视频</button>
+                        <button id="carlaXoscBtn" class="btn btn-secondary btn-small">只导出对齐版 xosc</button>
+                        <button id="carlaSrBtn" class="btn btn-secondary btn-small">用 ScenarioRunner 跑(逻辑)</button>
+                        <button id="carlaCancelBtn" class="btn btn-secondary btn-small">取消作业</button>
+                    </div>
+                    <div id="carlaStatusLine" class="cc-status">—</div>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">CARLA 仿真引擎（事故仿真把手：可播放 + 可编辑）</div>
+                    <div class="lab-row">
+                        <button id="engStartBtn" class="btn btn-primary btn-small">启动仿真引擎</button>
+                        <button id="engStopBtn" class="btn btn-secondary btn-small">停止引擎</button>
+                        <span id="engStatus" class="cc-status" style="flex:1">未启动：点左边按钮，会用「1) 选的场景」在 CARLA 里开一个可交互会话（约 40-90 秒）</span>
+                    </div>
+                    <div class="lab-split">
+                        <div class="lab-split-left">
+                            <img id="engImg" class="carla-live" alt="引擎未启动">
+                            <div class="lab-row">
+                                <button id="engPlayBtn" class="btn btn-primary btn-small">暂停</button>
+                                <button id="engPrevBtn" class="btn btn-secondary btn-small">⟲ 上一帧</button>
+                                <button id="engNextBtn" class="btn btn-secondary btn-small">⟳ 下一帧</button>
+                                <label>速度</label>
+                                <select id="engFps" class="cc-select" style="width:70px">
+                                    <option>10</option><option selected>20</option><option>30</option>
+                                </select>
+                                <label>相机</label>
+                                <select id="engCam" class="cc-select" style="width:100px">
+                                    <option value="chase">追逐</option><option value="birdseye">俯视</option>
+                                    <option value="front">车头</option><option value="side">侧视</option>
+                                </select>
+                                <label>天气</label>
+                                <select id="engWeather" class="cc-select" style="width:110px">
+                                    <option>ClearNoon</option><option>CloudyNoon</option><option>ClearSunset</option>
+                                    <option>ClearNight</option><option>MidRainyNoon</option>
+                                </select>
+                            </div>
+                            <div class="lab-row">
+                                <label>时间轴</label>
+                                <input type="range" id="engSlider" min="0" max="0" value="0" style="flex:1;min-width:220px">
+                                <span id="engFrameLabel" class="detail">0 / 0</span>
+                            </div>
+                        </div>
+                        <div class="lab-split-right">
+                            <div class="lab-subtitle">场景编辑（用下面按钮改选中行的位置/朝向）</div>
+                            <div class="lab-row">
+                                <label>步长(m)</label>
+                                <select id="engStep" class="cc-select" style="width:70px">
+                                    <option>0.5</option><option selected>1</option><option>2</option><option>5</option>
+                                </select>
+                                <button id="engResetBtn" class="btn btn-secondary btn-small">重置全部编辑</button>
+                                <button id="engSaveBtn" class="btn btn-primary btn-small">存成场景</button>
+                                <button id="engShotBtn" class="btn btn-secondary btn-small">截图</button>
+                            </div>
+                            <div id="engActors" class="lab-table-wrap"></div>
+                            <div class="lab-row">
+                                <label>新增车辆</label>
+                                <input type="number" id="engAddX" placeholder="x" style="width:78px">
+                                <input type="number" id="engAddY" placeholder="y" style="width:78px">
+                                <input type="number" id="engAddYaw" placeholder="yaw°" value="0" style="width:66px">
+                                <input type="number" id="engAddSpeed" placeholder="m/s" value="6" style="width:62px">
+                                <button id="engAddBtn" class="btn btn-primary btn-small">+ 加车</button>
+                            </div>
+                            <div id="engSaved" class="cc-status"></div>
+                        </div>
+                    </div>
+                    <div class="lab-subtitle" style="margin-top:8px;">作业日志（渲染 / 导出作业）</div>
+                    <pre id="carlaJobLog" class="lab-code carla-log">—</pre>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">3) 结果（最近一次作业）</div>
+                    <div id="carlaResultInfo" class="lab-summary"></div>
+                    <video id="carlaVideo" class="carla-video" controls preload="metadata" style="display:none"></video>
+                    <div class="lab-row" id="carlaDownloadRow" style="margin-top:6px;"></div>
+                    <div id="carlaMetrics" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">历史作业</div>
+                    <div id="carlaJobs" class="lab-table-wrap"></div>
+
+                    <div class="lab-subtitle" style="margin-top:10px;">说明</div>
+                    <div class="cc-status">
+                        ① 「用当前编辑的场景」= 把此刻场景里（含刚生成/编辑过的轨迹）导出成世界坐标 json 再送进 CARLA，
+                        所以改完轨迹点「开始 CARLA 仿真」就能立刻看新效果，形成"编辑 → 仿真 → 再看 → 再编辑"的循环。<br>
+                        <b style="color:#f59e0b">注意：CARLA 一开就占 ~5-6GB 显存</b>：跑完约 1 分钟没人用会自动释放，也可以随时点「释放显存」。
+                        要用 SAM3D / 加载大模型之前，<b>务必先释放</b>，否则会 OOM。<br>
+                        ② 视频里每个交通参与者都标了 <b>角色 + 速度</b>，顶部 HUD 有 <code>minDist / minTTC / collisions</code>。<br>
+                        ③ 实时直播是 CARLA 里正在跑的画面（后端已代理，不需要额外转发端口）。<br>
+                        ④ 「用 ScenarioRunner 跑」= 先导出 CARLA 对齐版 <code>.xosc</code>，再用 CARLA 官方 ScenarioRunner
+                        执行（逻辑/评测路径，不出画面）。
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <!-- 案例视频回放 -->
+    <div id="labVideoModal" class="modal">
+        <div class="modal-content modal-large">
+            <div class="modal-header">
+                <h2>案例视频回放（与播放效果一致）</h2>
+                <button class="modal-close" id="labVideoCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div id="labVideoInfo" class="cc-status"></div>
+                <div class="lab-row" id="labVideoTabs" style="margin-bottom:8px;">
+                    <button id="labVideoTabEgo" class="btn btn-small btn-primary">主车视角</button>
+                    <button id="labVideoTabBev" class="btn btn-small btn-secondary">俯视(BEV)</button>
+                    <button id="labVideoTabTop" class="btn btn-small btn-secondary">俯视(3D渲染)</button>
+                </div>
+                <video id="labVideoPlayer" class="lab-video" controls autoplay loop playsinline></video>
+                <div class="lab-row" style="margin-top:8px;">
+                    <a id="labVideoOpenLink" class="btn btn-small btn-secondary" target="_blank" rel="noopener">在新标签页打开</a>
+                    <span id="labVideoPath" class="detail"></span>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js"></script>
-    <script src="app.js"></script>
+    <script src="viewer3d.js?v=20260920m"></script>
+    <script src="app.js?v=20260920m"></script>
+    <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
+    <script src="ui-panels.js?v=20260920m"></script>
 </body>
 </html>

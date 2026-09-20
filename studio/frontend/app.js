@@ -1,20 +1,20 @@
-/**
- * DGGT Studio - 4DGS动态物体编辑画布前端应用 (修复版)
- * 修复内容：
- * - 完善轨迹/网格显示切换功能
- * - 修复工具选择和切换逻辑
- * - 优化物体选择和坐标转换
- * - 添加渲染缓存和性能优化
- */
-
 const API_BASE = 'http://localhost:8000/api';
+
+// 实验台：10 种事故类型（值, 中文名）
+const LAB_SCENARIOS = [
+    ['rear-end', '追尾'], ['head-on', '对向碰撞'], ['intersection-tbone', '路口侧碰'],
+    ['lane-change-cutin', '变道加塞'], ['hard-brake', '紧急刹车'], ['pedestrian-crossing', '行人横穿'],
+    ['cut-out-reveal', '前车闪开'], ['chain-reaction-rear-end', '连环追尾'],
+    ['cutin-brake-pileup', '加塞急刹连环'], ['occluded-pedestrian-pileup', '遮挡行人连环']
+];
 
 class DGGTStudio {
     constructor() {
         this.state = {
             sceneId: null,
             scenePath: null,
-            totalFrames: 0,
+            totalFrames: 0,      // 可渲染帧数（可延长）
+            dataFrames: 0,       // 磁盘上真实存在的帧数
             currentFrame: 0,
             objects: [],
             selectedObjects: [],
@@ -48,6 +48,25 @@ class DGGTStudio {
         this.currentImage = null;
         this.viewer3d = null;  // 3D 视图实例（懒加载）
 
+        // SAM 3D 交互重建状态
+        this.samPoints = [];           // [{x, y, label:'fg'|'bg'}]（源图像素坐标）
+        this.samPointType = 'fg';      // 当前点类型
+        this.samMask = null;           // 掩码 base64
+        this.samMaskImage = null;      // 掩码 Image
+        this.samSrcImage = null;       // 高清源图 Image
+        this.samSrcWidth = 0;
+        this.samSrcHeight = 0;
+        this._sam3dSegTimer = null;
+        this.lastSamObjectId = null;   // 最近生成的物体 id
+        this.samPreviewFrames = [];    // 预览帧 base64 列表
+        this.samPreviewTimer = null;
+        this.samPreviewIdx = 0;
+
+        // 选中物体的全局旋转（持久 360°）
+        this.objectRotation = { yaw: 0, pitch: 0, roll: 0 };
+        this._rotationLoadedFor = null;
+        this._rotationTimer = null;
+
         this.init();
     }
 
@@ -60,6 +79,10 @@ class DGGTStudio {
         this.setupKeyboardShortcuts();
         this.setupToolButtons();
         this.setupViewModeToggle();
+        this.setupSam3dControls();
+        this.setupNlEntityControls();
+        this.setupAutoHeadingControls();
+        this.setupLabControls();
         
         this.updateStatus('就绪 - 请加载场景开始编辑');
         this.renderEmptyCanvas();
@@ -156,51 +179,6 @@ class DGGTStudio {
             }
         });
 
-        this.setupWeatherControls();
-    }
-
-    setupWeatherControls() {
-        const typeEl = document.getElementById('weatherType');
-        const intEl = document.getElementById('weatherIntensity');
-        const visEl = document.getElementById('weatherVisibility');
-        const applyBtn = document.getElementById('applyWeatherBtn');
-        const clearBtn = document.getElementById('clearWeatherBtn');
-        if (intEl) intEl.addEventListener('input', () => {
-            document.getElementById('weatherIntensityVal').textContent = parseFloat(intEl.value).toFixed(1);
-        });
-        if (visEl) visEl.addEventListener('input', () => {
-            document.getElementById('weatherVisibilityVal').textContent = parseInt(visEl.value);
-        });
-        if (typeEl) typeEl.addEventListener('change', () => this.applyWeatherFromUI(false));
-        if (applyBtn) applyBtn.addEventListener('click', () => this.applyWeatherFromUI(true));
-        if (clearBtn) clearBtn.addEventListener('click', () => {
-            if (typeEl) typeEl.value = 'clear';
-            this.applyWeatherFromUI(true);
-        });
-    }
-
-    getWeatherFromUI() {
-        const type = document.getElementById('weatherType')?.value || 'clear';
-        const intensity = parseFloat(document.getElementById('weatherIntensity')?.value || '1.0');
-        const visibility = parseFloat(document.getElementById('weatherVisibility')?.value || '45');
-        const windX = parseFloat(document.getElementById('weatherWindX')?.value || '0');
-        const windY = parseFloat(document.getElementById('weatherWindY')?.value || '0');
-        return {
-            type,
-            intensity: type === 'clear' ? 0.0 : intensity,
-            visibility,
-            wind: [windX, windY]
-        };
-    }
-
-    applyWeatherFromUI(showStatus = true) {
-        const viewer = this.ensureViewer3d();
-        const weather = this.getWeatherFromUI();
-        viewer.setWeather(weather);
-        if (showStatus) {
-            const names = { clear: '晴朗', rain: '大雨', storm: '暴风雨', snow: '大雪', blizzard: '暴风雪', fog: '浓雾' };
-            this.updateStatus(`已应用三维天气: ${names[weather.type] || weather.type}`);
-        }
     }
 
     ensureViewer3d() {
@@ -211,6 +189,8 @@ class DGGTStudio {
             onObjectSelected: (trackId, asset) => {
                 // 若 Corner Case 面板正在等待为某角色指派物体，则优先指派
                 this.onTrackSelectedForCorner(trackId);
+                // 「替换目标物体」拾取模式：点击即选定替换目标
+                this._sam3dFinishPickTarget(trackId);
                 this.state.selectedObjects = [trackId];
                 // 用 3D 物体信息更新属性面板（以 track_id 为标识）
                 let obj = this.state.objects.find(o => o.track_id === trackId);
@@ -232,11 +212,13 @@ class DGGTStudio {
             onObjectEdited: (trackId) => {
                 // 编辑后清空 2D 渲染缓存，保证切回 2D 时显示最新结果
                 this.state.renderCache.clear();
+                // 强制重新读取该物体的全局旋转，刷新旋转滑杆数值
+                this._rotationLoadedFor = null;
+                this.updateSelectedObjectPanel();
                 this.saveEditHistory('move', trackId);
             }
         });
         this.viewer3d.init();
-        this.viewer3d.setWeather(this.getWeatherFromUI());
         return this.viewer3d;
     }
 
@@ -362,6 +344,16 @@ class DGGTStudio {
         
         document.getElementById('prevFrame').addEventListener('click', () => this.prevFrame());
         document.getElementById('nextFrame').addEventListener('click', () => this.nextFrame());
+        // 顶部帧数拖动条：拖动时即时更新帧号（渲染做节流，避免拖一次发几百个请求）
+        const frameSlider = document.getElementById('frameSlider');
+        if (frameSlider) {
+            frameSlider.addEventListener('input', (e) => {
+                this._scrubToFrame(parseInt(e.target.value, 10) || 0);
+            });
+            frameSlider.addEventListener('change', (e) => {
+                this._scrubToFrame(parseInt(e.target.value, 10) || 0, true);
+            });
+        }
         document.getElementById('playBtn').addEventListener('click', () => this.togglePlay());
         document.getElementById('frameInput').addEventListener('change', (e) => {
             const frame = parseInt(e.target.value);
@@ -370,6 +362,16 @@ class DGGTStudio {
             }
         });
         
+        // 时间轴：按需延长（原场景帧数不再是上限）
+        const _extBtn = document.getElementById('tlExtendBtn');
+        if (_extBtn) _extBtn.addEventListener('click', () => {
+            const v = parseInt(document.getElementById('tlExtendInput').value);
+            this.extendTimeline(isNaN(v) ? 50 : v);
+        });
+        document.querySelectorAll('.timeline-extend [data-extra]').forEach(b => {
+            b.addEventListener('click', () => this.extendTimeline(parseInt(b.dataset.extra)));
+        });
+
         document.getElementById('zoomInBtn').addEventListener('click', () => this.zoomIn());
         document.getElementById('zoomOutBtn').addEventListener('click', () => this.zoomOut());
         document.getElementById('fitToViewBtn').addEventListener('click', () => this.fitToView());
@@ -417,6 +419,8 @@ class DGGTStudio {
                     selectedObject = clickedObject;
                     isDraggingObject = true;
                     lastDragPos = { x: canvasX, y: canvasY };
+                    // 「替换目标物体」拾取模式：点击即选定目标
+                    this._sam3dFinishPickTarget(clickedObject.object_id);
                     
                     if (!e.shiftKey) {
                         this.state.selectedObjects = [clickedObject.object_id];
@@ -726,10 +730,14 @@ class DGGTStudio {
                 document.getElementById('sceneIdDisplay').textContent = this.state.sceneId;
                 document.getElementById('sceneTotalFrames').textContent = this.state.totalFrames;
                 document.getElementById('totalFrames').textContent = `/ ${this.state.totalFrames}`;
+                this.state.dataFrames = data.scene.data_frames || data.scene.num_frames;
+                this._refreshTimelineUI();
                 
                 document.getElementById('loadSceneModal').classList.remove('active');
                 
                 await this.loadFrame(this.state.currentFrame);
+                this._autoHeadingLoad();
+                this.loadEgoInfo();
                 this.updateStatus(`场景已加载: ${this.state.sceneId}`);
             }
         } catch (error) {
@@ -742,6 +750,8 @@ class DGGTStudio {
 
     async loadFrame(frameIdx) {
         if (!this.state.sceneId) return;
+        // 实验台打开且停在"关系图"页时，切帧自动刷新关系图
+        this._labMaybeAutoRefresh(frameIdx);
 
         // 3D 模式下把任务转给 viewer3d
         if (this.state.viewMode === '3d' && this.viewer3d) {
@@ -981,24 +991,123 @@ class DGGTStudio {
     }
 
     async updateObjectRotation(objectId, deltaAngle) {
+        // 旋转工具：叠加 yaw 旋转（全局持久，播放时保持）
         try {
             const response = await fetch(`${API_BASE}/edit/object/rotation`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     scene_id: this.state.sceneId,
-                    object_id: objectId,
-                    frame_idx: this.state.currentFrame,
-                    delta_yaw: deltaAngle
-                })
+                    track_id: objectId,
+                    delta_yaw: deltaAngle,
+                }),
             });
-            
-            if (response.ok) {
-                this.clearFrameCache(this.state.currentFrame);
+            const data = await response.json();
+            if (data && data.success) {
+                this._syncRotationUI(data.yaw_pitch_roll || [0, 0, 0]);
+                this._invalidateRenderCaches();
                 await this.loadFrame(this.state.currentFrame);
             }
         } catch (error) {
             console.error('更新物体旋转失败:', error);
+        }
+    }
+
+    _syncRotationUI(ypr) {
+        this.objectRotation = { yaw: ypr[0], pitch: ypr[1], roll: ypr[2] };
+        const ids = ['rotValYaw', 'rotValPitch', 'rotValRoll'];
+        const inputs = document.querySelectorAll('.rotation-controls input[type=range]');
+        ids.forEach((id, i) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = `${Math.round(ypr[i])}°`;
+        });
+        inputs.forEach((el, i) => { el.value = Math.round(ypr[i]); });
+    }
+
+    async _maybeLoadRotation(trackId) {
+        if (this._rotationLoadedFor === trackId) return;
+        this._rotationLoadedFor = trackId;
+        try {
+            const resp = await fetch(`${API_BASE}/edit/object/rotation/${this.state.sceneId}/${trackId}`);
+            const d = await resp.json();
+            if (d && d.success) this._syncRotationUI(d.yaw_pitch_roll || [0, 0, 0]);
+        } catch (e) {
+            console.error('加载旋转失败:', e);
+        }
+    }
+
+    onRotationSlider(axis, value) {
+        const v = parseFloat(value) || 0;
+        this.objectRotation[axis] = v;
+        const valId = { yaw: 'rotValYaw', pitch: 'rotValPitch', roll: 'rotValRoll' }[axis];
+        const el = document.getElementById(valId);
+        if (el) el.textContent = `${Math.round(v)}°`;
+        if (this._rotationTimer) clearTimeout(this._rotationTimer);
+        this._rotationTimer = setTimeout(() => this._applyRotation(), 60);
+    }
+
+    async _applyRotation() {
+        const tid = this.state.selectedObjects[0];
+        // track_id 0（T0）是合法物体，不能把 0 当成"没选中"。
+        if (tid === undefined || tid === null) return;
+        try {
+            await fetch(`${API_BASE}/edit/object/rotation`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    track_id: tid,
+                    yaw: this.objectRotation.yaw,
+                    pitch: this.objectRotation.pitch,
+                    roll: this.objectRotation.roll,
+                }),
+            });
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+        } catch (e) {
+            console.error('旋转失败:', e);
+        }
+    }
+
+    // 一键把物体绕自身竖直轴翻转 180°（用于单张图重建无法判断前后的情况）
+    async flipObjectRotation() {
+        const tid = this.state.selectedObjects[0];
+        // track_id 0（T0）是合法物体，不能把 0 当成"没选中"。
+        if (tid === undefined || tid === null) return;
+        try {
+            const resp = await fetch(`${API_BASE}/edit/object/rotation`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, track_id: tid, delta_yaw: 180 }),
+            });
+            const data = await resp.json();
+            if (data && data.success) {
+                this._syncRotationUI(data.yaw_pitch_roll || [0, 0, 0]);
+                this._invalidateRenderCaches();
+                await this.loadFrame(this.state.currentFrame);
+            }
+        } catch (e) {
+            console.error('翻转朝向失败:', e);
+        }
+    }
+
+    async resetObjectRotation() {
+        const tid = this.state.selectedObjects[0];
+        // track_id 0（T0）是合法物体，不能把 0 当成"没选中"。
+        if (tid === undefined || tid === null) return;
+        if (this._rotationTimer) clearTimeout(this._rotationTimer);
+        try {
+            await fetch(`${API_BASE}/edit/object/rotation`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, track_id: tid, reset: true }),
+            });
+            this._syncRotationUI([0, 0, 0]);
+            this._rotationLoadedFor = tid;
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+        } catch (e) {
+            console.error('重置朝向失败:', e);
         }
     }
 
@@ -1029,6 +1138,15 @@ class DGGTStudio {
         }
     }
 
+    // 任何会改变渲染结果的编辑（旋转/位移/删除…）后必须调用：
+    // 清空 2D 帧缓存 + 3D 视图帧缓存，否则会命中旧图像而"看起来没生效/自动回原位"。
+    _invalidateRenderCaches() {
+        this.state.renderCache.clear();
+        if (this.viewer3d && typeof this.viewer3d.invalidateRenderCache === 'function') {
+            this.viewer3d.invalidateRenderCache();
+        }
+    }
+
 
     // ==================== 播放控制 ====================
 
@@ -1044,10 +1162,105 @@ class DGGTStudio {
         }
     }
 
+    // ==================== 时间轴（按需延长帧数） ====================
+
+    _refreshTimelineUI() {
+        const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+        set('tlDataFrames', this.state.dataFrames || 0);
+        set('tlTotalFrames', this.state.totalFrames || 0);
+        const last = Math.max(0, (this.state.totalFrames || 1) - 1);
+        const fi = document.getElementById('frameInput');
+        if (fi) fi.max = last;
+        const fs = document.getElementById('frameSlider');
+        if (fs) {
+            fs.max = last;
+            fs.disabled = last <= 0;
+            if (String(fs.value) !== String(Math.min(this.state.currentFrame || 0, last))) {
+                fs.value = Math.min(this.state.currentFrame || 0, last);
+            }
+        }
+        const tot = document.getElementById('totalFrames');
+        if (tot) tot.textContent = `/ ${this.state.totalFrames}`;
+    }
+
+    _tlStatus(msg, isErr) {
+        const el = document.getElementById('tlStatus');
+        if (el) {
+            el.textContent = msg;
+            el.style.color = isErr ? 'var(--danger-color)' : '';
+        }
+    }
+
+    async extendTimeline(extra) {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const n = Math.max(1, Math.min(2000, parseInt(extra) || 50));
+        const holdCam = !!(document.getElementById('tlHoldCamera') || {}).checked;
+        this._tlStatus(`正在延长 ${n} 帧（动态物体沿各自轨迹外推，`
+            + (holdCam ? '相机固定在末帧' : '相机沿自车轨迹外推') + '）…');
+        try {
+            const resp = await fetch(`${API_BASE}/timeline/extend`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, extra_frames: n,
+                                       mode: 'extrapolate',
+                                       ego_mode: holdCam ? 'hold' : 'extrapolate' }),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            this.state.dataFrames = d.data_frames;
+            this.state.totalFrames = d.total_frames;
+            this.state.renderCache.clear();
+            this._refreshTimelineUI();
+            const eg = (d.extended_tracks || 0);
+            this._tlStatus(`已延长到 ${d.total_frames} 帧（数据帧 ${d.data_frames}，`
+                + `外推 ${d.extended_frames} 帧，涉及 ${eg} 条轨迹）。可以直接跳到后面的帧继续编辑。`);
+            this.updateStatus(`时间轴: ${d.data_frames} → ${d.total_frames} 帧`);
+        } catch (e) {
+            this._tlStatus('延长失败: ' + e.message, true);
+        }
+    }
+
     jumpToFrame(frameIdx) {
-        this.state.currentFrame = frameIdx;
-        document.getElementById('frameInput').value = frameIdx;
-        this.loadFrame(frameIdx);
+        const last = Math.max(0, (this.state.totalFrames || 1) - 1);
+        const f = Math.max(0, Math.min(last, parseInt(frameIdx, 10) || 0));
+        this.state.currentFrame = f;
+        const fi = document.getElementById('frameInput');
+        if (fi) fi.value = f;
+        const fs = document.getElementById('frameSlider');
+        if (fs && String(fs.value) !== String(f)) fs.value = f;
+        if (this._scrubTimer) { clearTimeout(this._scrubTimer); this._scrubTimer = null; }
+        this.loadFrame(f);
+    }
+
+    // 帧号变化时把顶部"数字输入 + 拖动条"同步一下（播放/跳帧都走这里）
+    _syncFrameWidgets() {
+        const f = this.state.currentFrame || 0;
+        const fi = document.getElementById('frameInput');
+        if (fi && String(fi.value) !== String(f)) fi.value = f;
+        const fs = document.getElementById('frameSlider');
+        if (fs && String(fs.value) !== String(f)) fs.value = f;
+    }
+
+    // 拖动顶部帧数条：帧号立刻更新，渲染节流（拖动过程中最多每 ~150ms 渲染一次）
+    _scrubToFrame(frameIdx, immediate = false) {
+        const last = Math.max(0, (this.state.totalFrames || 1) - 1);
+        const f = Math.max(0, Math.min(last, parseInt(frameIdx, 10) || 0));
+        this.state.currentFrame = f;
+        const fi = document.getElementById('frameInput');
+        if (fi) fi.value = f;
+        const fs = document.getElementById('frameSlider');
+        if (fs && String(fs.value) !== String(f)) fs.value = f;
+        const now = Date.now();
+        const run = () => {
+            this._scrubTimer = null;
+            this._scrubLastAt = Date.now();
+            this.loadFrame(this.state.currentFrame);
+        };
+        if (immediate || now - (this._scrubLastAt || 0) > 150) {
+            if (this._scrubTimer) { clearTimeout(this._scrubTimer); this._scrubTimer = null; }
+            run();
+        } else if (!this._scrubTimer) {
+            this._scrubTimer = setTimeout(run, 150);
+        }
     }
 
     togglePlay() {
@@ -1114,7 +1327,7 @@ class DGGTStudio {
 
             if (this.state.currentFrame < this.state.totalFrames - 1) {
                 this.state.currentFrame += 1;
-                document.getElementById('frameInput').value = this.state.currentFrame;
+                this._syncFrameWidgets();
                 
                 // 使用优化的播放加载方法：保留上一帧避免黑屏，异步加载新帧，自动预取
                 if (viewer.loadFrameForPlayback) {
@@ -1141,6 +1354,7 @@ class DGGTStudio {
     updateSelectedObjectPanel() {
         const panel = document.getElementById('selectedObjectPanel');
         if (!panel) return;
+        if (this.state.selectedObjects.length !== 1) this._rotationLoadedFor = null;
 
         if (this.state.selectedObjects.length === 0) {
             panel.innerHTML = '<div class="empty-state"><p>点击画布中的物体进行选择</p></div>';
@@ -1157,6 +1371,12 @@ class DGGTStudio {
                 const dimStr = dims.length === 3
                     ? `${dims[0].toFixed(1)} × ${dims[1].toFixed(1)} × ${dims[2].toFixed(1)}`
                     : '-';
+                const r = this.objectRotation || { yaw: 0, pitch: 0, roll: 0 };
+                const srcId = (this.state.ego || {}).source_track_id;
+                const isSrc = srcId !== null && srcId !== undefined && Number(srcId) === Number(tid);
+                const viewSourceBtn = isSrc
+                    ? `<button class="btn btn-small btn-secondary" onclick="studio.egoSetSource('')">恢复真实主车视角</button>`
+                    : `<button class="btn btn-small btn-primary" onclick="studio.egoSetSource(${tid})">以此物体视角渲染</button>`;
                 panel.innerHTML = `
                     <div class="selected-object-info">
                         <div class="info-row"><span class="label">Track:</span><span class="value">T:${tid}</span></div>
@@ -1164,12 +1384,35 @@ class DGGTStudio {
                         <div class="info-row"><span class="label">位置:</span><span class="value">(${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}, ${pos[2].toFixed(1)})</span></div>
                         <div class="info-row"><span class="label">尺寸:</span><span class="value">${dimStr}</span></div>
                         <div class="info-row"><span class="label">已编辑:</span><span class="value">${obj.edited ? '是' : '否'}</span></div>
+                        <div class="rotation-controls">
+                            <div class="rot-row"><label>朝向</label><input type="range" min="-180" max="180" step="1" value="${Math.round(r.yaw)}" oninput="studio.onRotationSlider('yaw', this.value)"><span class="rot-val" id="rotValYaw">${Math.round(r.yaw)}°</span></div>
+                            <div class="rot-row"><label>俯仰</label><input type="range" min="-180" max="180" step="1" value="${Math.round(r.pitch)}" oninput="studio.onRotationSlider('pitch', this.value)"><span class="rot-val" id="rotValPitch">${Math.round(r.pitch)}°</span></div>
+                            <div class="rot-row"><label>翻滚</label><input type="range" min="-180" max="180" step="1" value="${Math.round(r.roll)}" oninput="studio.onRotationSlider('roll', this.value)"><span class="rot-val" id="rotValRoll">${Math.round(r.roll)}°</span></div>
+                            <div class="button-row">
+                                <button class="btn btn-small btn-secondary" onclick="studio.flipObjectRotation()">翻转180°</button>
+                                <button class="btn btn-small btn-secondary" onclick="studio.resetObjectRotation()">重置朝向</button>
+                            </div>
+                        </div>
                         <div class="button-row">
                             <button class="btn btn-small btn-secondary" onclick="studio.viewer3d && studio.viewer3d.focusSelected()">聚焦</button>
                             <button class="btn btn-small btn-danger" onclick="studio.delete3dSelected()">删除物体</button>
                         </div>
+                        <div class="button-row">
+                            ${viewSourceBtn}
+                        </div>
+                        ${(Number(tid) >= 100000 || Number(tid) === 900000) ? `
+                        <div class="rotation-controls">
+                            <div class="rot-row"><label>模型大小</label>
+                                <input type="range" min="0.5" max="1.5" step="0.02"
+                                    value="${Number((this.state.modelFit && this.state.modelFit[tid]) || 1).toFixed(2)}"
+                                    oninput="studio.onModelSizeSlider(${tid}, this.value)">
+                                <span class="rot-val" id="modelSizeVal_${tid}">×${Number((this.state.modelFit && this.state.modelFit[tid]) || 1).toFixed(2)}</span>
+                            </div>
+                            <div class="detail" style="margin-top:4px;">等比缩放模型与包围盒（长宽高比不变）。</div>
+                        </div>` : ''}
                     </div>
                 `;
+                this._maybeLoadRotation(tid);
             }
         } else {
             panel.innerHTML = `
@@ -1178,6 +1421,36 @@ class DGGTStudio {
                 </div>
             `;
         }
+    }
+
+    // 选中物体的"模型大小"滑块：等比缩放模型 + 包围盒（长宽高比不变）
+    async onModelSizeSlider(tid, value) {
+        const factor = Math.max(0.2, Math.min(5.0, parseFloat(value) || 1));
+        this.state.modelFit = this.state.modelFit || {};
+        this.state.modelFit[tid] = factor;
+        const el = document.getElementById('modelSizeVal_' + tid);
+        if (el) el.textContent = '×' + factor.toFixed(2);
+        if (this._modelSizeTimer) clearTimeout(this._modelSizeTimer);
+        this._modelSizeTimer = setTimeout(async () => {
+            try {
+                const resp = await fetch(`${API_BASE}/edit/synthetic/scale`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ scene_id: this.state.sceneId, track_id: tid, factor }),
+                });
+                const d = await resp.json();
+                if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+                const dims = (d.dimensions || []).map(v => Number(v).toFixed(2)).join(' × ');
+                this.updateStatus(`T:${tid} 模型大小 ×${factor.toFixed(2)}（包围盒 ${dims} m）`);
+                this._invalidateRenderCaches();
+                await this.loadFrame(this.state.currentFrame);
+                if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                    await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+                }
+                this.updateSelectedObjectPanel();
+            } catch (e) {
+                this.updateStatus('调整模型大小失败: ' + e.message);
+            }
+        }, 120);
     }
 
     delete3dSelected() {
@@ -1781,6 +2054,7 @@ class DGGTStudio {
         if (ca && ca.critical_frame !== null && ca.critical_frame !== undefined) {
             this.loadFrame(ca.critical_frame);
             this.state.currentFrame = ca.critical_frame;
+            this._syncFrameWidgets();
             this.updateStatus(`已跳转到最晚反应关键帧: ${ca.critical_frame}`);
         }
     }
@@ -1984,6 +2258,7 @@ class DGGTStudio {
 
     updateObjectList() {
         const listContainer = document.getElementById('objectList');
+        this._sam3dPopulateTargets();
         
         if (this.state.objects.length === 0) {
             listContainer.innerHTML = '<div class="empty-state"><p>当前帧无动态物体</p></div>';
@@ -2050,6 +2325,2674 @@ class DGGTStudio {
 
     updateStatus(message) {
         document.getElementById('statusText').textContent = message;
+    }
+
+    // ==================== SAM 3D 交互重建 ====================
+
+    setupSam3dControls() {
+        const toggle = document.getElementById('sam3dToggleBtn');
+        const addBtn = document.getElementById('sam3dAddObjectBtn');
+        if (toggle) toggle.addEventListener('click', () => this.openSamSourceModal());
+        if (addBtn) addBtn.addEventListener('click', () => this._sam3dAddObject());
+
+        const modelSel = document.getElementById('sam3dModelSelect');
+        if (modelSel) modelSel.addEventListener('change', () => this._samSetModel(modelSel.value));
+        this._samLoadModels();
+
+        const previewBtn = document.getElementById('sam3dPreviewBtn');
+        if (previewBtn) previewBtn.addEventListener('click', () => this.openSamPreview());
+
+        const closeBtn = document.getElementById('samSourceCloseBtn');
+        if (closeBtn) closeBtn.addEventListener('click', () => this.closeSamSourceModal());
+        const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+        bind('sam3dPickTargetBtn', () => this._sam3dStartPickTarget());
+        bind('samSrcPrevBtn', () => this._samSrcLoadFrame((this.samSrcFrameIdx ?? this.state.currentFrame) - 1, false));
+        bind('samSrcNextBtn', () => this._samSrcLoadFrame((this.samSrcFrameIdx ?? this.state.currentFrame) + 1, false));
+        bind('samSrcBestBtn', () => {
+            const best = this.samSrcCandidates && this.samSrcCandidates[0];
+            if (!best) { this._samSrcStatus('推荐帧还在计算中…', true); return; }
+            this._samSrcLoadFrame(best.frame_idx, false);
+            this._samSrcStatus(`已跳到推荐帧 #${best.frame_idx}（遮挡 ${Math.round((best.occlusion || 0) * 100)}%）`);
+        });
+        bind('samSrcFgBtn', () => this._samSrcSetType('fg'));
+        bind('samSrcBgBtn', () => this._samSrcSetType('bg'));
+        bind('samSrcUndoBtn', () => this._samSrcUndo());
+        bind('samSrcClearBtn', () => this._samSrcClear());
+        bind('samSrcGenerateBtn', () => this._samSrcGenerate());
+
+        const canvas = document.getElementById('samSourceCanvas');
+        if (canvas) {
+            canvas.addEventListener('mousedown', (e) => this._samSrcHandleClick(e));
+            canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); this._samSrcUndo(); });
+        }
+
+        // 预览模态框
+        bind('samPreviewCloseBtn', () => this.closeSamPreview());
+        bind('samPreviewPlayBtn', () => this._samPreviewPlay());
+        bind('samPreviewStopBtn', () => this._samPreviewStop());
+        const slider = document.getElementById('samPreviewSlider');
+        if (slider) slider.addEventListener('input', () => this._samPreviewSeek(parseInt(slider.value, 10)));
+
+        // 替换后模型大小微调（相对后端自动算出的基准尺寸）
+        const scaleRange = document.getElementById('sam3dScaleRange');
+        if (scaleRange) {
+            scaleRange.addEventListener('input', () => {
+                const el = document.getElementById('sam3dScaleVal');
+                if (el) el.textContent = Math.round((parseFloat(scaleRange.value) || 1) * 100) + '%';
+            });
+            scaleRange.addEventListener('change', () => {
+                this._sam3dApplyScale(parseFloat(scaleRange.value) || 1.0);
+            });
+        }
+    }
+
+    // ==================== 文本添加实体（LLaDA-Image + SAM3D） ====================
+
+    _nlEntityStatus(msg, isError = false) {
+        const el = document.getElementById('nlEntityStatus');
+        if (el) { el.textContent = msg; el.style.color = isError ? '#e5484d' : 'inherit'; }
+        if (msg) this.updateStatus('文本实体: ' + msg);
+    }
+
+    setupNlEntityControls() {
+        const btn = document.getElementById('nlEntityBtn');
+        if (btn) btn.addEventListener('click', () => this.nlEntityGenerate());
+        const rb = document.getElementById('nlEntityReplanBtn');
+        if (rb) rb.addEventListener('click', () => this.nlEntityReplan());
+        const tp = document.getElementById('trajEditPlanBtn');
+        if (tp) tp.addEventListener('click', () => this.trajEdit('plan'));
+        const ta = document.getElementById('trajEditApplyBtn');
+        if (ta) ta.addEventListener('click', () => this.trajEdit('apply'));
+        this.nlEntityHealth();
+    }
+
+    async nlEntityHealth() {
+        try {
+            const r = await fetch(`${API_BASE}/text2entity/health`);
+            const d = await r.json();
+            if (d && d.success && d.status === 'ok') {
+                this._nlEntityStatus((d.prompt2image && d.vlm)
+                    ? '服务就绪（LLaDA-Image + Qwen2.5-VL-3B）'
+                    : '微服务在线，但模型目录缺失（请先下载权重）', !(d.prompt2image && d.vlm));
+            } else if (d && d.local_text2image) {
+                this._nlEntityStatus('LLaDA 微服务未启动，将用本地 sd-turbo 兜底出图（VLM 退回关键词先验）');
+            } else {
+                this._nlEntityStatus('微服务未启动：'
+                    + ((d && (d.detail || d.error)) || '请运行 bash text2entity/run_service.sh'), true);
+            }
+        } catch (e) {
+            this._nlEntityStatus('微服务未启动（' + e.message + '）：请运行 bash text2entity/run_service.sh', true);
+        }
+    }
+
+    async nlEntityGenerate() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const prompt = (document.getElementById('nlEntityPrompt')?.value || '').trim();
+        if (!prompt) { alert('请先输入要添加的物体描述'); return; }
+        // 可选：用户上传参考图 → 跳过文生图，直接用它做 SAM3D 重建（质量最可控）
+        let referenceImage = null;
+        const fileEl = document.getElementById('nlEntityRefFile');
+        if (fileEl && fileEl.files && fileEl.files[0]) {
+            referenceImage = await new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(String(fr.result).split(',')[1]);
+                fr.onerror = reject;
+                fr.readAsDataURL(fileEl.files[0]);
+            });
+        }
+        const body = {
+            scene_id: this.state.sceneId,
+            prompt,
+            frame_idx: this.state.currentFrame,
+            mode: document.getElementById('nlEntityMode')?.value || 'ahead',
+            distance: parseFloat(document.getElementById('nlEntityDistance')?.value || '12') || 0,
+            speed: parseFloat(document.getElementById('nlEntitySpeed')?.value || '0') || 0,
+            num_frames: parseInt(document.getElementById('nlEntityFrames')?.value || '20', 10) || 20,
+            use_vlm: true,
+        };
+        if (referenceImage) body.reference_image = referenceImage;
+        const btn = document.getElementById('nlEntityBtn');
+        if (btn) btn.disabled = true;
+        this._nlEntityStatus('正在出图/重建（三个大模型串行，首次约 1~3 分钟，请耐心等待）…');
+        const t0 = Date.now();
+        try {
+            const resp = await fetch(`${API_BASE}/text2entity/generate`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            const cat = d.category || 'object';
+            const dims = (d.dimensions || []).map(v => Number(v).toFixed(2)).join(' × ');
+            const desc = (d.vlm && d.vlm.short_desc) ? `（${d.vlm.short_desc}）` : '';
+            const att = (d.vlm && d.vlm.attempts) ? `，尝试 ${d.vlm.attempts} 次` : '';
+            this._nlEntityStatus(`已插入「${cat}」#${d.object_id}${desc}（${dims} m）· ${(d.placement || {}).mode || ''}`
+                + `${att} · 用时 ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+            if (d.reference_image) {
+                const grp = document.getElementById('nlEntityPreviewGroup');
+                const img = document.getElementById('nlEntityPreviewImg');
+                if (img) img.src = 'data:image/png;base64,' + d.reference_image;
+                if (grp) grp.style.display = 'block';
+            }
+            this.state.selectedObjects = [d.object_id];
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+            if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+            }
+            this.updateSelectedObjectPanel();
+        } catch (e) {
+            this._nlEntityStatus('生成失败：' + e.message, true);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // 重排选中物体：沿车道重新生成"物理合理 + 无冲突"的轨迹（保留模型）
+    async nlEntityReplan() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const tid = this.state.selectedObjects[0];
+        if (tid === undefined || tid === null) { alert('请先在画布中选中一个已插入的物体'); return; }
+        const body = {
+            scene_id: this.state.sceneId,
+            track_id: tid,
+            mode: document.getElementById('nlEntityMode')?.value || 'ahead',
+            distance: parseFloat(document.getElementById('nlEntityDistance')?.value || '12') || 0,
+            speed: parseFloat(document.getElementById('nlEntitySpeed')?.value || '0') || 0,
+            num_frames: parseInt(document.getElementById('nlEntityFrames')?.value || '20', 10) || 20,
+            start_frame: this.state.currentFrame,
+        };
+        const btn = document.getElementById('nlEntityReplanBtn');
+        if (btn) btn.disabled = true;
+        this._nlEntityStatus(`正在为 #${tid} 重排无冲突轨迹…`);
+        try {
+            const resp = await fetch(`${API_BASE}/text2entity/replan`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            const p = d.placement || {};
+            this._nlEntityStatus(`已重排 #${d.track_id}：${p.mode || ''} 横向 ${Number(p.lateral || 0).toFixed(1)}m / `
+                + `距离 ${Number(p.distance || 0).toFixed(1)}m，${d.num_frames} 帧，0 冲突`);
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+            if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+            }
+            this.updateSelectedObjectPanel();
+        } catch (e) {
+            this._nlEntityStatus('重排失败：' + e.message, true);
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // ==================== 语言编辑轨迹（LLM） ====================
+
+    _trajEditStatus(msg) {
+        const el = document.getElementById('trajEditStatus');
+        if (el) el.textContent = msg;
+        if (msg) this.updateStatus('轨迹编辑: ' + msg);
+    }
+
+    _trajEditPreview(obj) {
+        const el = document.getElementById('trajEditPreview');
+        if (el) el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1);
+    }
+
+    // 显示"生成新物体"时实际用的参考图 + 插入预览（用户要求：生成了新物体要能看到参考图）
+    _trajEditShowInserts(inserts) {
+        const box = document.getElementById('trajEditImages');
+        if (!box) return;
+        const list = inserts || [];
+        const it = list[0];
+        if (!it || (!it.reference_image && !it.preview)) { box.style.display = 'none'; return; }
+        const refImg = document.getElementById('trajEditRefImg');
+        const prevImg = document.getElementById('trajEditPrevImg');
+        const label = document.getElementById('trajEditRefLabel');
+        if (refImg) refImg.src = it.reference_image ? ('data:image/png;base64,' + it.reference_image) : '';
+        if (prevImg) prevImg.src = it.preview ? ('data:image/png;base64,' + it.preview) : '';
+        if (label) {
+            const bits = [`参考图（实际用于重建） · T:${it.object_id}`];
+            if (it.prompt) bits.push(it.prompt);
+            if (it.dimensions) bits.push(`包围盒 ${it.dimensions.map(v => v.toFixed(2)).join('×')}m`);
+            if (it.dims_target) bits.push(`目标 ${it.dims_target.map(v => v.toFixed(2)).join('×')}m`);
+            if (it.num_frames) bits.push(`${it.num_frames} 帧`);
+            if (it.bbox_mode) bits.push(it.bbox_mode === 'tight_to_model' ? '框紧贴模型' : it.bbox_mode);
+            if (it.recon_degenerate) bits.push('重建退化→已换通用车模');
+            label.textContent = bits.join(' · ');
+        }
+        box.style.display = 'block';
+    }
+
+    async trajEdit(mode) {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const instruction = (document.getElementById('trajEditInstruction')?.value || '').trim();
+        if (!instruction) { alert('请先输入要做的轨迹编辑'); return; }
+        const path = mode === 'apply' ? '/traj_edit/apply' : '/traj_edit/plan';
+        const nfEl = document.getElementById('trajEditNumFrames');
+        const panelFrames = Math.max(2, Math.min(600, parseInt(nfEl?.value || '30', 10) || 30));
+        const body = {
+            scene_id: this.state.sceneId, instruction,
+            frame_idx: this.state.currentFrame, num_frames: panelFrames,
+            new_role: (document.getElementById('trajEditNewRole')?.value) || 'auto',
+        };
+        // 可选参考图：指令里有"生成一辆车"时，直接用它做 SAM3D（跳过文生图）
+        const refEl = document.getElementById('trajEditRefFile');
+        if (mode === 'apply' && refEl && refEl.files && refEl.files[0]) {
+            try {
+                body.reference_image = await new Promise((resolve, reject) => {
+                    const fr = new FileReader();
+                    fr.onload = () => resolve(String(fr.result).split(',')[1]);
+                    fr.onerror = reject;
+                    fr.readAsDataURL(refEl.files[0]);
+                });
+            } catch (e) { /* 读图失败就当没给 */ }
+        }
+        this._trajEditStatus(mode === 'apply' ? '正在规划并应用（含 insert 时较慢）…' : '正在用 LLM 解析…');
+        const t0 = Date.now();
+        try {
+            const resp = await fetch(`${API_BASE}${path}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            const warns = d.warnings || [];
+            // 有操作没成功（例如"窗口内撞不上"）时，把原因也说清楚，别只显示"完成"
+            const fails = (d.report || []).filter(r => r && r.ok === false && (r.error || r.warn));
+            for (const r of fails) {
+                const tag = r.op === 'collide' ? `相撞 T:${r.a}↔T:${r.b}` : String(r.op || '操作');
+                warns.push(`${tag}未生效：${r.error || r.warn}`);
+            }
+            this._trajEditStatus(`完成（解析来源 ${d.source || '?'}，${(d.ops || []).length} 个操作，`
+                + `${((Date.now() - t0) / 1000).toFixed(0)}s）`
+                + (warns.length ? ` 注意：${warns[0]}` : ''));
+            this._trajEditPreview({ source: d.source, warnings: warns, ops: d.ops,
+                                    inserted: d.inserted, report: d.report });
+            this._trajEditShowInserts(d.inserts);
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+            if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+            }
+            this.updateSelectedObjectPanel();
+        } catch (e) {
+            this._trajEditStatus('失败：' + e.message);
+        }
+    }
+
+    _sam3dShowScaleControl(fit = 1.0) {
+        const grp = document.getElementById('sam3dScaleGroup');
+        const rng = document.getElementById('sam3dScaleRange');
+        const val = document.getElementById('sam3dScaleVal');
+        if (grp) grp.style.display = 'block';
+        if (rng) rng.value = String(fit);
+        if (val) val.textContent = Math.round(fit * 100) + '%';
+    }
+
+    async _sam3dApplyScale(factor) {
+        if (!this.state.sceneId || !this.lastSamObjectId) return;
+        try {
+            const resp = await fetch(`${API_BASE}/edit/synthetic/scale`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    track_id: this.lastSamObjectId,
+                    factor: Math.max(0.2, Math.min(5.0, factor)),
+                }),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            this._sam3dStatus(`替换模型大小已调整为基准的 ${Math.round((d.factor || factor) * 100)}%`);
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+            if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+            }
+        } catch (e) {
+            this._sam3dStatus('调整模型大小失败: ' + e.message, true);
+        }
+    }
+
+    // ==================== 车头朝向运动方向 ====================
+
+    setupAutoHeadingControls() {
+        const sm = document.getElementById('autoHeadingSmooth');
+        if (sm) {
+            sm.addEventListener('input', () => {
+                const v = parseFloat(sm.value) || 0;
+                const el = document.getElementById('autoHeadingSmoothVal');
+                if (el) el.textContent = v.toFixed(2);
+                if (this._autoHeadingTimer) clearTimeout(this._autoHeadingTimer);
+                this._autoHeadingTimer = setTimeout(() => this._autoHeadingApply({ smoothing: v }), 120);
+            });
+        }
+    }
+
+    async _autoHeadingLoad() {
+        if (!this.state.sceneId) return;
+        try {
+            const resp = await fetch(`${API_BASE}/edit/auto_heading/${this.state.sceneId}?frame_idx=${this.state.currentFrame || 0}`);
+            const d = await resp.json();
+            if (!d || !d.success) return;
+            // 该功能默认开启且作用于全部动态物体；若后端被关掉了则自动重新开启，保证"无需手动应用"
+            if (!d.enabled || !d.all_tracks) {
+                await this._autoHeadingApply({ enabled: true, all_tracks: true, smoothing: d.smoothing });
+                return;
+            }
+            this._syncAutoHeadingUI(d);
+        } catch (e) {
+            /* 忽略 */
+        }
+    }
+
+    _syncAutoHeadingUI(d) {
+        if (d.smoothing !== undefined && d.smoothing !== null) {
+            const sm = document.getElementById('autoHeadingSmooth');
+            if (sm) sm.value = d.smoothing;
+            const el = document.getElementById('autoHeadingSmoothVal');
+            if (el) el.textContent = Number(d.smoothing).toFixed(2);
+        }
+        const scope = d.all_tracks ? '全部动态物体' : `选中的 ${(d.track_ids || []).length} 个物体`;
+        this._autoHeadingStatus(d.enabled
+            ? `已开启：${scope} 车头朝向运动方向（平滑 ${Number(d.smoothing || 0).toFixed(2)}）`
+            : '未开启');
+    }
+
+    async _autoHeadingApply(payload) {
+        if (!this.state.sceneId) { this._autoHeadingStatus('请先加载场景', true); return; }
+        try {
+            const resp = await fetch(`${API_BASE}/edit/auto_heading`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, ...payload }),
+            });
+            const d = await resp.json();
+            if (!resp.ok || !d.success) throw new Error(d.detail || ('HTTP ' + resp.status));
+            this._syncAutoHeadingUI(d);
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+        } catch (e) {
+            this._autoHeadingStatus('设置自动朝向失败: ' + e.message, true);
+        }
+    }
+
+    _autoHeadingStatus(msg, isError = false) {
+        const el = document.getElementById('autoHeadingStatus');
+        if (el) {
+            el.textContent = msg;
+            el.style.color = isError ? '#e5484d' : 'inherit';
+        }
+    }
+
+    // ==================== 实验台（测试各改动） ====================
+
+    // ==================== 主车（EGO）实体化 ====================
+    async loadEgoInfo() {
+        const box = document.getElementById('egoStatus');
+        if (!this.state.sceneId) {
+            if (box) box.textContent = '请先加载场景。';
+            return null;
+        }
+        try {
+            const resp = await fetch(`${API_BASE}/ego/${encodeURIComponent(this.state.sceneId)}`);
+            const d = await resp.json();
+            this.state.ego = d;
+            const vis = document.getElementById('egoVisible');
+            if (vis && d.available) vis.checked = !!d.visible;
+            this._fillEgoSource(d);
+            if (box) {
+                if (!d.available) {
+                    box.innerHTML = '未启用主车实体（' + (d.reason || '未知原因') + '）';
+                } else {
+                    const src = d.source_track_id === null || d.source_track_id === undefined
+                        ? '真实主车（自车相机）' : `track ${d.source_track_id}（${d.source_type || ''}）`;
+                    const g = d.ground || {};
+                    const groundTxt = (d.auto_ground && g.applied)
+                        ? ` · <span title="按场景地面自动抬升，避免穿模">已自动贴地(相机高≈${Number(g.cam_height_median || 0).toFixed(2)}m)</span>`
+                        : '';
+                    box.innerHTML = `当前视角：<b>${this._escapeHtml(src)}</b>${groundTxt}`;
+                }
+            }
+            return d;
+        } catch (e) {
+            if (box) box.textContent = '主车信息获取失败: ' + e.message;
+            return null;
+        }
+    }
+
+    _fillEgoSource(d) {
+        const sel = document.getElementById('egoSource');
+        if (!sel) return;
+        if (!d || !d.available) {
+            sel.innerHTML = '<option value="">真实主车（自车相机）</option>';
+            sel.disabled = true;
+            return;
+        }
+        const cur = d.source_track_id === null || d.source_track_id === undefined ? '' : String(d.source_track_id);
+        const opts = ['<option value="">真实主车（自车相机）</option>'];
+        (d.options || []).forEach(o => {
+            const label = `${o.track_id} · ${o.type || ''}（${o.num_frames || 0}帧）`;
+            opts.push(`<option value="${o.track_id}">${this._escapeHtml(label)}</option>`);
+        });
+        sel.innerHTML = opts.join('');
+        sel.value = cur;
+        sel.disabled = false;
+    }
+
+    async egoSetSource(v) {
+        const id = String(v || '').trim();
+        const d = await this._egoPost('/ego', {
+            set_source: true,
+            source_track_id: id === '' ? null : parseInt(id, 10) });
+        if (d) this.updateStatus(`主车视角已切换到：${d.source_type || '真实主车'}`);
+    }
+
+    async _egoPost(path, body) {
+        if (!this.state.sceneId) { alert('请先加载场景'); return null; }
+        try {
+            const resp = await fetch(`${API_BASE}${path}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(Object.assign({ scene_id: this.state.sceneId }, body || {}))
+            });
+            const d = await resp.json();
+            if (!d.success) throw new Error(d.detail || '操作失败');
+            this._invalidateRenderCaches();
+            await this.loadFrame(this.state.currentFrame);
+            if (this.viewer3d && typeof this.viewer3d.loadFrame === 'function') {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+            }
+            await this.loadEgoInfo();
+            this.updateSelectedObjectPanel();
+            return d;
+        } catch (e) {
+            alert('主车操作失败: ' + e.message);
+            return null;
+        }
+    }
+
+    async egoSetVisible(visible) {
+        await this._egoPost('/ego', { visible: !!visible });
+        this.updateStatus(visible ? '主车实体：已显示' : '主车实体：已隐藏');
+    }
+
+    // 自动贴地：让后端按当前 4DGS 场景的地面重新摆放主车（不同场景相机高度不同）
+    async egoRefitGround() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const d = await this._egoPost('/ego/ground', { auto: true });
+        if (!d) return;
+        const g = d.ground || d.info || {};
+        if (g && g.applied) {
+            this.updateStatus(`主车已自动贴地：场景地面 y≈${Number(g.ground_y_median || 0).toFixed(2)}，`
+                + `相机高≈${Number(g.cam_height_median || 0).toFixed(2)}m`);
+        } else {
+            this.updateStatus('主车自动贴地未生效：' + ((g && g.reason) || '未知原因'));
+        }
+    }
+
+    setupLabControls() {
+        const openBtn = document.getElementById('labBtn');
+        if (openBtn) openBtn.addEventListener('click', () => this.openLab());
+        const closeBtn = document.getElementById('labCloseBtn');
+        if (closeBtn) closeBtn.addEventListener('click', () => this.closeLab());
+
+        document.querySelectorAll('.lab-tab').forEach(tab => {
+            tab.addEventListener('click', () => this._labSwitchTab(tab.dataset.tab));
+        });
+
+        const graphRun = document.getElementById('labGraphRunBtn');
+        if (graphRun) graphRun.addEventListener('click', () => this.labLoadGraph());
+        const batchRun = document.getElementById('labBatchRunBtn');
+        if (batchRun) batchRun.addEventListener('click', () => this.labRunBatch());
+        const gnnRun = document.getElementById('labGnnCollectBtn');
+        if (gnnRun) gnnRun.addEventListener('click', () => this.labCollectGnn());
+        const stRun = document.getElementById('labSelfTestBtn');
+        if (stRun) stRun.addEventListener('click', () => this.labSelfTest());
+
+        // ⑤ 闭环仿真工具
+        const bind = (id, fn) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('click', fn);
+        };
+        bind('simTrustModelBtn', () => this.simTrustModel());
+        bind('simEnvelopeBtn', () => this.simEnvelope());
+        bind('simTrajBtn', () => this.simTrajectory());
+        bind('simBankBuildBtn', () => this.simBuildBank());
+        bind('simBankInfoBtn', () => this.simBankInfo());
+        bind('simMvPlanBtn', () => this.simMvPlan());
+        bind('simMvRunBtn', () => this.simMvRun());
+        bind('simMvLogBtn', () => this.simMvLog());
+        bind('simDifixStatusBtn', () => this.simDifixStatus());
+        bind('simRigBtn', () => this.simRenderRig());
+        bind('simRunBtn', () => this.simRollout());
+        bind('simExpBtn', () => this.simExportScenario());
+        bind('simDemoRunBtn', () => this.simDemoRun());
+        bind('simDemoReportBtn', () => this.simDemoReport());
+        bind('simAbRunBtn', () => this.simAbRun());
+        bind('simAbReportBtn', () => this.simAbReport());
+
+        // ⑥ CARLA 仿真
+        bind('carlaStatusBtn', () => this.carlaRefreshStatus(1));
+        bind('carlaStartBtn', () => this.carlaServer('start'));
+        bind('carlaStopBtn', () => this.carlaServer('stop'));
+        bind('carlaEnvBtn', () => this.carlaEnvCheck());
+        bind('carlaSceneReloadBtn', () => this.carlaLoadScenarios());
+        bind('carlaRenderBtn', () => this.carlaRender());
+        bind('engStartBtn', () => this.carlaEngineStart());
+        bind('engStopBtn', () => this.carlaEngineStop());
+        bind('engPlayBtn', () => this.carlaEnginePlay());
+        bind('engPrevBtn', () => this.carlaEngineFrame(-1));
+        bind('engNextBtn', () => this.carlaEngineFrame(1));
+        bind('engResetBtn', () => this.carlaEngine('reset', {}).then(() => this.carlaEngineRefresh(false)));
+        bind('engSaveBtn', () => this.carlaEngineSave());
+        bind('engShotBtn', () => this.carlaEngineShot());
+        bind('engAddBtn', () => {
+            const g = id => parseFloat(document.getElementById(id)?.value || '0');
+            this.carlaEngine('actor/add', { x: g('engAddX'), y: g('engAddY'),
+                                            yaw: g('engAddYaw'), speed: g('engAddSpeed') })
+                .then(() => this.carlaEngineRefresh(false));
+        });
+        const _engCam = document.getElementById('engCam');
+        if (_engCam) _engCam.addEventListener('change', () => this.carlaEngine('camera', { camera: _engCam.value }));
+        const _engW = document.getElementById('engWeather');
+        if (_engW) _engW.addEventListener('change', () => this.carlaEngine('weather', { weather: _engW.value }));
+        const _engF = document.getElementById('engFps');
+        if (_engF) _engF.addEventListener('change', () => this.carlaEngine('fps', { fps: parseFloat(_engF.value) }));
+        const _engS = document.getElementById('engSlider');
+        if (_engS) _engS.addEventListener('change', () => this.carlaEngine('frame', { index: parseInt(_engS.value, 10) })
+            .then(() => this.carlaEngineRefresh(false)));
+        bind('simDifixRefineBtn', () => this.simDifixRefine());
+        bind('simDifixSeqBtn', () => this.simDifixSequence());
+        const _rnEl = document.getElementById('carlaRunName');
+        if (_rnEl) _rnEl.addEventListener('input', () => this._carlaWillRun());
+        const _rsEl = document.getElementById('carlaRoadSnap');
+        if (_rsEl) _rsEl.addEventListener('change', () => this._carlaWillRun());
+        const _ucEl = document.getElementById('carlaUseCurrent');
+        if (_ucEl) _ucEl.addEventListener('change', () => this._carlaWillRun());
+        bind('carlaXoscBtn', () => this.carlaExportXosc());
+        bind('carlaSrBtn', () => this.carlaScenarioRunner());
+        bind('carlaCancelBtn', () => this.carlaCancelJob());
+        // Corner Case 面板里的快捷入口：直接跳到 ⑥ CARLA 仿真
+        bind('carlaQuickBtn', () => { this.openLab(); this._labSwitchTab('carla'); });
+        // 流程串联：上一步/下一步 + ③→④ 直达 + 释放显存
+        bind('labNextStepBtn', () => this._labStep(1));
+        bind('labPrevStepBtn', () => this._labStep(-1));
+        bind('simToCarlaBtn', () => this._labGoCarla());
+        bind('carlaReleaseBtn', () => this.carlaRelease());
+
+        const videoClose = document.getElementById('labVideoCloseBtn');
+        if (videoClose) videoClose.addEventListener('click', () => this.closeVideoModal());
+        const tabEgo = document.getElementById('labVideoTabEgo');
+        if (tabEgo) tabEgo.addEventListener('click', () => this._labSwitchVideo('ego'));
+        const tabBev = document.getElementById('labVideoTabBev');
+        if (tabBev) tabBev.addEventListener('click', () => this._labSwitchVideo('bev'));
+        const tabTop = document.getElementById('labVideoTabTop');
+        if (tabTop) tabTop.addEventListener('click', () => this._labSwitchVideo('top'));
+        const caseVideoBtn = document.getElementById('renderCaseVideoBtn');
+        if (caseVideoBtn) caseVideoBtn.addEventListener('click', () => this.labRenderCaseVideo());
+
+        // 主车（EGO）控件：显示开关 + "以谁的视角渲染" + 自动贴地
+        const egoVis = document.getElementById('egoVisible');
+        if (egoVis) egoVis.addEventListener('change', () => this.egoSetVisible(egoVis.checked));
+        const egoSrc = document.getElementById('egoSource');
+        if (egoSrc) egoSrc.addEventListener('change', () => this.egoSetSource(egoSrc.value));
+        const egoGroundBtn = document.getElementById('egoGroundBtn');
+        if (egoGroundBtn) egoGroundBtn.addEventListener('click', () => this.egoRefitGround());
+
+        // 事故类型复选框
+        const typesBox = document.getElementById('labBatchTypes');
+        if (typesBox) {
+            typesBox.innerHTML = LAB_SCENARIOS.map(([v, label]) => {
+                const checked = ['rear-end', 'head-on', 'lane-change-cutin'].includes(v) ? 'checked' : '';
+                return `<label class="cc-checkbox"><input type="checkbox" class="lab-batch-type" value="${v}" ${checked}>${label}</label>`;
+            }).join('');
+        }
+    }
+
+    openLab() {
+        const modal = document.getElementById('labModal');
+        if (modal) modal.classList.add('active');
+        this._labRenderFlow();
+        if (this.state.sceneId) {
+            const frameEl = document.getElementById('labGraphFrame');
+            if (frameEl && !frameEl.dataset.touched) frameEl.value = this.state.currentFrame || 0;
+            this._labGnnCommand('');
+        } else {
+            this._labStatus('labGraphStatus', '请先加载场景（顶部「加载场景」）。');
+        }
+    }
+
+    closeLab() {
+        const modal = document.getElementById('labModal');
+        if (modal) modal.classList.remove('active');
+    }
+
+    // ==================== ⑤ 闭环仿真工具 ====================
+    _simStatus(id, msg, err) {
+        const el = document.getElementById(id);
+        if (el) { el.textContent = msg; el.style.color = err ? '#fca5a5' : ''; }
+    }
+
+    _simRows(headers, rows) {
+        if (!rows.length) return '<div class="cc-status">（无结果）</div>';
+        return `<table class="lab-table"><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>`
+            + `<tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+    }
+
+    async _simPost(url, body, statusId, label) {
+        if (!this.state.sceneId && url.indexOf('/scene') === -1 && url.indexOf('multiview') === -1) {
+            this._simStatus(statusId, '请先加载场景。', true); return null;
+        }
+        try {
+            const resp = await fetch(`${API_BASE}${url}`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {})
+            });
+            const d = await resp.json();
+            if (d.success === false || d.detail) throw new Error(d.detail || '失败');
+            return d;
+        } catch (e) {
+            this._simStatus(statusId, `${label}失败: ${e.message}`, true);
+            return null;
+        }
+    }
+
+    async simTrustModel() {
+        this._simStatus('simTrustStatus', '正在标定 trust 模型…');
+        const d = await this._simPost('/trust/model', {}, 'simTrustStatus', '标定');
+        if (!d) return;
+        const m = d.model || {};
+        this._simStatus('simTrustStatus',
+            `标定完成：样本 ${d.num_rows}，两特征 R²=${m.r2}（只用 coverage 时 ${m.r2_coverage_only}），`
+            + `模型 SSIM ≈ ${m.y0} + ${m.y1}·cov^${m.p}·exp(-ang/${m.tau_deg}°)`);
+        const el = document.getElementById('simTrustOut');
+        if (el) el.innerHTML = this._simRows(['指标', '值'], [
+            ['样本数', d.num_rows], ['R²（coverage+视角）', m.r2], ['R²（仅 coverage）', m.r2_coverage_only],
+            ['p', m.p], ['tau(度)', m.tau_deg], ['报告数', (d.reports || []).length]
+        ]);
+    }
+
+    async simEnvelope() {
+        const minTrust = parseFloat(document.getElementById('simTrustMin')?.value || '0.55');
+        const sweep = (document.getElementById('simSweep')?.value || '0,1,2,3,4')
+            .split(',').map(v => parseFloat(v)).filter(v => !isNaN(v));
+        this._simStatus('simTrustStatus', '正在扫描可信域…');
+        const d = await this._simPost('/trust/envelope', {
+            scene_id: this.state.sceneId, frame: this.state.currentFrame || 0,
+            lateral_offsets: sweep, min_trust: minTrust }, 'simTrustStatus', '可信域扫描');
+        if (!d) return;
+        const env = d.envelope || {};
+        this._simStatus('simTrustStatus', `可信域：最大安全横移 ${env.max_safe_lateral_m === null
+            ? '无（当前视角已不可信）' : env.max_safe_lateral_m + ' m'}（阈值 ${minTrust}）`);
+        const el = document.getElementById('simTrustOut');
+        if (el) el.innerHTML = this._simRows(['横移(m)', 'coverage', '预测 SSIM', '可信'],
+            (env.rows || []).map(r => [r.lateral_m, r.coverage, r.pred_ssim,
+                r.trusted ? '<span class="pass">是</span>' : '<span class="fail">否</span>']));
+    }
+
+    async simTrajectory() {
+        const minTrust = parseFloat(document.getElementById('simTrustMin')?.value || '0.55');
+        const num = parseInt(document.getElementById('cornerNumFrames')?.value) || 20;
+        this._simStatus('simTrustStatus', '正在逐帧判定…');
+        const d = await this._simPost('/trust/trajectory', {
+            scene_id: this.state.sceneId, frame: this.state.currentFrame || 0, num_frames: num,
+            min_trust: minTrust }, 'simTrustStatus', '轨迹 trust');
+        if (!d) return;
+        const rep = d.report || {};
+        this._simStatus('simTrustStatus', `信任 ${rep.trusted_frames}/${rep.num_frames} 帧`
+            + (rep.truncate_frame !== null && rep.truncate_frame !== undefined
+                ? `；越界截断帧 = ${rep.truncate_frame}（${rep.truncate_reason || ''}）` : '；未越界'));
+        const el = document.getElementById('simTrustOut');
+        if (el) el.innerHTML = this._simRows(['帧', 'coverage', '预测 SSIM', '可信', '离训练视角(m)', '夹角(°)'],
+            (rep.frames || []).map(f => [f.frame, f.coverage, f.pred_ssim,
+                f.trusted ? '是' : '否', f.d_trans_m, f.d_view_angle_deg]));
+    }
+
+    async simBuildBank() {
+        const solidify = !!document.getElementById('simBankSolidify')?.checked;
+        this._simStatus('simBankStatus', '正在构建 actor 资产库…（含跨帧关联，几秒）');
+        const d = await this._simPost('/actor_assets/build',
+            { scene_id: this.state.sceneId, solidify }, 'simBankStatus', '构建资产库');
+        if (!d) return;
+        this._simStatus('simBankStatus', `完成：${d.num_tracks} 条 track，可用 ${d.num_usable}；`
+            + `bank.json = ${d.bank_path}`);
+        const el = document.getElementById('simBankOut');
+        if (el) el.innerHTML = this._simRows(['资产', 'track', '高斯数', '尺寸(宽高长)', '速度(m/s)', '可用'],
+            (d.assets || []).map(a => [this._escapeHtml(a.asset_id), a.track_id, a.num_gaussians,
+                (a.dimensions || []).map(v => Number(v).toFixed(1)).join('×'),
+                a.mean_speed_mps, a.usable ? '是' : '否']));
+    }
+
+    async simBankInfo() {
+        try {
+            const r = await fetch(`${API_BASE}/actor_assets/${encodeURIComponent(this.state.sceneId)}`);
+            const d = await r.json();
+            this._simStatus('simBankStatus', d.available
+                ? `已有资产库：${d.num_usable}/${d.num_tracks} 可用（${d.path}）`
+                : '当前场景还没有资产库 → 点「构建 actor 资产库」；构建后俯视 3D 会用真模型渲染。');
+        } catch (e) {
+            this._simStatus('simBankStatus', '查询失败: ' + e.message, true);
+        }
+    }
+
+    _simMvBody() {
+        const cameras = (document.getElementById('simMvCameras')?.value || '0,1,2')
+            .split(',').map(v => parseInt(v)).filter(v => !isNaN(v));
+        const holdout = (document.getElementById('simMvHoldout')?.value || '')
+            .split(',').map(v => parseInt(v)).filter(v => !isNaN(v));
+        return {
+            scene: (document.getElementById('simMvScene')?.value || '001').trim(),
+            cameras, frames: parseInt(document.getElementById('simMvFrames')?.value) || 8,
+            holdout, do_eval: !!document.getElementById('simMvEval')?.checked,
+            do_bank: !!document.getElementById('simMvBank')?.checked
+        };
+    }
+
+    async simMvPlan() {
+        const d = await this._simPost('/multiview/plan', this._simMvBody(), 'simMvStatus', '预算检查');
+        if (!d) return;
+        this._simStatus('simMvStatus', `预算：${d.num_images} 张图 / 上限 ${d.max_images} → `
+            + (d.fits_budget ? '可以跑' : '会 OOM，请减少帧数或相机'));
+        const el = document.getElementById('simMvOut');
+        if (el) el.innerHTML = `<div class="cc-status">命令：<code>${this._escapeHtml(d.cmd)}</code></div>`;
+    }
+
+    async simMvRun() {
+        const body = Object.assign(this._simMvBody(), { confirm: true });
+        const d = await this._simPost('/multiview/run', body, 'simMvStatus', '启动');
+        if (!d) return;
+        this._simStatus('simMvStatus', `已在后台启动（pid ${d.pid}）；日志：${d.log_path}`);
+        this._simMvLastLog = d.log_path;
+        const lp = document.getElementById('simMvLogPath');
+        if (lp) lp.value = d.log_path;
+        const el = document.getElementById('simMvOut');
+        if (el) el.innerHTML = `<div class="cc-status">${this._escapeHtml(d.cmd)}</div>`;
+    }
+
+    async simMvLog() {
+        const out = document.getElementById('simMvOut');
+        const path = (this._simMvLastLog || '');
+        if (!path) { this._simStatus('simMvStatus', '先点「后台启动」，或把日志路径填进下面输入框。'); }
+        const el = document.getElementById('simMvLogPath');
+        const logPath = (el && el.value) || path;
+        if (!logPath) return;
+        this._simMvLastLog = logPath;
+        try {
+            const r = await fetch(`${API_BASE}/multiview/log?path=${encodeURIComponent(logPath)}&tail=60`);
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '读取失败');
+            if (out) out.innerHTML = `<pre class="lab-code">${this._escapeHtml((d.tail || []).join('\n'))}</pre>`;
+        } catch (e) {
+            this._simStatus('simMvStatus', '日志读取失败: ' + e.message, true);
+        }
+    }
+
+    async simDifixStatus() {
+        try {
+            const r = await fetch(`${API_BASE}/diffusion/status`);
+            const d = await r.json();
+            const ok = d.ready;
+            this._simStatus('simTrustStatus', ok ? '扩散精修可用（Difix + sd-turbo 就绪）'
+                : '扩散精修暂时不可用：' + JSON.stringify(d.sd_turbo && d.sd_turbo.missing || []));
+            const el = document.getElementById('simDifixOut');
+            if (el) el.innerHTML = `<div class="cc-status">权重：${this._escapeHtml(d.difix_ckpt || '未找到')}<br>`
+                + `sd-turbo：${d.sd_turbo && d.sd_turbo.available ? '就绪' : '缺失（' + this._escapeHtml(JSON.stringify(d.sd_turbo && d.sd_turbo.missing || [])) + '）'}<br>`
+                + `修复：<code>${this._escapeHtml((d.sd_turbo && d.sd_turbo.fix) || '')}</code></div>`;
+        } catch (e) {
+            this._simStatus('simTrustStatus', '扩散自检失败: ' + e.message, true);
+        }
+    }
+
+    async simRenderRig() {
+        const seg = (document.getElementById('simRigSeg')?.value || '001').trim();
+        const cams = (document.getElementById('simRigCams')?.value || '0,1,2,3,4')
+            .split(',').map(v => parseInt(v)).filter(v => !isNaN(v));
+        const distort = !!document.getElementById('simRigDistort')?.checked;
+        this._simStatus('simP23Status', '正在渲染相机 rig…');
+        const d = await this._simPost('/sensor/rig', {
+            scene_id: this.state.sceneId, segment: seg, frame: this.state.currentFrame || 0,
+            cameras: cams, distort }, 'simP23Status', 'rig 渲染');
+        if (!d) return;
+        const camsOut = d.cameras || [];
+        this._simStatus('simP23Status', `已渲染 ${camsOut.length} 台相机`
+            + `（视角偏离：${camsOut.map(c => c.view_angle_vs_ref_deg + '°').join(' / ')}）`
+            + (distort ? '，含镜头畸变' : ''));
+        const el = document.getElementById('simRigOut');
+        if (el) {
+            el.innerHTML = '<div class="lab-row">' + camsOut.map(c =>
+                `<div style="flex:1;min-width:180px;"><div class="detail">cam${c.camera} · ${c.view_angle_vs_ref_deg}°</div>`
+                + `<img src="${c.image}" style="width:100%;border-radius:4px;"></div>`).join('') + '</div>';
+        }
+    }
+
+    async simRollout() {
+        const body = {
+            scene_id: this.state.sceneId,
+            steps: parseInt(document.getElementById('simSteps')?.value) || 8,
+            speed: parseFloat(document.getElementById('simSpeed')?.value) || 0,
+            steer: parseFloat(document.getElementById('simSteer')?.value) || 0,
+            min_trust_frac: parseFloat(document.getElementById('simFrac')?.value) || undefined
+        };
+        this._simStatus('simP23Status', '正在跑闭环 rollout…（逐帧渲染 + trust 判定）');
+        const d = await this._simPost('/sim/rollout', body, 'simP23Status', 'rollout');
+        if (!d) return;
+        const rep = d.report || {};
+        this._simStatus('simP23Status', `rollout 完成：${rep.steps} 步，可信 ${rep.trusted_steps} 步`
+            + `（比例 ${rep.trusted_ratio}），最小 coverage ${rep.min_coverage}，`
+            + `${rep.collided ? '发生碰撞' : '无碰撞'}`);
+        const el = document.getElementById('simRollOut');
+        if (el) el.innerHTML = this._simRows(['步', '帧', 'coverage', '预测 SSIM', '阈值', '最近物体(m)', '碰撞', '终止原因'],
+            (d.log || []).map(e => {
+                const t = e.trust || {};
+                return [e.step, e.frame, t.coverage, t.pred_ssim, t.threshold, e.near_m,
+                    (e.collision || []).join(',') || '—', this._escapeHtml(e.truncate_reason || '—')];
+            }));
+    }
+
+    async simExportScenario() {
+        const body = {
+            scene_id: this.state.sceneId,
+            scenario_type: (document.getElementById('simExpType')?.value || '').trim() || null,
+            seed: parseInt(document.getElementById('simExpSeed')?.value) || 7,
+            num_frames: parseInt(document.getElementById('simExpFrames')?.value) || 20,
+            start_frame: this.state.currentFrame || 0,
+            all_tracks: !!document.getElementById('simExpAll')?.checked
+        };
+        this._simStatus('simExpStatus', '正在导出 OpenSCENARIO + CommonRoad…（会先生成事故再导出，导出后不改动场景）');
+        const d = await this._simPost('/export/scenario', body, 'simExpStatus', '导出');
+        if (!d) return;
+        const v = d.validation || {};
+        this._simStatus('simExpStatus', `导出完成：${d.num_tracks} 条轨迹；round-trip 校验 `
+            + (v.ok ? '通过 ✓' : '失败 ✗'));
+        const el = document.getElementById('simExpOut');
+        if (el) {
+            let html = this._simRows(['文件', '路径'], [
+                ['OpenSCENARIO', this._escapeHtml((d.files || {}).openscenario || '')],
+                ['CommonRoad', this._escapeHtml((d.files || {}).commonroad || '')],
+                ['世界坐标 JSON', this._escapeHtml((d.files || {}).world_json || '')]
+            ]);
+            html += this._simRows(['track', '角色', 'ego', '速度(m/s)', '尺寸(w×l×h)', '帧数'],
+                (d.tracks || []).map(t => [t.track_id, t.role, t.is_ego ? '是' : '否', t.speed_mps,
+                    (t.dimensions || []).map(x => Number(x).toFixed(2)).join('×'), t.num_frames]));
+            html += `<div class="cc-status">${this._escapeHtml(d.caveat || '')}</div>`;
+            el.innerHTML = html;
+        }
+    }
+
+    _simDemoBody() {
+        return {
+            scene_id: this.state.sceneId,
+            segment: (document.getElementById('simDemoSeg')?.value || '001').trim(),
+            scenario: (document.getElementById('simDemoScenario')?.value || 'rear-end').trim(),
+            frames: parseInt(document.getElementById('simDemoFrames')?.value) || 8,
+            steps: parseInt(document.getElementById('simDemoSteps')?.value) || 5,
+            confirm: true
+        };
+    }
+
+    async simDemoRun() {
+        this._simStatus('simDemoStatus', '已提交一键自检（后台跑，约 1-3 分钟）…');
+        const d = await this._simPost('/demo/run', this._simDemoBody(), 'simDemoStatus', '自检');
+        if (!d) return;
+        this._simDemoReport = d.report_path;
+        this._simStatus('simDemoStatus', `自检已在后台启动（pid ${d.pid}）。完成后点「看报告」：${d.report_path}`);
+        const el = document.getElementById('simDemoOut');
+        if (el) el.innerHTML = `<div class="cc-status">日志：<code>${this._escapeHtml(d.log_path)}</code></div>`;
+    }
+
+    async simDemoReport() {
+        const path = this._simDemoReport;
+        if (!path) { this._simStatus('simDemoStatus', '还没有报告路径：先点「跑一键自检」，或启动后稍等再点。'); return; }
+        try {
+            const r = await fetch(`${API_BASE}/report?path=${encodeURIComponent(path)}`);
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '读取失败');
+            const rep = d.report || {};
+            const st = rep.steps || {};
+            const rows = [];
+            if (st.trust_model) rows.push(['trust 模型', `样本 ${st.trust_model.num_rows}，R²=${st.trust_model.model.r2}`]);
+            if (st.trust_envelope) rows.push(['可信域', `max_safe_lateral=${st.trust_envelope.max_safe_lateral_m} m`]);
+            if (st.actor_bank) rows.push(['actor 资产库', `${st.actor_bank.num_tracks} track / 可用 ${st.actor_bank.num_usable}`]);
+            if (st.sensor_rig) rows.push(['相机 rig', `${st.sensor_rig.cameras.length} 台相机已渲染`]);
+            if (st.rollout) Object.entries(st.rollout.runs || {}).forEach(([k, v]) =>
+                rows.push([`rollout:${k}`, `${v.report.steps} 步，可信比例 ${v.report.trusted_ratio}`]));
+            if (st.export) rows.push(['导出', `${st.export.num_tracks} 条轨迹，round-trip ${st.export.validation && st.export.validation.ok ? '通过' : '失败'}`]);
+            if (st.diffusion) rows.push(['扩散精修', st.diffusion.ready ? '就绪' : `缺 ${JSON.stringify(st.diffusion.sd_turbo_missing)}`]);
+            this._simStatus('simDemoStatus', '自检报告已读取 ✓');
+            const el = document.getElementById('simDemoOut');
+            if (el) el.innerHTML = this._simRows(['环节', '结果'], rows);
+        } catch (e) {
+            this._simStatus('simDemoStatus', '报告还没生成或读取失败: ' + e.message, true);
+        }
+    }
+
+    async simAbRun() {
+        const refine = document.getElementById('simAbRefine')?.value || 'stub';
+        const held = (document.getElementById('simAbHeldout')?.value || '3,4')
+            .split(',').map(v => parseInt(v)).filter(v => !isNaN(v));
+        const body = { scene_id: this.state.sceneId, segment: (document.getElementById('simDemoSeg')?.value || '001').trim(),
+                       num_frames: parseInt(document.getElementById('simDemoFrames')?.value) || 4,
+                       heldout: held, refine, confirm: true };
+        const plan = await this._simPost('/trust/ab/plan', Object.assign({}, body, { confirm: false }),
+                                         'simDemoStatus', 'A/B 预检');
+        if (!plan) return;
+        if (refine === 'difix' && !plan.diffusion_ready) {
+            this._simStatus('simDemoStatus', `Difix 未就绪，缺 ${JSON.stringify(plan.diffusion_missing)}；可先用 stub 验证管道。`, true);
+            return;
+        }
+        const d = await this._simPost('/trust/ab/run', body, 'simDemoStatus', 'A/B');
+        if (!d) return;
+        this._simAbReport = d.report_path;
+        this._simStatus('simDemoStatus', `A/B 已在后台启动（pid ${d.pid}，refine=${refine}）。完成后可读报告：${d.report_path}`);
+        const el = document.getElementById('simDemoOut');
+        if (el) el.innerHTML = `<div class="cc-status">日志：<code>${this._escapeHtml(d.log_path)}</code></div>`;
+    }
+
+    async simAbReport() {
+        const path = this._simAbReport;
+        if (!path) { this._simStatus('simDemoStatus', '还没有 A/B 报告：先点「跑精修 A/B」，等它跑完再点这里。'); return; }
+        try {
+            const r = await fetch(`${API_BASE}/report?path=${encodeURIComponent(path)}`);
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '读取失败');
+            const rep = d.report || {};
+            const rows = (rep.per_view || []).map(v => {
+                const rf = v.refined || {};
+                const f = (x, n) => (x === undefined || x === null) ? '—' : Number(x).toFixed(n);
+                return [v.camera, f(v.mean_psnr, 2), f(v.mean_ssim, 4), f(v.mean_lpips, 4),
+                        f(rf.mean_psnr, 2), f(rf.mean_ssim, 4), f(rf.mean_lpips, 4),
+                        f(rf.delta_psnr, 3), f(rf.delta_ssim, 4), f(rf.delta_lpips, 4)];
+            });
+            this._simStatus('simDemoStatus', `A/B 报告（精修方式 ${rep.refine || 'none'}）：`
+                + ((rep.per_view || []).some(v => v.refined) ? '含精修前后对比 ✓' : '这次没有精修结果'));
+            const el = document.getElementById('simDemoOut');
+            if (el) el.innerHTML = this._simRows(
+                ['相机', 'PSNR', 'SSIM', 'LPIPS', '精修 PSNR', '精修 SSIM', '精修 LPIPS',
+                 'ΔPSNR', 'ΔSSIM', 'ΔLPIPS'], rows);
+        } catch (e) {
+            this._simStatus('simDemoStatus', 'A/B 报告还没生成或读取失败: ' + e.message, true);
+        }
+    }
+
+    // ==================== ⑥ CARLA 仿真（视频 / 实时直播 / 标准导出） ====================
+    _carlaState() {
+        if (!this._carla) this._carla = { jobId: null, timer: null, live: false, status: null, afterJob: null };
+        return this._carla;
+    }
+
+    _carlaStatus(msg, err) {
+        const el = document.getElementById('carlaStatusLine');
+        if (el) { el.textContent = msg; el.style.color = err ? '#e5484d' : 'inherit'; }
+    }
+
+    _carlaVal(id) { const el = document.getElementById(id); return el ? el.value : ''; }
+    _carlaChk(id) { const el = document.getElementById(id); return el ? el.checked : false; }
+
+    _carlaParams() {
+        const useCurrent = this._carlaChk('carlaUseCurrent') || !this._carlaVal('carlaSceneSel');
+        const out = {
+            map: this._carlaVal('carlaMap') || 'Town10HD_Opt',
+            fps: parseFloat(this._carlaVal('carlaFps') || '20'),
+            cameras: this._carlaVal('carlaCameras') || 'chase,birdseye',
+            cam_size: this._carlaVal('carlaCamSize') || '960x540',
+            focus: this._carlaVal('carlaFocus') || 'crash',
+            actors: this._carlaVal('carlaActors') || 'dynamic',
+            weather: this._carlaVal('carlaWeather') || 'ClearNoon',
+            ego_mode: this._carlaVal('carlaEgoMode') || 'playback',
+            seed: parseInt(this._carlaVal('carlaSeed') || '7', 10),
+            start_frame: parseInt(this._carlaVal('carlaStart') || '0', 10),
+            num_frames: parseInt(this._carlaVal('carlaFrames') || '20', 10),
+            export_xosc: this._carlaChk('carlaExportXosc'),
+            road_snap: this._carlaVal('carlaRoadSnap') || 'z',
+        };
+        const _rn = (this._carlaVal('carlaRunName') || '').trim();
+        if (_rn) out.export_name = _rn;
+        const stype = (this._carlaVal('carlaScenarioType') || '').trim();
+        if (stype) out.scenario_type = stype;
+        if (useCurrent) {
+            if (!this.state.sceneId) {
+                throw new Error('没有已加载的场景：先「加载场景」，或取消勾选「用当前编辑的场景」再从下拉里选一个已导出场景');
+            }
+            out.scene_id = this.state.sceneId;
+        } else {
+            out.scenario = this._carlaVal('carlaSceneSel');
+        }
+        return out;
+    }
+
+    _carlaFillMaps(maps) {
+        const sel = document.getElementById('carlaMap');
+        if (!sel || sel.dataset.filled === '1' || !maps || !maps.length) return;
+        sel.innerHTML = maps.map(m => `<option value="${m}"${m === 'Town10HD_Opt' ? ' selected' : ''}>${m}</option>`).join('');
+        sel.dataset.filled = '1';
+    }
+
+    async carlaRefreshStatus(deep) {
+        try {
+            const r = await fetch(`${API_BASE}/carla/status?deep=${deep ? 1 : 0}`);
+            const d = await r.json();
+            this._carlaState().status = d;
+            const dot = document.getElementById('carlaSvcDot');
+            if (dot) dot.className = 'carla-dot ' + (d.ready ? 'on' : 'off');
+            const txt = document.getElementById('carlaSvcText');
+            if (txt) {
+                txt.textContent = d.ready
+                    ? `CARLA 运行中（RPC ${d.port}${d.map ? '，地图 ' + d.map : ''}${d.live ? '，直播中' : ''}）`
+                    : (d.running ? 'CARLA 进程在但端口没通（可能还在加载，或已经卡住 → 点「停止」再启动）'
+                                 : 'CARLA 未启动（点左边「启动 CARLA」）');
+            }
+            const v = document.getElementById('carlaVram');
+            if (v && d.gpu) {
+                const g = d.gpu;
+                v.textContent = `显存 ${(g.used_mb / 1024).toFixed(1)}/${(g.total_mb / 1024).toFixed(1)} GB`;
+                v.style.color = g.free_mb < 7000 ? '#ef4444' : '#9ca3af';
+                v.title = '空闲 ' + g.free_mb + ' MB\n' +
+                    (g.procs || []).map(p => `${p.name}  ${p.used_mb} MB`).join('\n');
+            }
+            this._carlaFillMaps(d.maps);
+            return d;
+        } catch (e) {
+            this._carlaStatus('状态查询失败: ' + e.message, true);
+            return null;
+        }
+    }
+
+    async carlaServer(action) {
+        const body = { action, quality: this._carlaVal('carlaQuality') || 'High',
+                       map: this._carlaVal('carlaMap') || 'Town10HD_Opt' };
+        this._carlaStatus(action === 'start' ? '正在启动 CARLA（首次约 20-60 秒）…' : '正在停止…');
+        try {
+            const r = await fetch(`${API_BASE}/carla/server`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+            });
+            const d = await r.json();
+            await this.carlaRefreshStatus(1);
+            const ok = d.success !== false;
+            this._carlaStatus(ok ? (action === 'start' ? 'CARLA 已就绪 ✓' : '已停止') :
+                ('失败：' + (d.detail || '请看服务日志')), !ok);
+        } catch (e) { this._carlaStatus('操作失败: ' + e.message, true); }
+    }
+
+    async carlaEnvCheck() {
+        this._carlaStatus('环境自检中…');
+        try {
+            const r = await fetch(`${API_BASE}/carla/env`);
+            const d = await r.json();
+            const ok = d.carla_installed && d.python37_ok;
+            const lines = [
+                `CARLA 安装：${d.carla_installed ? '✓' : '✗'}  ${d.carla_home}`,
+                `Python3.7 API：${d.python37_ok ? '✓' : '✗'}  ${d.python37}`,
+                `脚本：${Object.entries(d.scripts || {}).map(([k, v]) => k + (v ? '✓' : '✗')).join('  ')}`,
+                `ScenarioRunner：${d.scenario_runner ? '✓' : '✗'}    磁盘剩余 ${d.disk_free_gb} GB`,
+                `Vulkan：${(d.vulkan || []).join(' | ') || '未检测到'}`,
+            ];
+            const box = document.getElementById('carlaMetrics');
+            if (box) box.innerHTML = `<table class="lab-table"><tbody>${lines.map(l => `<tr><td>${l}</td></tr>`).join('')}</tbody></table>`;
+            this._carlaStatus(ok ? '环境自检通过 ✓' : '环境不完整（见下表）', !ok);
+        } catch (e) { this._carlaStatus('自检失败: ' + e.message, true); }
+    }
+
+    async carlaLoadScenarios() {
+        const sel = document.getElementById('carlaSceneSel');
+        // 关键：这个刷新是异步的，会把「批量实例/上一步」刚选好的场景冲掉（表现为永远跑默认场景）。
+        // 所以先记下要保留的选择，重建列表后再选回去；如果它不在列表里（比如批量实例的 world.json）就补一条。
+        const keep = this._carlaPendingScenario || (sel ? sel.value : '');
+        try {
+            const r = await fetch(`${API_BASE}/carla/scenarios`);
+            const d = await r.json();
+            if (sel) {
+                const items = (d.items || []).filter(i => i.kind !== 'video');
+                sel.innerHTML = items.map(i =>
+                    `<option value="${i.path}">${i.path}  ·  ${i.num_tracks || '?'} 物体 / ${i.num_dynamic || 0} 动态`
+                    + `${(i.roles || []).length ? ' · ' + i.roles.join(',') : ''}`
+                    + `${i.rendered_video ? ' · 已出片' : ''}</option>`).join('');
+                if (keep) {
+                    if (![...sel.options].some(o => o.value === keep)) {
+                        const o = document.createElement('option');
+                        o.value = keep;
+                        o.textContent = `【指定】${keep}`;
+                        sel.insertBefore(o, sel.firstChild);
+                    }
+                    sel.value = keep;
+                }
+                if (!sel.dataset.bound) {
+                    sel.addEventListener('change', () => {
+                        this._carlaPendingScenario = null;   // 用户手动选了，就不再粘住旧的
+                        this._carlaWillRun();
+                    });
+                    sel.dataset.bound = '1';
+                }
+            }
+            this._carlaWillRun();
+            this._carlaStatus(`可跑场景 ${d.count} 个`);
+        } catch (e) { this._carlaStatus('场景列表失败: ' + e.message, true); }
+    }
+
+    // 明示"这次会跑什么场景"，避免又跑到默认场景
+    _carlaWillRun() {
+        const el = document.getElementById('carlaWillRun');
+        if (!el) return;
+        const useCurrent = this._carlaChk('carlaUseCurrent') || !this._carlaVal('carlaSceneSel');
+        const rn = (this._carlaVal('carlaRunName') || '').trim();
+        const t = (this._carlaVal('carlaScenarioType') || '').trim();
+        const what = useCurrent
+            ? `当前编辑的场景（scene_id=<code>${this._escapeHtml(this.state.sceneId || '未加载')}</code>`
+              + `${t ? '，事故类型 ' + this._escapeHtml(t) : ''}${this._carlaVal('carlaSeed') ? '，seed ' + this._escapeHtml(this._carlaVal('carlaSeed')) : ''}）`
+            : `<code>${this._escapeHtml(this._carlaVal('carlaSceneSel') || '（未选）')}</code>`;
+        el.innerHTML = '将跑：' + what
+            + (rn ? `　输出名 <code>${this._escapeHtml(rn)}</code>` : '')
+            + `　贴地=${this._escapeHtml(this._carlaVal('carlaRoadSnap') || 'z')}`
+            + `　ego=${this._escapeHtml(this._carlaVal('carlaEgoMode') || 'playback')}`;
+    }
+
+    async carlaRender() {
+        let p;
+        try { p = this._carlaParams(); } catch (e) { this._carlaStatus(e.message, true); return; }
+        this._carlaStatus('提交 CARLA 渲染作业…');
+        try {
+            const r = await fetch(`${API_BASE}/carla/render`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p)
+            });
+            const d = await r.json();
+            if (d.detail) throw new Error(d.detail);
+            this._carlaState().jobId = d.job.id;
+            this._carlaStatus(`作业 ${d.job.id} 已开始：${d.job.title}`);
+            this._carlaPoll();
+        } catch (e) { this._carlaStatus('提交失败: ' + e.message, true); }
+    }
+
+    _carlaPoll() {
+        const s = this._carlaState();
+        if (s.timer) clearTimeout(s.timer);
+        if (!s.jobId) return;
+        const tick = async () => {
+            let j;
+            try {
+                const r = await fetch(`${API_BASE}/carla/jobs/${s.jobId}?tail=150`);
+                j = await r.json();
+            } catch (e) { this._carlaStatus('轮询失败: ' + e.message, true); return; }
+            const log = document.getElementById('carlaJobLog');
+            if (log) { log.textContent = (j.log_tail || []).join('\n'); log.scrollTop = log.scrollHeight; }
+            if (j.status === 'running') {
+                this._carlaStatus(`作业跑中… ${j.seconds}s（日志在右边实时刷）`);
+                s.timer = setTimeout(tick, 2000);
+                return;
+            }
+            const ok = j.status === 'done';
+            this._carlaStatus(ok ? `作业完成 ✓（${j.seconds}s）` : `作业 ${j.status} ✗ rc=${j.rc}`, !ok);
+            this._carlaShowResult(j);
+            if (s.afterJob === 'sr' && j.artifacts && j.artifacts.xosc) {
+                s.afterJob = null;
+                this._carlaRunSr(j.artifacts.xosc);
+            }
+            this.carlaRefreshStatus();
+        };
+        tick();
+    }
+
+    _carlaFileUrl(p) { return `${API_BASE}/carla/file?path=${encodeURIComponent(p)}`; }
+    _carlaDownloadUrl(p) { return `${API_BASE}/carla/file?path=${encodeURIComponent(p)}&download=1`; }
+
+    async _carlaShowResult(j) {
+        const vids = ((j.artifacts || {}).videos) || [];
+        const vid = document.getElementById('carlaVideo');
+        if (vid && vids.length) { vid.src = this._carlaFileUrl(vids[0]); vid.style.display = ''; }
+        const dl = document.getElementById('carlaDownloadRow');
+        if (dl) {
+            const items = [];
+            vids.forEach(v => items.push(`<a class="btn btn-secondary btn-small" href="${this._carlaDownloadUrl(v)}">下载 ${v.split('/').pop()}</a>`));
+            ['events_json', 'frames_json', 'xosc'].forEach(k => {
+                if ((j.artifacts || {})[k]) {
+                    items.push(`<a class="btn btn-secondary btn-small" href="${this._carlaDownloadUrl(j.artifacts[k])}">下载 ${j.artifacts[k].split('/').pop()}</a>`);
+                }
+            });
+            dl.innerHTML = items.join(' ');
+        }
+        const box = document.getElementById('carlaResultInfo');
+        if (box) box.innerHTML = `<div class="cc-status">产物目录：<code>${j.out_dir || '-'}</code></div>`;
+        const mbox = document.getElementById('carlaMetrics');
+        const ev = (j.artifacts || {}).events_json;
+        if (ev && mbox) {
+            try {
+                const r = await fetch(this._carlaFileUrl(ev));
+                const e = await r.json();
+                const rows = [
+                    ['帧数', e.frames], ['actor 数', e.actors], ['地图', e.map],
+                    ['碰撞事件', (e.collisions || []).length],
+                    ['全程最小距离(m)', e.min_dist_overall], ['最小 TTC(s)', e.min_ttc_overall],
+                    ['相机跟随', `${e.focus} → ${JSON.stringify(e.focus_ids)}`],
+                ];
+                let html = `<table class="lab-table"><thead><tr><th>指标</th><th>值</th></tr></thead><tbody>`
+                    + rows.map(([k, v]) => `<tr><td>${k}</td><td>${v === null || v === undefined ? '-' : v}</td></tr>`).join('')
+                    + `</tbody></table>`;
+                const cs = e.collisions || [];
+                if (cs.length) {
+                    html += `<table class="lab-table"><thead><tr><th>碰撞帧</th><th>t(s)</th><th>actor</th><th>对方</th><th>冲量</th></tr></thead><tbody>`
+                        + cs.slice(0, 12).map(c => `<tr><td>${c.frame}</td><td>${c.t}</td><td>${c.actor}</td>`
+                            + `<td>${c.other_type || c.other_actor || '-'}</td><td>${c.impulse}</td></tr>`).join('')
+                        + `</tbody></table>`;
+                }
+                mbox.innerHTML = html;
+            } catch (e) { mbox.innerHTML = `<div class="cc-status">指标读取失败：${e.message}</div>`; }
+        }
+        this.carlaLoadJobs();
+    }
+
+    async carlaLoadJobs() {
+        try {
+            const r = await fetch(`${API_BASE}/carla/jobs`);
+            const d = await r.json();
+            const box = document.getElementById('carlaJobs');
+            if (!box) return;
+            const rows = (d.jobs || []).map(j => {
+                const v = ((j.artifacts || {}).videos || [])[0];
+                return [j.kind, j.title, j.status, j.seconds + 's',
+                        v ? `<a href="${this._carlaFileUrl(v)}" target="_blank">看视频</a>` : '-'];
+            });
+            box.innerHTML = this._simRows(['类型', '说明', '状态', '用时', '产物'], rows);
+        } catch (e) { /* 忽略 */ }
+    }
+
+    // ==================== CARLA 仿真引擎（可播放 + 可编辑）====================
+    _eng() {
+        if (!this._engine) this._engine = { timer: null, st: null };
+        return this._engine;
+    }
+
+    _engStatus(msg, err) {
+        const el = document.getElementById('engStatus');
+        if (el) { el.textContent = msg; el.style.color = err ? '#e5484d' : 'inherit'; }
+    }
+
+    async carlaEngine(action, body) {
+        const r = await fetch(`${API_BASE}/carla/engine/${action}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body || {})
+        });
+        const d = await r.json();
+        if (d && d.detail && d.success === undefined) throw new Error(d.detail);
+        return d;
+    }
+
+    async carlaEngineStart() {
+        let p;
+        try { p = this._carlaParams(); } catch (e) { this._engStatus(e.message, true); return; }
+        this._engStatus('正在启动仿真引擎（起 CARLA + 生成场景 + 预热，约 40-90 秒）…');
+        try {
+            const d = await this.carlaEngine('start', p);
+            if (!d.success) throw new Error(d.detail || '启动失败');
+            this._engStatus('引擎已就绪：可播放 / 拖时间轴 / 选中车辆编辑 / 存成场景');
+            const img = document.getElementById('engImg');
+            if (img) img.src = `${API_BASE}/carla/engine/mjpeg?t=${Date.now()}`;
+            await this.carlaEngineRefresh(true);
+            const s = this._eng();
+            if (s.timer) clearInterval(s.timer);
+            s.timer = setInterval(() => this.carlaEngineRefresh(false), 700);
+        } catch (e) { this._engStatus('启动失败: ' + e.message, true); }
+    }
+
+    async carlaEngineStop() {
+        try { await this.carlaEngine('stop', {}); } catch (e) { /* 忽略 */ }
+        const s = this._eng();
+        if (s.timer) { clearInterval(s.timer); s.timer = null; }
+        const img = document.getElementById('engImg');
+        if (img) img.removeAttribute('src');
+        this._engStatus('引擎已停止（显存约 1 分钟后自动释放，也可点「释放显存」）');
+    }
+
+    async carlaEngineRefresh(force) {
+        try {
+            const r = await fetch(`${API_BASE}/carla/engine/state`);
+            const st = await r.json();
+            if (st.detail) throw new Error(st.detail);
+            this._eng().st = st;
+            this._engRender(st);
+        } catch (e) {
+            if (force) this._engStatus('引擎未在运行: ' + e.message, true);
+        }
+    }
+
+    _engRender(st) {
+        const sl = document.getElementById('engSlider');
+        const lb = document.getElementById('engFrameLabel');
+        if (sl) { sl.max = Math.max(0, st.n_frames - 1); sl.value = st.frame; }
+        if (lb) lb.textContent = `${st.frame} / ${st.n_frames - 1}  ·  t=${(st.frame / st.fps).toFixed(2)}s`;
+        const pb = document.getElementById('engPlayBtn');
+        if (pb) pb.textContent = st.play ? '暂停' : '播放';
+        const cam = document.getElementById('engCam');
+        if (cam && st.camera) cam.value = st.camera;
+        const w = document.getElementById('engWeather');
+        if (w && st.weather) w.value = st.weather;
+        const box = document.getElementById('engActors');
+        if (!box) return;
+        const rows = (st.actors || []).map(a => {
+            const off = a.offset ? `Δ ${a.offset.dx || 0} / ${a.offset.dy || 0} m / ${a.offset.dyaw || 0}°` : '';
+            const loc = a.loc ? `${a.loc[0]}, ${a.loc[1]}` : '-';
+            return `<tr>
+                <td>${a.is_ego ? '主车 ' : ''}${this._escapeHtml(String(a.role))}#${a.tid}${a.extra ? ' <b>(新增)</b>' : ''}</td>
+                <td>${a.kind}</td><td>${loc}</td><td>${a.yaw ?? '-'}°</td><td>${off}</td>
+                <td>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dx="1">左</button>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dx="-1">右</button>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dy="1">前</button>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dy="-1">后</button>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dyaw="15">逆</button>
+                  <button class="btn btn-secondary btn-small eng-nudge" data-tid="${a.tid}" data-dyaw="-15">顺</button>
+                  <button class="btn btn-secondary btn-small eng-del" data-tid="${a.tid}">删</button>
+                </td></tr>`;
+        }).join('');
+        box.innerHTML = `<table class="lab-table"><thead><tr><th>参与者</th><th>类型</th><th>位置(x,y)</th>`
+            + `<th>朝向</th><th>编辑量</th><th>调整（步行=左/右/前/后，转角=逆/顺）</th></tr></thead>`
+            + `<tbody>${rows || '<tr><td colspan="6">（还没有 actor）</td></tr>'}</tbody></table>`;
+        box.querySelectorAll('.eng-nudge').forEach(b => b.addEventListener('click', () => {
+            const k = parseFloat(document.getElementById('engStep')?.value || '1');
+            const body = { tid: parseInt(b.dataset.tid, 10) };
+            if (b.dataset.dx) body.dx = parseFloat(b.dataset.dx) * k;
+            if (b.dataset.dy) body.dy = parseFloat(b.dataset.dy) * k;
+            if (b.dataset.dyaw) body.dyaw = parseFloat(b.dataset.dyaw);
+            this.carlaEngine('actor', body).then(() => this.carlaEngineRefresh(false));
+        }));
+        box.querySelectorAll('.eng-del').forEach(b => b.addEventListener('click', () => {
+            this.carlaEngine('actor/delete', { tid: parseInt(b.dataset.tid, 10) })
+                .then(() => this.carlaEngineRefresh(false));
+        }));
+    }
+
+    async carlaEnginePlay() {
+        const st = this._eng().st || {};
+        await this.carlaEngine('play', { play: !st.play });
+        this.carlaEngineRefresh(false);
+    }
+
+    async carlaEngineFrame(delta) {
+        const st = this._eng().st || { frame: 0, n_frames: 1 };
+        const idx = Math.max(0, Math.min((st.frame || 0) + delta, (st.n_frames || 1) - 1));
+        await this.carlaEngine('frame', { index: idx });
+        this.carlaEngineRefresh(false);
+    }
+
+    async carlaEngineSave() {
+        this._engStatus('正在把编辑后的场景存成 world.json …');
+        try {
+            const d = await this.carlaEngine('save', {});
+            const el = document.getElementById('engSaved');
+            if (el) el.innerHTML = `已保存：<code>${this._escapeHtml(d.path)}</code><br>`
+                + '可以把它填到上面「1) 选场景」的输入里，或者直接「开始 CARLA 仿真并出视频」。';
+            this._engStatus('已保存 ✓（编辑过的轨迹都在里面）');
+        } catch (e) { this._engStatus('保存失败: ' + e.message, true); }
+    }
+
+    async carlaEngineShot() {
+        try {
+            const d = await this.carlaEngine('screenshot', {});
+            const el = document.getElementById('engSaved');
+            if (el) el.innerHTML += `<br>截图已存：<code>${this._escapeHtml(d.path)}</code>`;
+        } catch (e) { this._engStatus('截图失败: ' + e.message, true); }
+    }
+
+    // 扩散精修：独立可用（不用跑一键自检）
+    async simDifixRefine() {
+        if (!this.state.sceneId) { this._simStatus('simDifixOut', '请先加载场景', true); return; }
+        const f = parseInt(document.getElementById('simDifixFrame')?.value || '0', 10);
+        this._simStatus('simDifixOut', `正在精修第 ${f} 帧……首次会加载扩散模型（可能 1-3 分钟）`);
+        const box = document.getElementById('simDifixImages');
+        if (box) box.innerHTML = '';
+        try {
+            const r = await fetch(`${API_BASE}/diffusion/refine_frame`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, frame_idx: f, width: 800, height: 600 })
+            });
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '精修失败');
+            const url = p => `${API_BASE}/diffusion/preview?path=${encodeURIComponent(p)}`;
+            if (box) {
+                box.innerHTML =
+                    `<div><div class="lab-subtitle">精修前</div><img class="difix-img" src="${url(d.before)}"></div>`
+                    + `<div><div class="lab-subtitle">精修后（Difix）</div><img class="difix-img" src="${url(d.after)}"></div>`;
+            }
+            this._simStatus('simDifixOut', `第 ${d.frame_idx} 帧精修完成，用时 ${d.seconds}s`);
+        } catch (e) { this._simStatus('simDifixOut', '精修失败: ' + e.message, true); }
+    }
+
+    async carlaExportXosc() {
+        let p;
+        try { p = this._carlaParams(); } catch (e) { this._carlaStatus(e.message, true); return; }
+        const body = { map: p.map };
+        if (p.scenario) body.scenario = p.scenario;
+        else if (p.scene_id) {
+            this._carlaStatus('导出对齐版 xosc 需要一个已落盘的场景：请取消勾选「用当前编辑的场景」，从下拉里选一个（或先「开始 CARLA 仿真」会自动导出）', true);
+            return;
+        }
+        this._carlaStatus('导出 CARLA 对齐版 xosc…');
+        this._carlaState().afterJob = null;
+        try {
+            const r = await fetch(`${API_BASE}/carla/export_xosc`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+            });
+            const d = await r.json();
+            if (d.detail) throw new Error(d.detail);
+            this._carlaState().jobId = d.job.id;
+            this._carlaPoll();
+        } catch (e) { this._carlaStatus('导出失败: ' + e.message, true); }
+    }
+
+    // 先导出对齐版 xosc，再拿它的产物路径去跑 ScenarioRunner
+    async carlaScenarioRunner() {
+        const p = this._carlaParams();
+        if (p.scene_id) {
+            this._carlaStatus('ScenarioRunner 需要一个已落盘的场景：请取消勾选「用当前编辑的场景」并从下拉里选一个', true);
+            return;
+        }
+        this._carlaStatus('Step1/2：先导出 CARLA 对齐版 xosc…');
+        this._carlaState().afterJob = 'sr';
+        await this.carlaExportXosc();
+    }
+
+    async _carlaRunSr(xosc) {
+        this._carlaStatus('Step2/2：用 ScenarioRunner 跑 ' + xosc + ' …');
+        try {
+            const r = await fetch(`${API_BASE}/carla/scenario_runner`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ xosc })
+            });
+            const d = await r.json();
+            if (d.detail) throw new Error(d.detail);
+            this._carlaState().jobId = d.job.id;
+            this._carlaPoll();
+        } catch (e) { this._carlaStatus('ScenarioRunner 失败: ' + e.message, true); }
+    }
+
+    // 扩散精修：一次精修所有帧 -> 出一段视频
+    async simDifixSequence() {
+        if (!this.state.sceneId) { this._simStatus('simDifixOut', '请先加载场景', true); return; }
+        const f = parseInt(document.getElementById('simDifixFrame')?.value || '0', 10);
+        this._simStatus('simDifixOut', `已提交"精修所有帧"作业（从第 ${f} 帧到结尾），正在跑第 1 帧…`);
+        try {
+            const r = await fetch(`${API_BASE}/diffusion/refine_sequence`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, start_frame: f, num_frames: 0,
+                                       make_video: true, fps: 10 })
+            });
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '提交失败');
+            this._difixJob = d.job_id;
+            this._simDifixPoll();
+        } catch (e) { this._simStatus('simDifixOut', '提交失败: ' + e.message, true); }
+    }
+
+    _simDifixPoll() {
+        if (this._difixTimer) clearInterval(this._difixTimer);
+        const url = p => `${API_BASE}/diffusion/preview?path=${encodeURIComponent(p)}`;
+        const vurl = p => `${API_BASE}/carla/file?path=${encodeURIComponent(p)}`;
+        this._difixTimer = setInterval(async () => {
+            try {
+                const r = await fetch(`${API_BASE}/diffusion/refine_job/${this._difixJob}`);
+                const j = await r.json();
+                if (j.status === 'running') {
+                    const tot = j.total || 0;
+                    this._simStatus('simDifixOut', tot
+                        ? `精修中 ${j.done}/${tot} 帧…（首帧要加载模型较慢，之后每帧约几秒~几十秒）`
+                        : '正在准备第 1 帧（加载模型）…');
+                    return;
+                }
+                clearInterval(this._difixTimer); this._difixTimer = null;
+                const box = document.getElementById('simDifixImages');
+                if (j.status === 'done') {
+                    this._simStatus('simDifixOut', `全部 ${j.total} 帧精修完成，产物目录 ${j.out_dir}`);
+                    if (box) {
+                        box.innerHTML = (j.video
+                            ? `<div><div class="lab-subtitle">精修后视频</div>`
+                              + `<video class="difix-img" controls preload="metadata" src="${vurl(j.video)}"></video></div>`
+                            : '')
+                          + (j.video_before
+                            ? `<div><div class="lab-subtitle">原始视频（对比）</div>`
+                              + `<video class="difix-img" controls preload="metadata" src="${vurl(j.video_before)}"></video></div>`
+                            : '');
+                    }
+                } else {
+                    this._simStatus('simDifixOut', '精修失败: ' + (j.error || '未知错误'), true);
+                }
+            } catch (e) { /* 忽略轮询错误 */ }
+        }, 3000);
+    }
+
+    async carlaRelease() {
+        this._carlaStatus('正在释放显存（停 CARLA + 直播）…');
+        try {
+            const r = await fetch(`${API_BASE}/carla/release`, { method: 'POST' });
+            const d = await r.json();
+            const img = document.getElementById('carlaLiveImg');
+            if (img) { img.removeAttribute('src'); img.alt = '直播已停止'; }
+            await this.carlaRefreshStatus(1);
+            const g = d.gpu || {};
+            this._carlaStatus(`已释放，现在空闲显存 ${g.free_mb ?? '?'} MB / ${g.total_mb ?? '?'} MB`
+                + '（可以放心去用 SAM3D 了）');
+        } catch (e) { this._carlaStatus('释放失败: ' + e.message, true); }
+    }
+
+    async carlaCancelJob() {
+        const s = this._carlaState();
+        if (!s.jobId) { this._carlaStatus('当前没有跟踪中的作业'); return; }
+        try {
+            await fetch(`${API_BASE}/carla/jobs/${s.jobId}/cancel`, { method: 'POST' });
+            this._carlaStatus('已请求取消作业 ' + s.jobId);
+        } catch (e) { this._carlaStatus('取消失败: ' + e.message, true); }
+    }
+
+    // ==================== 工作台流程串联（① 挑事故 → ② 批量生成 → ③ 闭环评估 → ④ CARLA 验证 → ⑤/⑥）====================
+    _labSteps() { return ['batch', 'graph', 'sim', 'carla']; }
+    _labStepNames() {
+        return { batch: '① 批量生成', graph: '② 挑事故', sim: '③ 渲染可信域评估',
+                 carla: '④ CARLA 闭环仿真' };
+    }
+
+    _labCase() {
+        if (!this._caseCtx) {
+            this._caseCtx = { scenario_type: '', seed: null, roles: null,
+                              start_frame: 0, num_frames: 20, quality: null, source: '' };
+        }
+        return this._caseCtx;
+    }
+
+    // 各步骤产出案例后都调它，把上下文带到后面所有步骤
+    _labSetCase(patch, source) {
+        const c = this._labCase();
+        Object.assign(c, patch || {});
+        if (source) c.source = source;
+        this._labRenderFlow();
+        return c;
+    }
+
+    _labRenderFlow() {
+        const el = document.getElementById('labCaseCtx');
+        const cur = document.querySelector('.lab-tab.active')?.dataset.tab || 'graph';
+        const names = this._labStepNames();
+        const nxt = this._labStepName(cur, 1);
+        const btn = document.getElementById('labNextStepBtn');
+        if (btn) btn.textContent = nxt ? `下一步：${nxt} →` : '已经是最后一步';
+        if (!el) return;
+        const c = this._labCase();
+        const bits = [];
+        if (c.scenario_type) bits.push(`事故类型 <b>${this._escapeHtml(c.scenario_type)}</b>`);
+        if (c.seed !== null && c.seed !== undefined) bits.push(`seed <b>${c.seed}</b>`);
+        if (c.roles && Object.keys(c.roles).length) bits.push(`参与者 ${this._escapeHtml(JSON.stringify(c.roles))}`);
+        if (c.num_frames) bits.push(`帧窗 <b>${c.start_frame || 0}–${(c.start_frame || 0) + c.num_frames}</b>`);
+        if (c.quality) bits.push(`质量门 <b>${c.quality}</b>`);
+        el.innerHTML = bits.length
+            ? `当前案例：${bits.join(' · ')}${c.source ? ` <i>（来自 ${this._escapeHtml(c.source)}）</i>` : ''}`
+            : '还没有案例 —— 先在 ① 批量生成里跑一批，再点某一行右侧「载入场景」或「CARLA 这条」';
+    }
+
+    _labStepName(cur, delta) {
+        const steps = this._labSteps();
+        const names = this._labStepNames();
+        const i = steps.indexOf(cur);
+        if (i < 0) return '';
+        const j = i + delta;
+        return (j >= 0 && j < steps.length) ? names[steps[j]] : '';
+    }
+
+    _labStep(delta) {
+        const cur = document.querySelector('.lab-tab.active')?.dataset.tab || 'graph';
+        const steps = this._labSteps();
+        const i = steps.indexOf(cur);
+        const j = Math.min(steps.length - 1, Math.max(0, i + delta));
+        if (j === i) return;
+        this._labSwitchTab(steps[j]);
+    }
+
+    // 把"当前案例"的上下文填进 CARLA 面板
+    _labPrefillCarla() {
+        const c = this._labCase();
+        const set = (id, v) => {
+            const el = document.getElementById(id);
+            if (el && v !== undefined && v !== null && v !== '') el.value = v;
+        };
+        set('carlaScenarioType', c.scenario_type);
+        set('carlaSeed', c.seed);
+        set('carlaStart', c.start_frame);
+        set('carlaFrames', c.num_frames);
+    }
+
+    // 把某条批量实例"载入场景"（确定性重放），之后可以在 ③ 里逐帧评估、继续编辑
+    async _labApplyInstance(m) {
+        if (!this.state.sceneId) { this._carlaStatus('请先加载场景，再载入实例', true); return; }
+        if (!m || !m.instance_id) { this._carlaStatus('这条实例没有可用信息', true); return; }
+        this._carlaStatus(`正在把实例 ${m.instance_id} 还原进场景（会先把场景重置成干净状态，之后可继续编辑）…`);
+        try {
+            const r = await fetch(`${API_BASE}/carla/apply_instance`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, instance: m, reset_scene: true })
+            });
+            const d = await r.json();
+            if (!d.success) throw new Error(d.detail || '还原失败');
+            this._labSetCase({
+                scenario_type: d.scenario_type, seed: d.seed, roles: d.roles || null,
+                start_frame: d.start_frame, num_frames: d.num_frames, instance_id: d.instance_id,
+                quality: m.valid ? '通过' : '未通过', world_json: m.world_json || null
+            }, `实例 ${d.instance_id}`);
+            this._labSwitchTab('sim');
+            this._simStatus('simP23Status',
+                `已把 ${d.instance_id} 还原进场景（碰撞帧 ${d.collision_frame ?? '—'}）——`
+                + '可以直接「跑闭环 rollout」，或点右上「下一步：④ CARLA 验证」');
+        } catch (e) { this._carlaStatus('还原实例失败: ' + e.message, true); }
+    }
+
+    // 把某条批量实例直接送 ④ CARLA（用实例自带的 world.json，不依赖内存里的场景）
+    _labSendInstanceToCarla(m) {
+        this._labSetCase({
+            scenario_type: m.scenario_type || '', seed: m.seed, roles: m.roles || null,
+            start_frame: m.start_frame, num_frames: m.num_frames, instance_id: m.instance_id,
+            quality: m.valid ? '通过' : '未通过', world_json: m.world_json || null
+        }, `实例 ${m.instance_id || ''}`);
+        this._carlaPendingScenario = m.world_json || null;   // 让场景列表刷新后仍然选中它
+        this._labSwitchTab('carla');
+        const chk = document.getElementById('carlaUseCurrent');
+        const sel = document.getElementById('carlaSceneSel');
+        if (m.world_json && sel) {
+            if (chk) chk.checked = false;            // 走"实例 world.json"这条路，最稳
+            if (![...sel.options].some(o => o.value === m.world_json)) {
+                const o = document.createElement('option');
+                o.value = m.world_json;
+                o.textContent = `【批量实例】${m.instance_id} · ${m.world_json}`;
+                sel.insertBefore(o, sel.firstChild);
+            }
+            sel.value = m.world_json;
+        } else if (chk) {
+            chk.checked = true;
+        }
+        this._labPrefillCarla();
+        this._carlaStatus(`已选中批量实例 ${m.instance_id}：点「开始 CARLA 仿真并出视频」即可`
+            + (m.world_json ? '（直接吃实例的 world.json，不依赖内存里的场景）' : '（会现场导出当前场景）'));
+    }
+
+    // ③ 闭环评估 → ④ CARLA 验证
+    _labGoCarla() {
+        const c = this._labCase();
+        if (c.instance_id && c.world_json) {
+            // 第三步刚"载入场景"过的实例：④ 也用它的 world.json 最稳（不依赖内存场景）
+            this._carlaPendingScenario = c.world_json;
+        }
+        if (!c.scenario_type) {
+            this._carlaStatus('提示：还没选定具体事故案例，CARLA 会直接跑当前场景里已有的轨迹（也可以先回 ① 生成一个）');
+        } else {
+            this._carlaStatus(`已带入案例 ${c.scenario_type}（seed ${c.seed ?? '-'}）`
+                + (c.world_json ? '，并把它的 world.json 选中为本次场景' : ''));
+        }
+        this._labSwitchTab('carla');
+        this._labPrefillCarla();
+        this._carlaWillRun();
+    }
+
+    _labSwitchTab(name) {
+        document.querySelectorAll('.lab-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+        document.querySelectorAll('.lab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === name));
+        if (name === 'graph' && this.state.sceneId) this.labLoadGraph();
+        if (name === 'carla') { this.carlaRefreshStatus(1); this.carlaLoadScenarios(); this.carlaLoadJobs(); this._carlaWillRun(); }
+        // ④ 页面里每 10 秒刷一次状态（顺带盯显存），切走就停
+        if (this._carlaTimer) { clearInterval(this._carlaTimer); this._carlaTimer = null; }
+        if (name === 'carla') this._carlaTimer = setInterval(() => this.carlaRefreshStatus(0), 10000);
+        this._labRenderFlow();
+    }
+
+    _labStatus(id, msg, isError = false) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.textContent = msg;
+            el.style.color = isError ? '#e5484d' : 'inherit';
+        }
+    }
+
+    // 帧切换时（实验台打开 + 关系图页 + 勾选自动刷新）防抖刷新
+    _labMaybeAutoRefresh(frameIdx) {
+        const modal = document.getElementById('labModal');
+        if (!modal || !modal.classList.contains('active')) return;
+        const graphTabActive = document.querySelector('.lab-tab.active')?.dataset.tab === 'graph';
+        const autoEl = document.getElementById('labGraphAuto');
+        if (!graphTabActive || !autoEl || !autoEl.checked || !this.state.sceneId) return;
+        const frameEl = document.getElementById('labGraphFrame');
+        if (frameEl) frameEl.value = frameIdx;
+        if (this._labTimer) clearTimeout(this._labTimer);
+        this._labTimer = setTimeout(() => this.labLoadGraph(frameIdx), 150);
+    }
+
+    async labLoadGraph(frameIdx) {
+        if (!this.state.sceneId) { this._labStatus('labGraphStatus', '请先加载场景。', true); return; }
+        const f = (frameIdx !== undefined && frameIdx !== null)
+            ? frameIdx
+            : (parseInt(document.getElementById('labGraphFrame')?.value) || 0);
+        const win = parseInt(document.getElementById('labGraphWindow')?.value) || 10;
+        this._labStatus('labGraphStatus', `正在读取第 ${f} 帧关系图…`);
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/graph/${encodeURIComponent(this.state.sceneId)}?frame_idx=${f}&window=${win}`);
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.detail || '读取失败');
+            const g = data.graph || {};
+            this._labGraph = g;
+            this._labProposals = data.proposals || {};
+            this._labRenderGraphSummary(g, data.proposals || {}, f);
+            this._labRenderGraphSvg(g);
+            this._labRenderGraphEdges(g);
+            this._labRenderProposals(data.proposals || {});
+            this._labStatus('labGraphStatus', `第 ${f} 帧：${g.num_nodes || 0} 个物体 / ${g.num_edges || 0} 条关系。`);
+        } catch (e) {
+            this._labStatus('labGraphStatus', '读取关系图失败: ' + e.message, true);
+        }
+    }
+
+    _labRenderGraphSummary(g, proposals, frameIdx) {
+        const el = document.getElementById('labGraphSummary');
+        if (!el) return;
+        const nodes = g.nodes || [];
+        const edges = g.edges || [];
+        const crit = edges.filter(e => (e.criticality || 0) > 0.6).length;
+        const onCourse = edges.filter(e => e.on_collision_course).length;
+        const classes = {};
+        nodes.forEach(n => { classes[n.class] = (classes[n.class] || 0) + 1; });
+        let html = `<span>帧 <b>${frameIdx}</b></span>`;
+        html += `<span>物体 <b>${nodes.length}</b>（车辆 ${classes.vehicle || 0} / 行人 ${classes.pedestrian || 0} / 大车 ${classes.large_vehicle || 0}）</span>`;
+        html += `<span>关系 <b>${edges.length}</b></span>`;
+        html += `<span>高危关系(>0.6) <b class="${crit ? 'bad' : ''}">${crit}</b></span>`;
+        html += `<span>碰撞航向 <b class="${onCourse ? 'bad' : ''}">${onCourse}</b></span>`;
+        const nProp = Object.values(proposals).reduce((a, c) => a + (c ? c.length : 0), 0);
+        html += `<span>参与者提案 <b>${nProp}</b></span>`;
+        el.innerHTML = html;
+    }
+
+    _labRenderGraphSvg(g) {
+        const svg = document.getElementById('labGraphSvg');
+        if (!svg) return;
+        const nodes = g.nodes || [];
+        if (!nodes.length) { svg.innerHTML = '<text x="20" y="30" fill="#6b7686" font-size="12">该帧附近没有动态物体</text>'; return; }
+        const xs = nodes.map(n => n.center[0]), zs = nodes.map(n => n.center[2]);
+        const minX = Math.min(...xs), maxX = Math.max(...xs), minZ = Math.min(...zs), maxZ = Math.max(...zs);
+        const W = 520, H = 380, pad = 40;
+        const sx = x => pad + (maxX - minX < 1e-6 ? (W - 2 * pad) / 2 : (x - minX) / (maxX - minX) * (W - 2 * pad));
+        const sz = z => H - pad - (maxZ - minZ < 1e-6 ? (H - 2 * pad) / 2 : (z - minZ) / (maxZ - minZ) * (H - 2 * pad));
+        const parts = [];
+        // 边
+        (g.edges || []).forEach(e => {
+            const a = nodes.find(n => n.track_id === e.track_pair[0]);
+            const b = nodes.find(n => n.track_id === e.track_pair[1]);
+            if (!a || !b) return;
+            const c = e.criticality || 0;
+            const stroke = c > 0.6 ? '#ef4444' : (c > 0.3 ? '#f59e0b' : '#3b82f6');
+            parts.push(`<line x1="${sx(a.center[0]).toFixed(1)}" y1="${sz(a.center[2]).toFixed(1)}" x2="${sx(b.center[0]).toFixed(1)}" y2="${sz(b.center[2]).toFixed(1)}" stroke="${stroke}" stroke-width="${(1 + c * 3).toFixed(1)}" opacity="0.6"/>`);
+        });
+        // 节点 + 速度箭头
+        nodes.forEach(n => {
+            const cx = sx(n.center[0]), cy = sz(n.center[2]);
+            const fill = n.class === 'pedestrian' ? '#22c55e' : (n.class === 'large_vehicle' ? '#a855f7' : '#38bdf8');
+            parts.push(`<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="9" fill="${fill}" stroke="#0b1220" stroke-width="1.5"/>`);
+            parts.push(`<text x="${cx.toFixed(1)}" y="${(cy - 13).toFixed(1)}" fill="#e5e7eb" font-size="11" text-anchor="middle">T${n.track_id}</text>`);
+            const v = n.velocity || [0, 0, 0];
+            const vn = Math.hypot(v[0], v[2]);
+            if (vn > 0.5) {
+                const scale = 26 / Math.max(1, vn);
+                const ex = cx + v[0] * scale;
+                const ey = cy - v[2] * scale;   // z 增大 = 屏幕向上
+                parts.push(`<line x1="${cx.toFixed(1)}" y1="${cy.toFixed(1)}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}" stroke="${fill}" stroke-width="2" marker-end="url(#labArrow)"/>`);
+            }
+        });
+        parts.unshift('<defs><marker id="labArrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#94a3b8"/></marker></defs>');
+        svg.innerHTML = parts.join('');
+    }
+
+    _labRenderGraphEdges(g) {
+        const box = document.getElementById('labGraphEdges');
+        if (!box) return;
+        const relLabel = {
+            following: '同向跟车', adjacent_parallel: '并列同向', oncoming: '对向',
+            crossing: '交叉', stationary: '含静止', receding: '远离', unrelated: '无关'
+        };
+        const rows = (g.edges || []).slice(0, 40).map(e => {
+            const c = e.criticality || 0;
+            const cls = c > 0.6 ? 'crit-high' : (c > 0.3 ? 'crit-mid' : '');
+            const ttc = e.ttc_s === null || e.ttc_s === undefined ? '—' : e.ttc_s.toFixed(2);
+            return `<tr>
+                <td>${e.track_pair[0]}–${e.track_pair[1]}</td>
+                <td>${relLabel[e.relation] || e.relation}</td>
+                <td>${e.distance.toFixed(1)}</td>
+                <td>${e.relative_speed.toFixed(1)}</td>
+                <td>${e.approach_rate.toFixed(1)}</td>
+                <td>${ttc}</td>
+                <td class="${cls}">${c.toFixed(2)}</td>
+                <td>${e.on_collision_course ? '是' : ''}</td>
+            </tr>`;
+        }).join('');
+        box.innerHTML = `<table class="lab-table">
+            <thead><tr><th>对</th><th>关系</th><th>距离</th><th>相对速度</th><th>接近速率</th><th>TTC</th><th>关键度</th><th>碰撞航向</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="8">无关系边</td></tr>'}</tbody>
+        </table>`;
+    }
+
+    _labRenderProposals(proposals) {
+        const box = document.getElementById('labGraphProposals');
+        if (!box) return;
+        const nameMap = {};
+        LAB_SCENARIOS.forEach(([v, label]) => { nameMap[v] = label; });
+        let html = '';
+        Object.entries(proposals).forEach(([st, cands]) => {
+            if (!cands || !cands.length) {
+                html += `<div class="lab-proposal-row"><span class="p-type">${nameMap[st] || st}</span><span class="detail">无可候选组合</span></div>`;
+                return;
+            }
+            cands.slice(0, 3).forEach((roles, i) => {
+                const chips = Object.entries(roles).map(([k, v]) => `<span class="lab-chip">${k}=T${v}</span>`).join('');
+                const rolesJson = JSON.stringify(roles);
+                html += `<div class="lab-proposal-row">
+                    <span class="p-type">${nameMap[st] || st} #${i + 1}</span>
+                    ${chips}
+                    <button class="btn btn-small btn-secondary lab-use-proposal" data-type="${st}" data-roles='${this._escapeHtml(rolesJson)}'>用此组合</button>
+                </div>`;
+            });
+        });
+        box.innerHTML = html || '<div class="empty-state"><p>暂无提案</p></div>';
+        box.querySelectorAll('.lab-use-proposal').forEach(btn => {
+            btn.addEventListener('click', () => {
+                let roles = {};
+                try { roles = JSON.parse(btn.dataset.roles); } catch (e) { return; }
+                this.labUseProposal(btn.dataset.type, roles);
+            });
+        });
+    }
+
+    labUseProposal(scenarioType, roles) {
+        const sel = document.getElementById('cornerScenarioType');
+        if (!sel) return;
+        sel.value = scenarioType;
+        this.renderCornerRoles();          // 会重置角色指派
+        Object.entries(roles).forEach(([k, v]) => this.assignCornerRole(k, Number(v)));
+        this.closeLab();
+        this._switchToCornerPanel();
+        const st = this.cornerScenarios[scenarioType];
+        this.updateStatus(`已按关系图提案填入「${st ? st.name : scenarioType}」的参与者，可直接点「生成事故轨迹」`);
+    }
+
+    _switchToCornerPanel() {
+        // 展开折叠的场景参数并滚动到生成面板
+        const panel = document.getElementById('cornerCasePanel');
+        if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    _labSelectedTypes() {
+        return Array.from(document.querySelectorAll('.lab-batch-type:checked')).map(c => c.value);
+    }
+
+    async labRunBatch() {
+        if (!this.state.sceneId) { this._labStatus('labBatchStatus', '请先加载场景。', true); return; }
+        const types = this._labSelectedTypes();
+        if (!types.length) { this._labStatus('labBatchStatus', '请至少勾选一个事故类型。', true); return; }
+        const body = {
+            scene_id: this.state.sceneId,
+            scenario_types: types,
+            num_per_type: parseInt(document.getElementById('labBatchNum')?.value) || 3,
+            seed: parseInt(document.getElementById('labBatchSeed')?.value) || 0,
+            start_frame: parseInt(document.getElementById('labBatchStart')?.value) || 0,
+            num_frames: parseInt(document.getElementById('labBatchFrames')?.value) || 20,
+            save: !!document.getElementById('labBatchSave')?.checked,
+            keep_only_valid: !!document.getElementById('labBatchOnlyValid')?.checked,
+            // 注意：元素缺失时用 ?? 兜底（旧缓存页面里没有这些控件）——
+            // 否则 render_videos 会变成 false，导致"视频全是无"。
+            render_videos: document.getElementById('labBatchRenderVideo')?.checked ?? true,
+            // 真实渲染视频不叠加包围盒/ID/轨迹（用户要求干净画面）
+            video_draw_bboxes: false,
+            video_draw_ids: false,
+            video_draw_trajectories: false,
+            render_bev: document.getElementById('labBatchVidBev')?.checked ?? true,
+            render_topdown: document.getElementById('labBatchVidTop')?.checked ?? true,
+            use_edited_ego: document.getElementById('labBatchFollowEgo')?.checked ?? false
+        };
+        const runName = document.getElementById('labBatchRunName')?.value?.trim();
+        if (runName) body.run_name = runName;
+        this._labStatus('labBatchStatus', '批量生产中…（每条：图选参与者 → 采样参数 → 生成 → 质量打分' + (body.render_videos ? ' → 渲染视频' : '') + ' → 还原）');
+        const t0 = performance.now();
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/batch`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+            });
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.detail || '批量失败');
+            const dt = ((performance.now() - t0) / 1000).toFixed(1);
+            this._labStatus('labBatchStatus', `完成：${data.total} 条，通过质量门 ${data.num_valid} 条`
+                + (data.num_videos ? `，主车视角视频 ${data.num_videos} 个` : '')
+                + (data.num_bev_videos ? `，俯视BEV ${data.num_bev_videos} 个` : '')
+                + (data.num_topdown_videos ? `，俯视3D渲染 ${data.num_topdown_videos} 个` : '') + `（耗时 ${dt}s）。`);
+            this._lastBatchManifest = data.manifest || [];
+            this._lastBatchCtx = { start_frame: body.start_frame, num_frames: body.num_frames };
+            // 批量结果顺手变成"当前案例"，后面 ③④ 步直接用
+            const firstValid = (data.manifest || []).find(m => m.valid) || (data.manifest || [])[0];
+            if (firstValid) {
+                this._labSetCase({
+                    scenario_type: firstValid.scenario_type || '', seed: firstValid.seed,
+                    roles: firstValid.roles || null, start_frame: body.start_frame,
+                    num_frames: body.num_frames, quality: firstValid.valid ? '通过' : '未通过'
+                }, '批量生产');
+            }
+            this._labRenderBatchSummary(data);
+            this._labRenderBatchTable(data);
+        } catch (e) {
+            this._labStatus('labBatchStatus', '批量生成失败: ' + e.message, true);
+        }
+    }
+
+    _labRenderBatchSummary(data) {
+        const el = document.getElementById('labBatchSummary');
+        if (!el) return;
+        let html = `<span>实例 <b>${data.total}</b></span>`;
+        html += `<span>通过质量门 <b class="${data.num_valid ? 'ok' : 'bad'}">${data.num_valid}</b></span>`;
+        if (data.num_saved !== undefined) html += `<span>已落盘 <b>${data.num_saved}</b></span>`;
+        if (data.num_videos !== undefined) html += `<span>主车视角视频 <b class="${data.num_videos ? 'ok' : ''}">${data.num_videos}</b></span>`;
+        if (data.num_bev_videos !== undefined) html += `<span>俯视BEV <b class="${data.num_bev_videos ? 'ok' : ''}">${data.num_bev_videos}</b></span>`;
+        if (data.num_topdown_videos !== undefined) html += `<span>俯视3D渲染 <b class="${data.num_topdown_videos ? 'ok' : ''}">${data.num_topdown_videos}</b></span>`;
+        const bt = data.by_type || {};
+        Object.entries(bt).forEach(([st, info]) => {
+            html += `<span>${st}: 候选 ${info.num_candidates ?? 0} / 生成 ${info.num_generated ?? 0} / 通过 ${info.num_valid ?? 0}</span>`;
+        });
+        if (data.reset_scene) {
+            html += `<span style="color:#f59e0b">已自动清空批量前的生成/编辑残留（不清的话不同类型会生成出一样的视频）</span>`;
+        }
+        if (data.video_dir) html += `<span>视频目录: <b>${this._escapeHtml(data.video_dir)}</b></span>`;
+        if (data.manifest_path) html += `<span>manifest: <b>${this._escapeHtml(data.manifest_path)}</b></span>`;
+        el.innerHTML = html;
+    }
+
+    _labRenderBatchTable(data) {
+        const box = document.getElementById('labBatchTable');
+        if (!box) return;
+        const rows = (data.manifest || []).map(m => {
+            const q = m.quality || {};
+            const blk = (q.blocking_checks || []).map(n => this._qualityCheckLabel(n)).join('、');
+            const ok = m.valid ? '<span class="pass">通过</span>' : '<span class="fail">未通过</span>';
+            const ego = m.video_path || null;
+            const bev = m.bev_video_path || null;
+            const top = m.topdown_video_path || null;
+            const lbl = this._escapeHtml(m.instance_id || '');
+            let vid = '<span class="video-btn disabled">无</span>';
+            if (ego || bev || top) {
+                const attrs = `data-path="${ego ? this._escapeHtml(ego) : ''}" data-bev="${bev ? this._escapeHtml(bev) : ''}" data-top="${top ? this._escapeHtml(top) : ''}" data-label="${lbl}"`;
+                vid = '';
+                if (ego) vid += `<button class="video-btn lab-play-video" data-kind="ego" ${attrs}>主车</button>`;
+                if (bev) vid += `<button class="video-btn video-btn-bev lab-play-video" data-kind="bev" ${attrs}>俯视BEV</button>`;
+                if (top) vid += `<button class="video-btn video-btn-top lab-play-video" data-kind="top" ${attrs}>俯视3D</button>`;
+            }
+            return `<tr>
+                <td>${this._escapeHtml(m.instance_id || '')}</td>
+                <td>${this._escapeHtml(m.scenario_type || '')}</td>
+                <td>${this._escapeHtml(JSON.stringify(m.roles || {}))}</td>
+                <td>${m.collision_frame ?? '—'}</td>
+                <td>${m.critical_frame ?? '—'}</td>
+                <td>${q.ttc_at_critical === null || q.ttc_at_critical === undefined ? '—' : Number(q.ttc_at_critical).toFixed(2)}</td>
+                <td>${q.max_accel === null || q.max_accel === undefined ? '—' : Number(q.max_accel).toFixed(1)}</td>
+                <td>${ok}</td>
+                <td>${this._escapeHtml(blk)}</td>
+                <td>${vid}</td>
+                <td><button class="btn btn-secondary btn-small lab-batch-next" data-i="${this._escapeHtml(m.instance_id || '')}" data-j="apply" ${m.world_json ? '' : 'disabled'}>载入场景</button>
+                    <button class="btn btn-primary btn-small lab-batch-next" data-i="${this._escapeHtml(m.instance_id || '')}" data-j="carla" ${m.world_json ? '' : 'disabled'}>CARLA 这条</button></td>
+            </tr>`;
+        }).join('');
+        box.innerHTML = `<table class="lab-table">
+            <thead><tr><th>实例</th><th>类型</th><th>参与者</th><th>碰撞帧</th><th>反应帧</th><th>TTC</th><th>加速度</th><th>质量门</th><th>未通过项</th><th>视频</th><th>下一步</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="11">无实例</td></tr>'}</tbody>
+        </table>`;
+        box.querySelectorAll('.lab-play-video').forEach(btn => {
+            btn.addEventListener('click', () => this._labShowVideo(
+                { ego: btn.dataset.path || null, bev: btn.dataset.bev || null, top: btn.dataset.top || null },
+                btn.dataset.label, btn.dataset.kind || 'ego'));
+        });
+        // 每一行 = 一条实例：可以"载入场景继续编辑/评估"，也可以"直接送 CARLA"
+        box.querySelectorAll('.lab-batch-next').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const man = this._lastBatchManifest || [];
+                const m = man.find(x => (x.instance_id || '') === btn.dataset.i) || {};
+                if (btn.dataset.j === 'carla') this._labSendInstanceToCarla(m);
+                else this._labApplyInstance(m);
+            });
+        });
+        box.scrollTop = 0;
+    }
+
+    async labCollectGnn() {
+        if (!this.state.sceneId) { this._labStatus('labGnnStatus', '请先加载场景。', true); return; }
+        const types = this._labSelectedTypes();
+        const scenarioTypes = types.length ? types : ['rear-end', 'head-on', 'lane-change-cutin'];
+        const body = {
+            scene_id: this.state.sceneId,
+            scenario_types: scenarioTypes,
+            num_per_type: parseInt(document.getElementById('labGnnNum')?.value) || 20,
+            seed: parseInt(document.getElementById('labGnnSeed')?.value) || 0,
+            start_frame: 0,
+            num_frames: 20
+        };
+        this._labStatus('labGnnStatus', '正在收集样本…');
+        try {
+            const resp = await fetch(`${API_BASE}/gnn/collect`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+            });
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.detail || '收集失败');
+            this._labStatus('labGnnStatus', `完成：${data.num_samples} 个样本（特征维 ${data.feature_dim}）。`);
+            const el = document.getElementById('labGnnSummary');
+            if (el) {
+                const dist = Object.entries(data.severity_dist || {}).map(([k, v]) => `${k}:${v}`).join(' ');
+                el.innerHTML = `<span>样本 <b>${data.num_samples}</b></span>`
+                    + `<span>特征维 <b>${data.feature_dim}</b></span>`
+                    + `<span>碰撞率 <b>${(data.collision_rate * 100).toFixed(1)}%</b></span>`
+                    + `<span>严重度分布 <b>${this._escapeHtml(dist || '—')}</b></span>`
+                    + `<span>文件 <b>${this._escapeHtml(data.output_path || '')}</b></span>`;
+            }
+            this._labGnnCommand(data.output_path);
+        } catch (e) {
+            this._labStatus('labGnnStatus', '收集失败: ' + e.message, true);
+        }
+    }
+
+    _labGnnCommand(dataPath) {
+        const el = document.getElementById('labGnnCmd');
+        if (!el) return;
+        const p = dataPath || '<收集后生成的 .npz 路径>';
+        el.textContent = [
+            'cd /root/autodl-fs/dggt-main/studio/backend',
+            '/root/autodl-tmp/conda_envs/dggt/bin/python train_gnn.py \\',
+            `  --data ${p} \\`,
+            '  --epochs 300 --out gnn_model.pt'
+        ].join('\n');
+    }
+
+    // ---------- 视频回放 ----------
+    _videoUrl(path) {
+        return `${API_BASE}/corner_case/video_file?path=${encodeURIComponent(path)}`;
+    }
+
+    // videos: {ego, bev}；kind: 'ego' | 'bev'
+    _labShowVideo(videos, label, kind) {
+        this._labVideos = Object.assign({ ego: null, bev: null, top: null }, videos || {});
+        this._labVideoLabel = label || '';
+        const modal = document.getElementById('labVideoModal');
+        const tabs = { ego: document.getElementById('labVideoTabEgo'),
+                       bev: document.getElementById('labVideoTabBev'),
+                       top: document.getElementById('labVideoTabTop') };
+        Object.entries(tabs).forEach(([k, el]) => { if (el) el.style.display = this._labVideos[k] ? '' : 'none'; });
+        if (!this._labVideos.ego && !this._labVideos.bev && !this._labVideos.top) return;
+        this._labSwitchVideo(kind || (this._labVideos.ego ? 'ego' : (this._labVideos.bev ? 'bev' : 'top')));
+        if (modal) modal.classList.add('active');
+    }
+
+    _labSwitchVideo(kind) {
+        const path = this._labVideos ? this._labVideos[kind] : null;
+        if (!path) return;
+        this._labVideoKind = kind;
+        const player = document.getElementById('labVideoPlayer');
+        const info = document.getElementById('labVideoInfo');
+        const link = document.getElementById('labVideoOpenLink');
+        const pathEl = document.getElementById('labVideoPath');
+        const url = this._videoUrl(path);
+        if (player) { player.src = url; player.load(); player.play().catch(() => {}); }
+        const views = { ego: '主车视角', bev: '俯视(BEV)示意图', top: '俯视(3D渲染)' };
+        if (info) info.textContent = (this._labVideoLabel ? `${this._labVideoLabel} · ` : '') + (views[kind] || '');
+        if (link) link.href = url;
+        if (pathEl) pathEl.textContent = path;
+        ['ego', 'bev', 'top'].forEach(k => {
+            const el = document.getElementById('labVideoTab' + k.charAt(0).toUpperCase() + k.slice(1));
+            if (el) el.className = 'btn btn-small ' + (k === kind ? 'btn-primary' : 'btn-secondary');
+        });
+    }
+
+    _labPlayVideo(path, label) {
+        if (!path) return;
+        this._labShowVideo({ ego: path }, label, 'ego');
+    }
+
+    closeVideoModal() {
+        const modal = document.getElementById('labVideoModal');
+        const player = document.getElementById('labVideoPlayer');
+        if (player) { player.pause(); player.removeAttribute('src'); player.load(); }
+        if (modal) modal.classList.remove('active');
+    }
+
+    // 把"当前场景状态"（已生成/编辑的事故轨迹）录制成可播放视频
+    async labRenderCaseVideo() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const start = parseInt(document.getElementById('cornerStartFrame')?.value) || 0;
+        const num = parseInt(document.getElementById('cornerNumFrames')?.value) || 20;
+        const btn = document.getElementById('renderCaseVideoBtn');
+        const oldText = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = '录制中…（逐帧渲染）'; }
+        this.updateStatus('正在渲染案例视频（与播放效果一致）…');
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/video`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId, start_frame: start, num_frames: num, fps: 10.0,
+                    draw_bboxes: false, draw_ids: false, draw_trajectories: false,
+                    render_bev: true, render_topdown: true,
+                    // 始终跟随"当前主车视角"（真实主车轨迹 / 全局选定的物体）
+                    use_edited_ego: true,
+                    name: `case_${Date.now()}`
+                })
+            });
+            const data = await resp.json();
+            if (!data.success) throw new Error(data.detail || '渲染失败');
+            this.updateStatus(`案例视频已生成：${data.video_path}`);
+            this._labShowVideo(
+                { ego: data.video_path || null, bev: data.bev_video_path || null,
+                  top: data.topdown_video_path || null },
+                `当前案例（帧 ${data.start_frame}~${data.start_frame + data.num_frames - 1}）`, 'ego');
+        } catch (e) {
+            alert('渲染视频失败: ' + e.message);
+        } finally {
+            if (btn) { btn.disabled = false; btn.textContent = oldText; }
+        }
+    }
+
+    // ---------- 一键自检 ----------
+    _labCheck(icon, cls, title, detail) {
+        return `<div class="lab-check ${cls}"><span class="icon">${icon}</span><div><div>${this._escapeHtml(title)}</div><div class="detail">${this._escapeHtml(detail || '')}</div></div></div>`;
+    }
+
+    async labSelfTest() {
+        const out = document.getElementById('labSelfTestOut');
+        if (!out) return;
+        if (!this.state.sceneId) { out.innerHTML = this._labCheck('✗', 'fail', '未加载场景', '请先加载一个场景'); return; }
+        out.innerHTML = this._labCheck('…', 'warn', '开始自检…', '');
+        const logs = [];
+        const push = (icon, cls, title, detail) => {
+            logs.push(this._labCheck(icon, cls, title, detail));
+            out.innerHTML = logs.join('');
+            out.scrollTop = out.scrollHeight;
+        };
+
+        // ① 关系图
+        let graph = null;
+        try {
+            const r = await fetch(`${API_BASE}/corner_case/graph/${encodeURIComponent(this.state.sceneId)}?frame_idx=0&window=10`);
+            const d = await r.json();
+            graph = d.graph;
+            const ok = d.success && graph && graph.num_nodes > 0;
+            push(ok ? '✓' : '✗', ok ? 'pass' : 'fail', '① 关系图（scene graph）',
+                `节点 ${graph?.num_nodes ?? 0}，关系 ${graph?.num_edges ?? 0}`);
+        } catch (e) { push('✗', 'fail', '① 关系图', e.message); }
+
+        // 选一个探测物体（优先有速度的车辆）
+        let probe = null;
+        if (graph && graph.nodes) {
+            const veh = graph.nodes.filter(n => n.class !== 'pedestrian' && n.speed > 1.0);
+            probe = (veh[0] || graph.nodes[0] || {}).track_id;
+        }
+
+        // ② 统一引擎 + 质量门（干净合成参与者：只给一个角色，另一个自动合成）
+        if (probe !== null && probe !== undefined) {
+            for (const [st, roleKey] of [['rear-end', 'attacker'], ['head-on', 'attacker'], ['intersection-tbone', 'attacker']]) {
+                try {
+                    const resp = await fetch(`${API_BASE}/corner_case/generate`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            scene_id: this.state.sceneId, scenario_type: st, roles: { [roleKey]: probe },
+                            start_frame: 0, num_frames: 30, intensity: 1.0, enable_physics: true, fps: 10.0, sampling_seed: 123
+                        })
+                    });
+                    const d = await resp.json();
+                    if (!d.success) { push('✗', 'fail', `② 生成 ${st}`, d.detail || '生成失败'); continue; }
+                    const q = d.quality_report || {};
+                    const ca = d.collision_analysis || {};
+                    const blocking = (q.checks || []).filter(c => c.passed === false).map(c => c.name);
+                    const ok = q.valid === true;
+                    push(ok ? '✓' : '!', ok ? 'pass' : 'warn', `② 统一引擎生成 · ${st}`,
+                        `碰撞帧 ${d.collision_frame ?? '无'}，反应帧 ${d.critical_frame ?? '无'}，TTC ${ca.time_to_collision ?? '—'}s，`
+                        + `最大加速度 ${(q.max_accel ?? 0).toFixed(1)} m/s²，质量门 ${ok ? '通过' : '未通过(' + blocking.join(',') + ')'}`);
+                    await fetch(`${API_BASE}/undo/${encodeURIComponent(this.state.sceneId)}`, { method: 'POST' });
+                } catch (e) { push('✗', 'fail', `② 生成 ${st}`, e.message); }
+            }
+        } else {
+            push('!', 'warn', '② 统一引擎生成', '未找到可用的探测物体，跳过');
+        }
+
+        // ③ 批量生成
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/batch`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId, scenario_types: ['rear-end', 'head-on'],
+                    num_per_type: 2, seed: 7, start_frame: 0, num_frames: 20, save: false
+                })
+            });
+            const d = await resp.json();
+            const ok = d.success && d.total > 0;
+            push(ok ? '✓' : '✗', ok ? 'pass' : 'fail', '③ 批量生成 + 质量评分',
+                `实例 ${d.total ?? 0}，通过 ${d.num_valid ?? 0}；多样性由"图选参与者 + 参数采样"提供`);
+        } catch (e) { push('✗', 'fail', '③ 批量生成', e.message); }
+
+        // ④ GNN 语料
+        try {
+            const resp = await fetch(`${API_BASE}/gnn/collect`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId, scenario_types: ['rear-end', 'head-on'],
+                    num_per_type: 5, seed: 0, start_frame: 0, num_frames: 20
+                })
+            });
+            const d = await resp.json();
+            const ok = d.success && d.num_samples > 0;
+            push(ok ? '✓' : '✗', ok ? 'pass' : 'fail', '④ GNN 语料收集',
+                ok ? `样本 ${d.num_samples}，特征维 ${d.feature_dim}，碰撞率 ${(d.collision_rate * 100).toFixed(0)}%，文件 ${d.output_path}`
+                   : (d.detail || '收集失败'));
+            if (ok) this._labGnnCommand(d.output_path);
+        } catch (e) { push('✗', 'fail', '④ GNN 语料', e.message); }
+
+        push('注', 'pass', '自检结束', '注：② 用"一个真实物体 + 一个自动合成参与者"，结果反映引擎本身；若用真实噪声轨迹（批量）可能因数据质量被质量门拦下。');
+    }
+
+    async _samLoadModels() {
+        try {
+            const resp = await fetch(`${API_BASE}/sam/models`);
+            const data = await resp.json();
+            if (!data.success) return;
+            const sel = document.getElementById('sam3dModelSelect');
+            if (!sel) return;
+            const cur = data.current;
+            sel.innerHTML = data.models
+                .filter(m => m.exists)
+                .map(m => `<option value="${m.type}">${m.type}${m.type === cur ? '（当前）' : ''} · ${m.size_mb}MB</option>`)
+                .join('');
+            if (cur) sel.value = cur;
+        } catch (e) {
+            console.error('加载 SAM 模型列表失败:', e);
+        }
+    }
+
+    async _samSetModel(modelType) {
+        try {
+            const resp = await fetch(`${API_BASE}/sam/model`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_type: modelType }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.detail || ('HTTP ' + resp.status));
+            this._sam3dStatus(`已切换到分割模型 ${data.current}`);
+        } catch (e) {
+            this._sam3dStatus('切换模型失败: ' + e.message, true);
+            this._samLoadModels();
+        }
+    }
+
+    _sam3dStatus(msg, isError = false) {
+        const el = document.getElementById('sam3dStatus');
+        if (el) {
+            el.textContent = msg;
+            el.style.color = isError ? '#e5484d' : 'inherit';
+        }
+        if (msg) this.updateStatus('SAM 3D: ' + msg);
+    }
+
+    _samSrcStatus(msg, isError = false) {
+        const el = document.getElementById('samSourceStatus');
+        if (el) { el.textContent = msg; el.style.color = isError ? '#e5484d' : 'inherit'; }
+        this._sam3dStatus(msg, isError);
+    }
+
+    // 读取「替换目标物体」下拉框的 track_id。
+    // 注意：track_id 允许为 0（T0 是合法物体），不能用 `!targetId` 判断——
+    // parseInt('0') === 0 是 falsy，会把 T0 误判成"没选物体"。
+    _sam3dSelectedTargetId() {
+        const sel = document.getElementById('sam3dTargetObject');
+        if (!sel) return null;
+        const raw = String(sel.value ?? '').trim();
+        if (raw === '') return null;
+        const n = parseInt(raw, 10);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    openSamSourceModal() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const targetId = this._sam3dSelectedTargetId();
+        if (targetId === null) { alert('请先在左侧选择要替换的目标物体'); return; }
+        document.getElementById('samSourceModal').classList.add('active');
+        this.samPoints = [];
+        this.samMask = null;
+        this.samMaskImage = null;
+        this._samSrcLoadCandidates(targetId);
+        this._samSrcLoadFrame(this.state.currentFrame, false);
+    }
+
+    // 多帧源图：切换到某一帧重新做高清渲染（遮挡少、看得全的帧更适合单图重建）
+    async _samSrcLoadFrame(frameIdx, keepPoints = false) {
+        const total = Math.max(1, this.state.totalFrames || 1);
+        const f = Math.max(0, Math.min(total - 1, parseInt(frameIdx, 10) || 0));
+        if (!keepPoints) {
+            this.samPoints = [];
+            this.samMask = null;
+            this.samMaskImage = null;
+        }
+        this.samSrcFrameIdx = f;
+        const label = document.getElementById('samSrcFrameLabel');
+        if (label) label.textContent = `帧 ${f} / ${total - 1}`;
+        this._samSrcRenderCandidates();
+        this._samSrcStatus(`正在渲染第 ${f} 帧高清源图...`);
+        try {
+            const resp = await fetch(`${API_BASE}/sam/source_image`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, frame_idx: f, max_dim: 1536 }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.detail || '渲染失败');
+            const img = new Image();
+            img.onload = () => {
+                this.samSrcWidth = data.width;
+                this.samSrcHeight = data.height;
+                this.samSrcImage = img;
+                const c = document.getElementById('samSourceCanvas');
+                if (c) { c.width = this.samSrcWidth; c.height = this.samSrcHeight; }
+                this._samSrcRedraw();
+                this._samSrcStatus(`第 ${f} 帧源图 ${data.width}×${data.height}：左键加点，右键撤销`);
+            };
+            img.src = 'data:image/png;base64,' + data.image;
+        } catch (e) {
+            this._samSrcStatus('源图渲染失败: ' + e.message, true);
+        }
+    }
+
+    async _samSrcLoadCandidates(targetId) {
+        this.samSrcCandidates = null;
+        this._samSrcRenderCandidates();
+        try {
+            const resp = await fetch(`${API_BASE}/sam/frame_candidates`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, target_object_id: targetId, max_candidates: 8 }),
+            });
+            const data = await resp.json();
+            if (resp.ok && data.success) {
+                this.samSrcCandidates = data.candidates || [];
+                this._samSrcRenderCandidates();
+            }
+        } catch (e) {
+            console.error('帧评分失败:', e);
+        }
+    }
+
+    _samSrcRenderCandidates() {
+        const box = document.getElementById('samSrcCandidates');
+        if (!box) return;
+        const cands = this.samSrcCandidates;
+        if (!cands || !cands.length) {
+            box.innerHTML = '<span class="cand-hint">正按遮挡程度为各帧打分…（遮挡越少、越完整越靠前）</span>';
+            return;
+        }
+        box.innerHTML = '<span class="cand-hint">推荐帧（遮挡少→多）：</span>' + cands.map((c, i) => {
+            const occ = Math.round((c.occlusion || 0) * 100);
+            const active = (c.frame_idx === this.samSrcFrameIdx) ? ' active' : '';
+            return `<button class="cand-chip${active}" data-frame="${c.frame_idx}">#${c.frame_idx}${i === 0 ? '首选' : ''} 遮挡${occ}%</button>`;
+        }).join('');
+        box.querySelectorAll('.cand-chip').forEach(btn => {
+            btn.addEventListener('click', () => this._samSrcLoadFrame(parseInt(btn.dataset.frame, 10), false));
+        });
+    }
+
+    closeSamSourceModal() {
+        document.getElementById('samSourceModal').classList.remove('active');
+    }
+
+    _samSrcSetType(type) {
+        this.samPointType = type;
+        const fg = document.getElementById('samSrcFgBtn');
+        const bg = document.getElementById('samSrcBgBtn');
+        if (fg) fg.classList.toggle('active', type === 'fg');
+        if (bg) bg.classList.toggle('active', type === 'bg');
+    }
+
+    _samSrcUndo() {
+        if (!this.samPoints.length) return;
+        this.samPoints.pop();
+        this._samSrcRedraw();
+        this._samSrcSegmentDebounced();
+    }
+
+    _samSrcClear() {
+        this.samPoints = [];
+        this.samMask = null;
+        this._samSrcRedraw();
+        this._samSrcStatus('已清除所有点');
+    }
+
+    _sam3dAddObject() {
+        this.samPoints = [];
+        this.samMask = null;
+        this.samMaskImage = null;
+        this.samSrcFrameIdx = this.state.currentFrame;
+        this.samSrcCandidates = null;
+        this._sam3dPopulateTargets();
+        const sel = document.getElementById('sam3dTargetObject');
+        if (sel) sel.value = '';
+        this._sam3dStatus('请选择下一个要替换的目标物体，然后点「开始交互分割」');
+    }
+
+    _sam3dPopulateTargets() {
+        const sel = document.getElementById('sam3dTargetObject');
+        if (!sel) return;
+        const cur = sel.value;
+        const objs = this.state.objects || [];
+        sel.innerHTML = '<option value="">（选择要替换的物体）</option>' + objs.map(o => {
+            const tid = (o.track_id !== undefined && o.track_id !== null) ? o.track_id : o.object_id;
+            return `<option value="${tid}">T:${tid}${o.type ? ' · ' + o.type : ''}</option>`;
+        }).join('');
+        if (cur) sel.value = cur;
+    }
+
+    // ==================== 视图点击选择「替换目标物体」 ====================
+
+    _sam3dStartPickTarget() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        this._sam3dPickingTarget = true;
+        const btn = document.getElementById('sam3dPickTargetBtn');
+        if (btn) btn.classList.add('active');
+        this._sam3dStatus('请在视图（2D 画布或 3D 视图）中点击要替换的物体…');
+    }
+
+    _sam3dFinishPickTarget(trackId) {
+        if (!this._sam3dPickingTarget) return false;
+        const tid = parseInt(trackId, 10);
+        if (!Number.isFinite(tid)) return false;
+        this._sam3dPickingTarget = false;
+        const btn = document.getElementById('sam3dPickTargetBtn');
+        if (btn) btn.classList.remove('active');
+        this._sam3dPopulateTargets();
+        const sel = document.getElementById('sam3dTargetObject');
+        if (sel) {
+            if (![...sel.options].some(o => parseInt(o.value, 10) === tid)) {
+                const opt = document.createElement('option');
+                opt.value = String(tid);
+                opt.textContent = `T:${tid}`;
+                sel.appendChild(opt);
+            }
+            sel.value = String(tid);
+        }
+        const label = document.getElementById('sam3dSrcFrameLabel');
+        if (label) label.textContent = `帧 ${this.state.currentFrame}`;
+        this._sam3dStatus(`已选择替换目标 T:${tid}，点「开始交互分割」继续`);
+        return true;
+    }
+
+    _samSrcCanvasPoint(e) {
+        const c = e.currentTarget;
+        const rect = c.getBoundingClientRect();
+        return {
+            x: (e.clientX - rect.left) / rect.width * c.width,
+            y: (e.clientY - rect.top) / rect.height * c.height,
+        };
+    }
+
+    _samSrcHandleClick(e) {
+        if (e.button === 2) return;
+        if (!this.samSrcWidth) return;
+        const p = this._samSrcCanvasPoint(e);
+        this.samPoints.push({ x: p.x, y: p.y, label: this.samPointType });
+        this._samSrcRedraw();
+        this._samSrcSegmentDebounced();
+    }
+
+    _samSrcRedraw() {
+        const c = document.getElementById('samSourceCanvas');
+        if (!c) return;
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+        if (this.samSrcImage) ctx.drawImage(this.samSrcImage, 0, 0, c.width, c.height);
+        if (this.samMask && this.samMaskImage) {
+            ctx.save(); ctx.globalAlpha = 0.4;
+            ctx.drawImage(this.samMaskImage, 0, 0, c.width, c.height);
+            ctx.restore();
+        }
+        const r = Math.max(3, c.width / 300);
+        for (const p of this.samPoints) {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+            ctx.fillStyle = p.label === 'fg' ? '#22c55e' : '#ef4444';
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+        }
+    }
+
+    _samSrcSegmentDebounced() {
+        if (this._sam3dSegTimer) clearTimeout(this._sam3dSegTimer);
+        this._sam3dSegTimer = setTimeout(() => this._samSrcSegment(), 300);
+    }
+
+    async _samSrcSegment() {
+        if (!this.state.sceneId || !this.samPoints.length || !this.samSrcWidth) return;
+        try {
+            const resp = await fetch(`${API_BASE}/sam/segment`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    frame_idx: (this.samSrcFrameIdx !== undefined ? this.samSrcFrameIdx : this.state.currentFrame),
+                    points: this.samPoints.map(p => [p.x / this.samSrcWidth, p.y / this.samSrcHeight]),
+                    point_labels: this.samPoints.map(p => p.label === 'fg' ? 1 : 0),
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.detail || ('HTTP ' + resp.status));
+            this.samMask = data.mask;
+            if (!this.samMaskImage) this.samMaskImage = new Image();
+            this.samMaskImage.src = `data:image/png;base64,${this.samMask}`;
+            this._samSrcRedraw();
+        } catch (e) {
+            this._samSrcStatus('分割失败: ' + e.message, true);
+        }
+    }
+
+    async _samSrcGenerate() {
+        if (!this.state.sceneId) { alert('请先加载场景'); return; }
+        const targetId = this._sam3dSelectedTargetId();
+        if (targetId === null) { alert('请先选择要替换的目标物体'); return; }
+        if (!this.samPoints.length) { alert('请先在源图上点选前景/背景点'); return; }
+
+        this._samSrcStatus(`正在重建并替换物体 #${targetId}（首次约需数分钟）...`);
+        try {
+            const resp = await fetch(`${API_BASE}/sam3d/replace`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    frame_idx: (this.samSrcFrameIdx !== undefined ? this.samSrcFrameIdx : this.state.currentFrame),
+                    target_object_id: targetId,
+                    points: this.samPoints.map(p => [p.x / this.samSrcWidth, p.y / this.samSrcHeight]),
+                    point_labels: this.samPoints.map(p => p.label === 'fg' ? 1 : 0),
+                }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.detail || ('HTTP ' + resp.status));
+            this._samSrcStatus(`已替换物体 #${targetId} → 新物体 #${data.object_id}（scale=${Number(data.scale).toFixed(3)}）`);
+            this.lastSamObjectId = data.object_id;
+            this._sam3dShowScaleControl(1.0);
+            // 选中替换后的新物体：后续轨迹/位姿编辑都作用于它，
+            // 避免仍选中被替换掉的旧物体（会导致旧模型被"复活"）
+            this.state.selectedObjects = [data.object_id];
+            if (this.viewer3d) {
+                await this.viewer3d.loadFrame(this.state.sceneId, this.state.currentFrame, true);
+                if (typeof this.viewer3d.selectTrack === 'function') {
+                    this.viewer3d.selectTrack(data.object_id);
+                }
+            } else {
+                this.updateSelectedObjectPanel();
+            }
+            // 显示导出 .ply 的下载链接 + 预览按钮
+            const dl = document.getElementById('sam3dDownloadBtn');
+            if (dl) {
+                dl.href = `${API_BASE}/sam3d/objects/${this.state.sceneId}/${data.object_id}/download`;
+                dl.style.display = 'block';
+            }
+            const pv = document.getElementById('sam3dPreviewBtn');
+            if (pv) pv.style.display = 'block';
+            this.samPoints = [];
+            this.samMask = null;
+            this._samSrcRedraw();
+            this.closeSamSourceModal();
+            await this.loadFrame(this.state.currentFrame);
+            this._sam3dPopulateTargets();
+        } catch (e) {
+            console.error('替换失败:', e);
+            this._samSrcStatus('替换失败: ' + e.message, true);
+        }
+    }
+
+    async openSamPreview() {
+        if (!this.state.sceneId || !this.lastSamObjectId) { alert('请先生成一个物体'); return; }
+        this._sam3dStatus('正在渲染旋转预览...');
+        try {
+            const resp = await fetch(`${API_BASE}/sam3d/preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, object_id: this.lastSamObjectId, num_frames: 36, size: 512 }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.success) throw new Error(data.detail || ('HTTP ' + resp.status));
+            this.samPreviewFrames = data.frames || [];
+            this.samPreviewIdx = 0;
+            const slider = document.getElementById('samPreviewSlider');
+            if (slider) { slider.max = Math.max(0, this.samPreviewFrames.length - 1); slider.value = 0; }
+            document.getElementById('samPreviewModal').classList.add('active');
+            this._samPreviewShow(0);
+            this._sam3dStatus('预览已就绪');
+            this._samPreviewPlay();
+        } catch (e) {
+            this._sam3dStatus('预览失败: ' + e.message, true);
+        }
+    }
+
+    closeSamPreview() {
+        this._samPreviewStop();
+        document.getElementById('samPreviewModal').classList.remove('active');
+    }
+
+    _samPreviewShow(idx) {
+        const img = document.getElementById('samPreviewImg');
+        const label = document.getElementById('samPreviewFrameLabel');
+        if (!this.samPreviewFrames.length) return;
+        this.samPreviewIdx = (idx + this.samPreviewFrames.length) % this.samPreviewFrames.length;
+        if (img) img.src = 'data:image/png;base64,' + this.samPreviewFrames[this.samPreviewIdx];
+        if (label) label.textContent = `${this.samPreviewIdx + 1} / ${this.samPreviewFrames.length}`;
+        const slider = document.getElementById('samPreviewSlider');
+        if (slider) slider.value = this.samPreviewIdx;
+    }
+
+    _samPreviewPlay() {
+        this._samPreviewStop();
+        this.samPreviewTimer = setInterval(() => this._samPreviewShow(this.samPreviewIdx + 1), 100);
+    }
+
+    _samPreviewStop() {
+        if (this.samPreviewTimer) { clearInterval(this.samPreviewTimer); this.samPreviewTimer = null; }
+    }
+
+    _samPreviewSeek(idx) {
+        this._samPreviewStop();
+        this._samPreviewShow(idx);
     }
 
     render() {

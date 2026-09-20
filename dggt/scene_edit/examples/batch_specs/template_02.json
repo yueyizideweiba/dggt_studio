@@ -1,0 +1,44 @@
+{
+  "scene_path": "/path/to/your/scene",
+  "output_dir": "/path/to/output/case_02",
+  "num_frames": 20,
+  "start_idx": 0,
+  "draw_bboxes": true,
+  "draw_ids": true,
+  "save_video": true,
+  "video_name": "case_02.mp4",
+  "video_fps": 10,
+  "load_sky": true,
+  "static_only": false,
+  "metadata": {
+    "case_name": "case_02",
+    "export_id_map": true,
+    "scenario_type": "ghost_pedestrian"
+  },
+  "actions": [
+    {
+      "type": "insert_object",
+      "target": {
+        "frame_idx": 6,
+        "object_id": 9999
+      },
+      "params": {
+        "pose_world": [
+          [1.0, 0.0, 0.0, 8.0],
+          [0.0, 1.0, 0.0, 1.5],
+          [0.0, 0.0, 1.0, 0.0],
+          [0.0, 0.0, 0.0, 1.0]
+        ]
+      }
+    },
+    {
+      "type": "time_shift",
+      "target": {
+        "track_id": 5
+      },
+      "params": {
+        "shift_frames": 2
+      }
+    }
+  ]
+}

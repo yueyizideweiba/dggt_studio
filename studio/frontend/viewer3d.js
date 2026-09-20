@@ -1,19 +1,3 @@
-/**
- * DGGT Studio - 3D 自由视角视图模块（服务端渲染 + track 追踪）
- *
- * 目标：从任意视角查看 4DGS（普通渲染只能锁自车视角），并在三维空间中
- * 选中/拖动/删除动态物体、查看与编辑其运动轨迹。
- *
- * 关键决策：
- * - 画面由后端 gsplat 按相机 c2w 渲染并返回 PNG（浏览器零 GPU 负担，画质一致）。
- * - 所有物体一律用 **track_id** 标识（跨帧稳定），避免不同帧 raw object_id 不连续。
- * - 播放流畅性：保留上一帧图像直到新图就绪（不清屏→不黑屏）；按 track 预取相邻帧。
- * - 编辑时锁定场景：选中物体进入移动/旋转模式后，禁用相机轨道/平移，
- *   只允许拖动被选物体或其轨迹点。
- *
- * 相机：OpenCV 约定（+Z 前向，+Y 向下；世界“上方” = -Y）。
- */
-
 class DGGTViewer3D {
     constructor(container, options = {}) {
         this.container = container;
@@ -52,6 +36,7 @@ class DGGTViewer3D {
 
         // 交互
         this.mode = 'select';       // 'select' | 'translate' | 'rotate'
+        this._pendingYaw = 0;       // 旋转拖动累积的 yaw（弧度），提交时走全局旋转接口
         this.trajectoryEditMode = false;  // 轨迹编辑状态（独立开关）
         this.isOrbiting = false;
         this.isPanning = false;
@@ -313,6 +298,11 @@ class DGGTViewer3D {
     _invalidateCache() {
         this.frameCache.clear();
         this.cacheCameraKey = null;
+    }
+
+    // 外部（如左侧面板的旋转/位移控件）改动后端位姿后调用，强制丢弃旧帧图像重新渲染
+    invalidateRenderCache() {
+        this._invalidateCache();
     }
 
     // ==================== 渲染请求（节流 + 缓存） ====================
@@ -1074,6 +1064,7 @@ class DGGTViewer3D {
             }
         } else if (this.mode === 'rotate') {
             const angle = dx * 0.02;
+            this._pendingYaw = (this._pendingYaw || 0) + angle;
             this._rotatePoseY(obj.pose_world, angle);
         }
         // 拖动时本帧需重渲染（相机不变，但物体动了）
@@ -1113,6 +1104,27 @@ class DGGTViewer3D {
         const obj = this.objects.find(o => o.track_id === this.selectedTrackId);
         if (!obj) return;
         try {
+            // 旋转：走全局旋转偏移接口，作用所有帧（播放时保持），可 360° 累计
+            if (this.mode === 'rotate' && Math.abs(this._pendingYaw || 0) > 1e-6) {
+                const deltaDeg = this._pendingYaw * 180 / Math.PI;
+                this._pendingYaw = 0;
+                await fetch(`${this.apiBase}/edit/object/rotation`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.sceneId,
+                        track_id: obj.track_id,
+                        delta_yaw: deltaDeg,
+                    })
+                });
+                obj.edited = true;
+                this._invalidateCache();
+                this._fetchTrajectory(obj.track_id);
+                this.onObjectEdited(obj.track_id, obj.pose_world);
+                // 重新拉取该帧，拿到带全局旋转的新位姿
+                await this.loadFrame(this.sceneId, this.frameIdx, true);
+                return;
+            }
             await fetch(`${this.apiBase}/edit/object/matrix`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1201,9 +1213,10 @@ class DGGTViewer3D {
         const pt = this.trajectory.trajectory.find(p => p.frame_idx === frameIdx);
         if (!pt) return;
         try {
+            let resp;
             if (this.adaptiveTrajEdit) {
                 // 智能模式：拖动一个节点，整条路径自适应平滑跟随
-                await fetch(`${this.apiBase}/edit/track/point_adaptive`, {
+                resp = await fetch(`${this.apiBase}/edit/track/point_adaptive`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -1216,7 +1229,7 @@ class DGGTViewer3D {
                     })
                 });
             } else {
-                await fetch(`${this.apiBase}/edit/track/point`, {
+                resp = await fetch(`${this.apiBase}/edit/track/point`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -1226,6 +1239,14 @@ class DGGTViewer3D {
                         center: pt.center
                     })
                 });
+            }
+            if (resp && !resp.ok) {
+                const d = await resp.json().catch(() => ({}));
+                const msg = (d && d.detail) ? d.detail : ('HTTP ' + resp.status);
+                console.error('[Viewer3D] 轨迹点回写失败:', msg);
+                alert(msg);
+                this._fetchTrajectory(this.selectedTrackId);
+                return;
             }
             this.onObjectEdited(this.selectedTrackId, null);
             this._invalidateCache();

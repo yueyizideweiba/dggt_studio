@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from .asset_bank import SceneObjectAssetBank
+from .collision_physics import check_collision, compute_critical_frame
 from .geometry import make_translation, make_yaw_rotation, to_pose_matrix
 from .specs import EditAction, SceneEditSpec
 
@@ -246,6 +247,7 @@ class SceneEditExecutor:
         lateral_offset = float(action.params.get("lateral_offset", 0.0))
         slow_down_scale = float(action.params.get("slow_down_scale", 0.35))
         follow_gain = float(action.params.get("follow_gain", 1.0))
+        enable_physics = bool(action.params.get("enable_physics", True))
 
         lead_tracks = self._extract_positions(lead_tid, start_idx, num_frames)
         follow_tracks = self._extract_positions(follow_tid, start_idx, num_frames)
@@ -257,6 +259,20 @@ class SceneEditExecutor:
         lead_xy = lead_start_pose[:3, 3].clone()
         follow_xy = follow_start_pose[:3, 3].clone()
         delta = lead_xy - follow_xy
+
+        # 物理接触距离：基于两车包围盒尺寸，避免穿模
+        contact_gap = 0.35  # 默认归一化接近系数
+        if enable_physics:
+            lead_dims = lead_tracks[0][1].get("dimensions")
+            follow_dims = follow_tracks[0][1].get("dimensions")
+            if lead_dims and follow_dims and len(lead_dims) >= 3 and len(follow_dims) >= 3:
+                # 沿接近方向的接触半长之和（米）
+                half_sum = float(lead_dims[0]) / 2.0 + float(follow_dims[0]) / 2.0
+                dist = float(torch.norm(delta).item())
+                if dist > 1e-4:
+                    # 把"接触距离"转换为归一化插值停止比例
+                    contact_gap = max(0.0, min(0.95, half_sum / dist))
+
         if mode == "lane_change":
             lateral_axis = action.params.get("lateral_axis", "x")
             offset_value = lateral_offset if lateral_offset != 0.0 else 1.8
@@ -269,7 +285,7 @@ class SceneEditExecutor:
                 target_follow[0] = follow_xy[0]
             target_follow[2] = follow_xy[2]
         else:
-            target_follow = lead_xy - delta * 0.35
+            target_follow = lead_xy - delta * contact_gap
 
         for idx, (frame_idx, obj, pose) in enumerate(follow_tracks):
             if frame_idx < decel_start:
@@ -300,3 +316,28 @@ class SceneEditExecutor:
                 lead_pose = pose.clone()
                 lead_pose[:3, 3] = lead_xy
                 self.engine.set_object_pose(frame_idx, obj["object_id"], lead_pose)
+
+    def analyze_collision_course(self, lead_tid: int, follow_tid: int, start_idx: int,
+                                 num_frames: int, fps: float = 10.0, safety_margin: float = 1.5):
+        """分析一对 track 的碰撞，返回最晚反应关键帧信息（供自动驾驶评估）。"""
+        lead_tracks = self._extract_positions(lead_tid, start_idx, num_frames)
+        follow_tracks = self._extract_positions(follow_tid, start_idx, num_frames)
+        if not lead_tracks or not follow_tracks:
+            return None
+        lead_map = {fi: (obj, pose) for fi, obj, pose in lead_tracks}
+        common = [fi for fi, _, _ in follow_tracks if fi in lead_map]
+        if not common:
+            return None
+        poses_f, poses_l, dims_f, dims_l = [], [], None, None
+        for fi, obj, pose in follow_tracks:
+            if fi not in lead_map:
+                continue
+            poses_f.append(pose.detach().cpu().numpy())
+            poses_l.append(lead_map[fi][1].detach().cpu().numpy())
+            if dims_f is None:
+                dims_f = obj.get("dimensions", [4.5, 2.0, 1.6])
+                dims_l = lead_map[fi][0].get("dimensions", [4.5, 2.0, 1.6])
+        return compute_critical_frame(
+            poses_f, dims_f, poses_l, dims_l, common,
+            safety_margin=safety_margin, fps=fps,
+        )

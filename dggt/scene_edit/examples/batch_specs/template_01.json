@@ -1,0 +1,42 @@
+{
+  "scene_path": "/path/to/your/scene",
+  "output_dir": "/path/to/output/case_01",
+  "num_frames": 20,
+  "start_idx": 0,
+  "draw_bboxes": true,
+  "draw_ids": true,
+  "save_video": true,
+  "video_name": "case_01.mp4",
+  "video_fps": 10,
+  "load_sky": true,
+  "static_only": false,
+  "metadata": {
+    "case_name": "case_01",
+    "export_id_map": true,
+    "scenario_type": "cut_in"
+  },
+  "actions": [
+    {
+      "type": "translate_track",
+      "target": {
+        "track_id": 2
+      },
+      "params": {
+        "dx": 3.5,
+        "dy": 0.0,
+        "dz": 0.0
+      }
+    },
+    {
+      "type": "velocity_perturb",
+      "target": {
+        "track_id": 2
+      },
+      "params": {
+        "shift": [0.4, 0.0, 0.0],
+        "scale": 1.5,
+        "begin_frame": 4
+      }
+    }
+  ]
+}

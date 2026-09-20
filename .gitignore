@@ -7,3 +7,50 @@ venv/
 .vscode/
 *.log
 /tmp/
+
+# ==================== 只备份代码：排除大数据 / 权重 / 渲染结果 ====================
+# 数据集
+waymo/
+data/waymo/
+pretrained/
+datasets/**/raw/
+# 渲染结果与日志
+output/
+logs/
+# SAM 3D Objects 的权重与产出（仅保留代码/脚本/文档）
+sam-3d-objects/checkpoints/
+sam-3d-objects/SAM_checkpoints/
+sam-3d-objects/outputs/
+sam-3d-objects/doc/
+sam-3d-objects/notebook/images/
+sam-3d-objects/notebook/meshes/
+# 第三方库编译产物
+third_party/pointops2/build/
+third_party/pointops2/dist/
+third_party/**/build/
+third_party/**/*.egg-info/
+
+# 大文件类型（防御性）
+*.ply
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.npy
+*.npz
+*.mp4
+*.avi
+*.mov
+*.onnx
+*.so
+*.o
+*.a
+*.zip
+*.whl
+*.tar
+*.tar.gz
+
+# ==================== 本地编辑备份（不提交） ====================
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
