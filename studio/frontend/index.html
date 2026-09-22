@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260920m">
+    <link rel="stylesheet" href="styles.css?v=20260920n">
 </head>
 <body>
     <div id="app">
@@ -217,13 +217,21 @@
 
                 <div class="panel-section panel-sam3d">
                     <div class="panel-header">
-                        <h3>自然语言编辑轨迹</h3>
+                        <h3>自然语言总控</h3>
                     </div>
                     <div class="sam3d-panel">
                         <div class="form-group">
-                            <label>用自然语言描述怎么改 / 怎么撞</label>
+                            <label>一句话描述要改什么（编辑 / 生成 / 事故 / 时间轴都能做）</label>
                             <textarea id="trajEditInstruction" rows="3" style="width:100%;box-sizing:border-box;"
-                                placeholder="例如：让 T:4 向左变道，然后和 T:2 相撞；T:5 减速到 4m/s；删掉 T:7；生成一辆红色轿车变道撞 T:2，持续 40 帧（也可以写“4 秒”）"></textarea>
+                                placeholder="例如：生成一辆与 T:12 同向行驶的白色货车变道撞击 T:12，持续 30 帧；让 T:4 向左变道后和 T:2 相撞；T:5 减速到 4 m/s；删掉 T:7；生成一个 T:5 追尾 T:2 的事故，20 帧；把 T:100000 放大到 1.3 倍 / 去掉它的阴影；把 T:100000 的轨迹重排到前方 16m；把时间轴延长 50 帧；撤销"></textarea>
+                        </div>
+                        <div class="detail" style="margin-top:4px;">
+                            支持：速度 / 变道 / 转向 / 删除 / 相撞 / 生成车辆（LLaDA 出图 + SAM3D 重建）/
+                            整数倍缩放 / 接触阴影开关 / 轨迹重排 / corner case 事故生成 / 延长帧数 / 撤销。
+                            解析来源会显示在下面（LLM 或规则兜底）。
+                        </div>
+                        <div class="button-row">
+                            <button id="trajEditPlanBtn" class="btn btn-secondary btn-block">只规划（看解析出的操作）</button>
                         </div>
                         <div class="button-row">
                             <button id="trajEditApplyBtn" class="btn btn-primary btn-block">规划并应用</button>
@@ -1093,9 +1101,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260920m"></script>
-    <script src="app.js?v=20260920m"></script>
+    <script src="viewer3d.js?v=20260920n"></script>
+    <script src="app.js?v=20260920n"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260920m"></script>
+    <script src="ui-panels.js?v=20260920n"></script>
 </body>
 </html>

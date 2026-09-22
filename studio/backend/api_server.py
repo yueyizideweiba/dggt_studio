@@ -4632,6 +4632,14 @@ async def sam3d_replace(request: SAM3DReplaceRequest):
 
         # 3. 释放 SAM 显存，给 SAM 3D 让路
         sam_segment.release_memory()
+        # 3.5 顺手让 SAM3D 微服务先卸掉常驻模型：上一次重建会常驻 9~18GB，直接再重建
+        #     很容易 CUDA OOM（实测：stale 14.7GB + 新重建 → "Tried to allocate 1.31 GiB"）。
+        try:
+            client0 = sam3d_client.get_sam3d_client()
+            await client0.unload()
+            await asyncio.sleep(1.0)
+        except Exception:  # noqa: BLE001
+            pass
 
         # 4. SAM 3D 重建
         client = sam3d_client.get_sam3d_client()
@@ -4771,6 +4779,12 @@ class Text2EntityRequest(BaseModel):
     steps: int = 4
     reference_image: Optional[str] = None   # 可选：直接给参考图 base64，跳过 LLaDA
     max_attempts: int = 3                   # VLM 判定"图和描述不一致"时最多重生成几次
+    # ---- "与 T<id> 同向/对向行驶"：方向以**参照车**为准（不再是相对自车猜） ----
+    direction_ref: Optional[int] = None     # 参照车 id（方向跟它一致或相反）
+    same_dir: bool = True                   # True=同向；False=对向
+    lane_ref: Optional[int] = None          # 初始车道参照车
+    lane_offset: float = 0.0                # 相对参照车右向量的横向偏移（±3.5 = 旁边一条车道）
+    impact_frame: Optional[int] = None      # 期望撞击帧（相对场景帧号），用于轨迹收口
 
 
 class Text2EntityReplanRequest(BaseModel):
@@ -4802,6 +4816,16 @@ def _insert_warnings(plan: Dict[str, Any]) -> List[str]:
     背景也会变空。不是错误，但用户需要知道，否则会以为"位置又错了"。
     """
     out: List[str] = []
+    try:
+        rr = float(plan.get("route_roughness") or 1.0)
+        ref = plan.get("direction_ref")
+        if rr > 1.6 and ref is not None:
+            out.append(
+                f"参照车 T:{ref} 这段轨迹抖动/折返较明显（折返倍数 {rr:.2f}）："
+                "新物体的路线用的是**平滑后**的版本，撞击位置以实际接触为准。"
+                "想更准可以换一辆轨迹连续的车做参照，或先修它的轨迹。")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         n = int(plan.get("ground_sparse_total") or plan.get("ground_fallback_frames") or 0)
         total = len(plan.get("poses") or {}) or 1
@@ -4876,6 +4900,17 @@ async def text2entity_generate(request: Text2EntityRequest):
         if dims is None:
             dims, cat = nl.rule_dimensions(request.prompt)
             vlm["fallback"] = "rule_dimensions"
+        # **文本里明确写了车型就以文本为准**：VLM 只看图，实测会把"白色货车"认成轿车
+        # （→ 目标尺寸变成轿车尺寸 → 好好的货车模型被"塞进轿车包围盒"压成一辆玩具车）。
+        try:
+            dims_txt, cat_txt = nl.rule_dimensions(request.prompt)
+        except Exception:  # noqa: BLE001
+            dims_txt, cat_txt = None, None
+        if dims_txt and cat_txt and cat_txt != "object" and str(cat_txt) != str(cat):
+            vlm["category_override"] = {"vlm": cat, "text": cat_txt,
+                                        "text_dims": [float(x) for x in dims_txt]}
+            cat = str(cat_txt)
+            dims = [float(x) for x in dims_txt]
         # 车辆类：和"场景已有车辆 / 常识"融合，避免生成的车明显偏大
         dims = nl.refine_vehicle_dims(dims, cat, tm)
         vlm["refined_dims"] = [float(x) for x in dims]
@@ -4915,12 +4950,36 @@ async def text2entity_generate(request: Text2EntityRequest):
         # 6) 车道轨迹 + 冲突规避（VLM 若判定"模型朝后"则翻转 180°）
         facing = nl.vlm_facing(vlm)
         # 用"紧贴模型"的尺寸做无冲突放置/判定，与最终插入的包围盒保持一致
-        plan = await asyncio.to_thread(
-            nl.plan_collision_free, tm, dims_tight,
-            mode=request.mode, start_frame=int(request.frame_idx),
-            num_frames=int(num_frames), distance=float(request.distance),
-            lateral=float(request.lateral), speed=float(request.speed),
-            flip=(facing == "back"))
+        # ① 如果指令说"与 T<id> 同向/对向行驶"（direction_ref/lane_ref），就**以那辆车自己的
+        #    轨迹为基准**铺轨迹（方向、车道、转弯几何都跟它一致）；否则退回"相对自车车道"的老口径。
+        rel_ref = None
+        for cand in (getattr(request, "direction_ref", None), getattr(request, "lane_ref", None)):
+            try:
+                cid = int(cand) if cand is not None else None
+            except (TypeError, ValueError):
+                cid = None
+            if cid is not None and len(tm.get_track_frames(int(cid))) > 0:
+                rel_ref = int(cid)
+                break
+        if rel_ref is not None:
+            plan = await asyncio.to_thread(
+                nl.plan_relative_collision_free, tm, dims_tight,
+                ref_track=int(rel_ref), same_dir=bool(getattr(request, "same_dir", True)),
+                lane_offset=float(getattr(request, "lane_offset", 0.0) or 0.0),
+                start_frame=int(request.frame_idx), num_frames=int(num_frames),
+                distance=float(request.distance), speed=float(request.speed),
+                impact_frame=(int(request.impact_frame)
+                              if getattr(request, "impact_frame", None) is not None else None),
+                flip=(facing == "back"))
+            mode_used = f"relative(T:{rel_ref}{'' if getattr(request, 'same_dir', True) else ' 对向'})"
+        else:
+            plan = await asyncio.to_thread(
+                nl.plan_collision_free, tm, dims_tight,
+                mode=request.mode, start_frame=int(request.frame_idx),
+                num_frames=int(num_frames), distance=float(request.distance),
+                lateral=float(request.lateral), speed=float(request.speed),
+                flip=(facing == "back"))
+            mode_used = request.mode
         if not plan.get("ok"):
             try:
                 await client.unload()
@@ -4945,6 +5004,10 @@ async def text2entity_generate(request: Text2EntityRequest):
             spec["dims_target_reference"] = [float(x) for x in dims]
             spec["bbox_mode"] = "tight_to_model"
             spec["recon_quality"] = bbox_info
+            spec["placement_mode"] = mode_used
+            spec["direction_ref"] = rel_ref
+            spec["same_dir"] = bool(getattr(request, "same_dir", True))
+            spec["lane_offset"] = float(getattr(request, "lane_offset", 0.0) or 0.0)
         except Exception:  # noqa: BLE001
             pass
 
@@ -4981,7 +5044,13 @@ async def text2entity_generate(request: Text2EntityRequest):
             "ply_path": str(ply_path),
             "num_frames": int(num_frames),
             "placement": {
-                "mode": plan.get("mode"), "lateral": plan.get("lateral"),
+                "mode": mode_used, "plan_mode": plan.get("mode"),
+                "direction_ref": plan.get("direction_ref"),
+                "same_dir": plan.get("same_dir"),
+                "impact_frame": plan.get("impact_frame"),
+                "contact_gap": plan.get("contact_gap"),
+                "route_roughness": plan.get("route_roughness"),
+                "lateral": plan.get("lateral"),
                 "distance": plan.get("distance"), "speed": plan.get("speed"),
                 "num_frames": len(plan.get("poses") or {}), "up_sign": plan.get("up_sign"),
                 "tried": plan.get("tried"),
@@ -5116,6 +5185,18 @@ async def traj_edit_apply(request: TrajEditApplyRequest):
         insert_warnings: List[str] = []
         for op in ops:
             if str(op.get("op")) == "insert":
+                # 期望撞击帧：从回填前的 collide op（肇事车 = 占位符 null/-1）里取，
+                # 让新车的轨迹按"第几帧撞上"收口（plan_relative_trajectory 会用它算收口速度）
+                imp = None
+                for o2 in ops:
+                    if str(o2.get("op")) != "collide":
+                        continue
+                    if o2.get("a") in (None, -1):
+                        try:
+                            imp = int(o2.get("frame"))
+                        except (TypeError, ValueError):
+                            imp = None
+                        break
                 req = Text2EntityRequest(
                     scene_id=request.scene_id,
                     prompt=str(op.get("prompt") or request.instruction),
@@ -5128,6 +5209,14 @@ async def traj_edit_apply(request: TrajEditApplyRequest):
                     use_vlm=True, max_attempts=2,
                     # 语言编辑里也能贴参考图：给了就直接用它做 SAM3D（跳过文生图）
                     reference_image=request.reference_image or None,
+                    # "与 T<id> 同向/对向行驶 / 在它旁边一条车道"这类提示，直接透给规划器
+                    direction_ref=(int(op["direction_ref"])
+                                   if op.get("direction_ref") not in (None, 0) else None),
+                    same_dir=bool(op.get("same_dir", True)),
+                    lane_ref=(int(op["lane_ref"])
+                              if op.get("lane_ref") not in (None, 0) else None),
+                    lane_offset=float(op.get("lane_offset") or 0.0),
+                    impact_frame=imp,
                 )
                 r = await text2entity_generate(req)
                 if r.get("object_id") is not None:
@@ -5145,6 +5234,8 @@ async def traj_edit_apply(request: TrajEditApplyRequest):
                         "dims_target": r.get("dims_target"),
                         "bbox_mode": r.get("bbox_mode"),
                         "recon_degenerate": r.get("recon_degenerate"),
+                        "vlm": r.get("vlm"),
+                        "placement": r.get("placement"),
                         "reference_image": r.get("reference_image"),
                         "preview": r.get("preview"),
                     })
@@ -5162,9 +5253,18 @@ async def traj_edit_apply(request: TrajEditApplyRequest):
                 if k in op and op[k] in PH:
                     op[k] = new_id
 
-        tm.push_history()
-        report = await asyncio.to_thread(traj_llm.apply_ops, tm, ops, 10.0,
-                                          int(request.num_frames))
+        # 撤销/重做**先执行**，而且不能把本批的 push_history 当成"上一步"：
+        # 否则用户只写"撤销"时，会先把本批快照压进去、再立刻弹出来 —— 看起来什么都没发生。
+        undo_ops = [o for o in ops if str(o.get("op")) in ("undo", "redo")]
+        other_ops = [o for o in ops if str(o.get("op")) not in ("undo", "redo")]
+        report: List[Dict[str, Any]] = []
+        if undo_ops:
+            report += await asyncio.to_thread(traj_llm.apply_ops_ext, tm, undo_ops, 10.0,
+                                              int(request.num_frames))
+        if other_ops:
+            tm.push_history()
+            report += await asyncio.to_thread(traj_llm.apply_ops_ext, tm, other_ops, 10.0,
+                                              int(request.num_frames))
         return {"success": True, "source": plan.get("source"), "ops": ops,
                 "inserted": inserted, "inserts": insert_details, "report": report,
                 "raw": plan.get("raw"),

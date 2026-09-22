@@ -480,9 +480,54 @@ corner case 的参数化场景仍可用 False）：
 > 如果两条轨迹在这个窗口里最近也有十几米（对方跑掉了），会**如实回 `ok=false`**
 > 并保留原轨迹，而不是硬造一条长途追车轨迹（详见上面的连续性一节）。
 
+### 2.7) 自然语言总控：一句话驱动 编辑 / 生成 / 事故 / 时间轴
+
+入口还是「自然语言总控」面板（`POST /api/traj_edit/plan|apply`），但能识别的操作远不止轨迹编辑：
+
+| 操作 | 示例 | 复用的既有功能 |
+|---|---|---|
+| speed / lane_change / turn / remove / collide | "让 T:4 减速到 4m/s，然后和 T:2 相撞" | `traj_llm` 里同一批 `_op_*` + `fuse_collide_ops` |
+| insert（生成车辆） | "生成一辆与 T:12 同向行驶的白色货车变道撞击 T:12，持续 30 帧" | LLaDA 出图 + SAM3D 重建 + 相对轨迹规划 |
+| scale | "把 T:100000 放大到 1.3 倍" | `/api/edit/synthetic/scale` 的同一套逻辑 |
+| shadow | "给 T:100000 去掉阴影" | 接触阴影开关 |
+| replan | "把 T:100000 的轨迹重排到前方 16m" | `/api/text2entity/replan` 的同一套逻辑 |
+| corner_case | "生成一个 T:5 追尾 T:2 的事故，20 帧" | `corner_case.generate`（同一套事故引擎） |
+| extend | "把时间轴延长 50 帧" | `tm.extend_timeline` |
+| undo / redo | "撤销" / "重做" | `tm.undo/redo` |
+
+**"与 T<id> 同向/对向"不再搞反（这次的 bug）**：
+
+1. `scene_summary` 现在带 `yaw`（世界运动方向）和 `vs_ego`（相对主车同向/对向）——
+   旧摘要只有 id/type/x/z/dims，**没有任何朝向信息**，LLM 只能瞎猜（实测就把"与 T100000 同向"
+   生成成了对向车）；
+2. 提示词里写明"方向必须看 yaw"，并要求填 `direction_ref / same_dir / lane_ref / lane_offset`；
+3. 规划完之后 `_inject_insert_hints()` 用**指令原文**兜底：正则解析"与 T<id> 同向/对向"、
+   "在 T<id> 左边/右侧"、以及"变道撞击"该配的 `lane_change`。LLM 填错（实测把
+   `direction_ref` 填成了主车 900000）或漏填都会被按指令改回来并回一条 warning；
+4. 轨迹不再靠"相对自车车道"的 ahead/oncoming 猜：新增
+   `nl_entity.plan_relative_trajectory()` —— **以参照车自己的轨迹为基准**铺路线：
+   同向 = 跟在它后面把间距从 `distance` 收到"刚好接触"，对向 = 从它前方迎上来；
+   横向 = 参照车右向量 × `lane_offset`（±3.5 就是旁边一条车道）。方向/车道/转弯几何自动一致；
+5. 参照车轨迹抖得厉害时（原始折线长度 ÷ 平滑路线长度 > 1.6，实测误检轨迹能到 3+），先用
+   `_smooth_route()` 整理成"单调、平滑的路线"再铺（否则新物体位置会来回摆十几米），
+   并在回执里给 warning 说明；
+6. "变道撞击" = `insert(lane_offset=±3.5)` + 自动补的
+   `lane_change(track=null, lateral=-lane_offset)`，后者会被 `fuse_collide_ops` 融进同一次事故仿真，
+   即"一边切进来一边撞"，不会先变道再撞两段式地互相覆盖；
+7. 实测（干净参照车 = 主车）：同向 → 新物体朝向 -2.7°（参照 -2.6°），车距 8.95m→6.33m；
+   对向 → 朝向 -179.1°（正好相反），车距 29.4m→**0.76m（第 18 帧精确接触）**。
+
+其它：
+- `replace`（SAM3D 替换）仍需要**点选/框选目标**，自然语言里会明确回
+  "这类操作需要在对应面板里做"；`render/export` 同理（需要参数）。
+- 顺手修了一个会让替换失败的坑：`/api/sam3d/replace` 在重建前先让 SAM3D 微服务
+  `/unload`（上一次重建会常驻 9~18GB，实测直接再重建会 `CUDA OOM: Tried to allocate 1.31 GiB`）。
+- 事故场景名从 `corner_case.SCENARIOS` 现取后写进提示词（含每个场景需要的 roles key），
+  不再手写（手写会写错名字，例如把 `head-on` 写成 `oncoming-collision`）。
+
 ### 3) 语言编辑里生成新物体时，能看到 / 指定参考图
 
-界面「语言编辑轨迹（LLM）」面板新增：
+界面「自然语言总控」面板（原「语言编辑轨迹（LLM）」）新增：
 
 - **参考图（可选）**：选一张图就直接用它做 SAM3D 重建（跳过文生图），
   和「文本添加实体」面板一致；不选则按描述由 LLaDA 出图。

@@ -21,8 +21,26 @@ TEXT2ENTITY_URL = os.environ.get("TEXT2ENTITY_URL", "http://127.0.0.1:8002")
 
 # ==================== 场景摘要 ====================
 
+def _motion_yaw_deg(tm, tid: int, frame_idx: int):
+    """某物体在该帧的**运动方向**（度，0=世界 +z，90=+x）；拿不到返回 None。"""
+    try:
+        y = tm.get_motion_yaw(int(tid), int(frame_idx))
+        if y is not None:
+            return float(math.degrees(y))
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def scene_summary(tm, frame_idx: int = 0) -> List[Dict[str, Any]]:
+    """给 LLM 的场景摘要。
+
+    **必须带朝向**：否则"与 T100000 同向行驶"这类要求它根本无从判断（旧的摘要只有
+    id/type/x/z/dims，LLM 只能瞎猜 → 生成出方向相反的车）。这里额外给出
+    `yaw`（世界运动方向，度）与 `vs_ego`（相对主车是同向还是对向）。
+    """
     rows = []
+    ego_yaw = _motion_yaw_deg(tm, 900000, frame_idx)
     for o in tm.get_frame_objects(int(frame_idx)):
         tid = int(o["track_id"])
         p = np.asarray(o["pose_world"], dtype=np.float64)
@@ -33,6 +51,13 @@ def scene_summary(tm, frame_idx: int = 0) -> List[Dict[str, Any]]:
             "z": round(float(p[2, 3]), 2),
             "dims": [round(float(d), 2) for d in (o.get("dimensions") or [])],
         }
+        yaw = _motion_yaw_deg(tm, tid, frame_idx)
+        if yaw is not None:
+            row["yaw"] = round(float(yaw), 1)
+            if ego_yaw is not None and not tm.is_ego_track(tid):
+                # 与主车同向/对向（差 90° 以上就算对向）
+                d = abs((float(yaw) - float(ego_yaw) + 180.0) % 360.0 - 180.0)
+                row["vs_ego"] = "同向" if d < 90.0 else "对向"
         if tm.is_ego_track(tid):
             # 把主车也告诉 LLM，否则它不知道"主车/自车"该用哪个 id
             row["type"] = "主车(自车/ego)"
@@ -44,33 +69,72 @@ def scene_summary(tm, frame_idx: int = 0) -> List[Dict[str, Any]]:
 
 # ==================== LLM 规划 ====================
 
-PLAN_PROMPT = """你是自动驾驶场景编辑助手。当前场景里的车辆（JSON，帧 {frame}）：
+PLAN_PROMPT = """你是自动驾驶 4DGS 场景编辑助手。把用户的一句话拆成可执行操作，**只输出一个 JSON**（不要 markdown、不要解释）。
+
+场景里的物体（JSON，帧 {frame}）：
 {scene}
+
+字段：id=物体编号；x/z=位置(米)；dims=[宽,高,长](米)；yaw=**运动方向**(度：0=朝+z，90=朝+x，180=朝-z)；
+vs_ego=相对主车是同向还是对向（没有 yaw 表示该帧静止或测不到）。
 
 用户要求：{instruction}
 
-请把它拆成可执行操作，**只输出一个 JSON**（不要 markdown、不要解释）：
+输出的 ops 数组（按执行顺序，可用操作如下）：
 {{"ops": [
  {{"op":"speed","track":<id>,"speed_mps":<数>,"start_frame":<帧>,"end_frame":<帧>}},
- {{"op":"lane_change","track":<id>,"lateral":<米，车体右侧为正>,"start_frame":<帧>,"duration":<帧数>}},
+ {{"op":"lane_change","track":<id 或 null>,"lateral":<米，车体右侧为正>,"start_frame":<帧>,"duration":<帧数>}},
  {{"op":"turn","track":<id>,"yaw_deg":<相对角度，正=左转>,"start_frame":<帧>,"duration":<帧数>}},
  {{"op":"remove","track":<id>}},
- {{"op":"collide","a":<attacker id>,"b":<victim id>,"frame":<碰撞帧>}},
- {{"op":"insert","prompt":"<英文外观描述>","track":null,"mode":"ahead","distance":<米>,"speed":<m/s>,"num_frames":<帧数>}}
-（insert 的 num_frames 就是"新物体生成多少帧轨迹"：用户说了帧数/秒数就按它填，
-  1 秒 ≈ {fps} 帧，例如"持续 4 秒"→40、"跑 60 帧"→60；没说就填 20。
-  帧数不要超过 {max_frames}。
-  insert 的 mode 只能填三个字面量之一：ahead（同向、在自车前方）/oncoming（对向）/
-  roadside（路肩），**不要把 "ahead|oncoming|roadside" 原样抄下来**。
-  collide 的 frame 是"撞上的那一帧"，要放在整段轨迹的中间偏后（大约 60% 处），
-  这样 40 帧里才有"撞前 → 撞上 → 撞后"三段；不要填在最后一帧。）
+ {{"op":"scale","track":<id>,"factor":<倍数，1=原样>}},
+ {{"op":"shadow","track":<id>,"enabled":<true/false>}},
+ {{"op":"replan","track":<id>,"mode":"ahead","distance":<米>,"lateral":<米>,"speed":<m/s>,"num_frames":<帧数>}},
+ {{"op":"corner_case","scenario":"<场景类型>","roles":{{"attacker":<id>,"victim":<id>}},
+   "start_frame":<帧>,"num_frames":<帧数>,"intensity":<0.5~2.0>}},
+ {{"op":"extend","extra_frames":<帧数>}},
+ {{"op":"undo"}},
+ {{"op":"collide","a":<肇事车 id 或 null>,"b":<被撞车 id>,"frame":<碰撞帧>}},
+ {{"op":"insert","prompt":"<英文外观描述>","track":null,"mode":"ahead","distance":<米>,"speed":<m/s>,
+   "num_frames":<帧数>,"direction_ref":<id 或 null>,"same_dir":<true/false>,
+   "lane_ref":<id 或 null>,"lane_offset":<米>}}
 ]}}
-规则：track 用上面 JSON 里的 id（**主车/自车的 id 是 900000**，"主车/自车/本车/ego"都指它）；
-帧号 0~{num_frames_minus1}；"撞/相撞/追尾/别车/加塞"用 collide
-（同一辆车可同时给 lane_change/speed 让它更真实）；"加/生成/放入一辆车"用 insert；
-① 只有用户明确要求"新增/生成/添加一辆新车"时才输出 insert，只是让已有车相撞/变道时**不要** insert；
-② 若肇事车就是本条指令要**新建**的那辆，collide 的 "a" 必须写 null（会绑定到新生成的车上），
-"b" 写被撞的那辆已有车的 id；③ 只输出 JSON，不要 markdown、不要解释。"""
+
+insert（生成一辆新车）怎么填：
+- **方向必须看 yaw**：用户说"与 T12 同向行驶" → "direction_ref":12,"same_dir":true；
+  "与 T12 对向/迎面/逆行" → "same_dir":false。没提跟谁比就 direction_ref 填 null，
+  "同向"=跟主车同向（mode "ahead"）、"对向"=mode "oncoming"。
+- "变道撞击 T12"= 新车在**旁边车道**（lane_offset 填 3.5 或 -3.5），再加一条
+  {{"op":"lane_change","track":null,"lateral":<-3.5 或 3.5>,"start_frame":0,"duration":<帧数/3>}}
+  表示新车切进目标车道（track=null = 作用在新车上），最后 collide 的 "a" 写 null、"b" 写被撞车。
+- lane_offset：新车初始在目标车**右侧**多少米（负=在它左边，0=同一车道）。
+- prompt 用英文写**静态外观**（颜色+车型，如 "white box truck" / "red sedan"），不要写动作。
+- num_frames：用户说"持续 N 帧 / N 秒"就按它填（1 秒 ≈ {fps} 帧），没说填 20，不要超过 {max_frames}。
+- mode 只能是 ahead / oncoming / roadside 三个字面量之一，**不要原样抄 "ahead|oncoming|roadside"**。
+- collide 的 frame 放在整段中间偏后（约 60%），保证"撞前 → 撞上 → 撞后"三段；不要放最后一帧。
+- 帧号范围 0~{num_frames_minus1}；主车/自车/本车/ego 的 id 是 900000。
+
+其它规则：
+① 只有用户明确说"新增/生成/添加一辆车"时才 insert；只是让已有车相撞/变道时不要 insert；
+② 肇事车就是本条要新建的那辆车时，collide 的 "a" 写 null；
+③ corner_case 的 scenario 只能从这个列表里选（含每个场景需要的 roles key）：
+   {scenarios}
+   用户没说类型就按语义最接近的选；roles 里写"谁的 id 撞谁"（按列表中该场景的 key）。
+④ 用户说"延长帧数/加长到 N 帧"用 extend；"撤销/回退"用 undo；
+   "把 T12 放大/缩小到 x%" 用 scale；"给 T12 加/去阴影"用 shadow；"把 T12 换个轨迹/重排"用 replan；
+⑤ 只输出 JSON。
+
+示例：
+- "生成一辆与 T12 同向行驶的白色货车变道撞击 T12，持续 30 帧"
+{{"ops":[{{"op":"insert","prompt":"white box truck","track":null,"mode":"ahead","distance":12,"speed":0,
+"num_frames":30,"direction_ref":12,"same_dir":true,"lane_ref":12,"lane_offset":3.5}},
+{{"op":"lane_change","track":null,"lateral":-3.5,"start_frame":0,"duration":10}},
+{{"op":"collide","a":null,"b":12,"frame":18}}]}}
+- "让 T4 减速到 5m/s，然后和 T7 相撞"
+{{"ops":[{{"op":"speed","track":4,"speed_mps":5,"start_frame":0,"end_frame":29}},
+{{"op":"collide","a":4,"b":7,"frame":20}}]}}
+- "生成一个 T5 追尾 T2 的事故，20 帧"
+{{"ops":[{{"op":"corner_case","scenario":"rear-end","roles":{{"attacker":5,"victim":2}},
+"start_frame":0,"num_frames":20,"intensity":1.0}}]}}
+"""
 
 
 def _llm_text(prompt: str, max_new_tokens: int = 768) -> str:
@@ -178,21 +242,169 @@ def parse_num_frames(text: str, fps: float = 10.0):
     return None, None
 
 
-def rule_insert_prompt(text: str) -> str:
-    """规则兜底时给文生图的提示词：只留"物体描述"，砍掉动作子句与开头的动词。
+def _obj_phrases(text: str):
+    """在**整句**里找颜色/车型关键词（按出现位置排序），返回 (中文短语, 英文短语)。
 
-    否则整句"生成一辆对向来的红色轿车在T100000转弯时相撞"会被原样丢给
-    LLaDA-Image，出图必然跑偏。
+    为什么要在整句里找而不是"先砍动作子句"：描述常常在方向从句**后面**
+    （"生成一辆与T100000同向行驶的白色货车…"），按第一个动作词就砍会把"白色货车"砍掉。
     """
     t = str(text or "")
+    low = t.lower()
+    hits = []
+    for kws, en in _COLOR_ZH2EN:
+        for k in kws:
+            i = low.find(k.lower())
+            if i >= 0:
+                hits.append((i, k, en))
+                break
+    for kws, en in _TYPE_ZH2EN:
+        best = None
+        for k in kws:
+            i = low.find(k.lower())
+            if i >= 0 and (best is None or i < best[0] or (i == best[0] and len(k) > len(best[1]))):
+                best = (i, k, en)
+        if best is not None:
+            hits.append(best)
+    hits.sort(key=lambda h: (h[0], -len(h[1])))
+    zh = "".join(h[1] for h in hits)
+    ens = []
+    for h in hits:
+        if h[2] not in ens:
+            ens.append(h[2])
+    return zh, " ".join(ens)
+
+
+def rule_insert_prompt(text: str) -> str:
+    """规则兜底时给文生图的提示词：只留"物体描述"，并翻成中英混排。
+
+    旧实现只按 `_ACTION_CUT` 砍一刀，遇到"生成一辆与T100000同向行驶的白色货车变道撞击T100000"
+    会抽出 `'一辆与'` 这种垃圾（实测）——文生图必然跑偏。现在优先在整句里认颜色/车型
+    （`白色货车` → `white box truck, 白色货车`），认不出来才退回"砍动作子句"的老办法。
+    """
+    zh_found, en_found = _obj_phrases(str(text or ""))
+    if en_found:
+        return f"{en_found}, {zh_found}" if zh_found else en_found
+    t = str(text or "")
+    # 退回：先砍动作子句（撞/变道/持续/…），再剥掉方向/track 从句
     m = _ACTION_CUT.search(t)
     if m and m.start() > 0:
         t = t[:m.start()]
-    for pre in ("帮我", "给我", "请", "生成", "添加", "增加", "放入", "加一辆", "加个", "来"):
+    for pat in _INSERT_STRIP_PATTERNS:
+        t = re.sub(pat, "", t)
+    for pre in ("帮我", "给我", "请", "生成", "添加", "增加", "放入", "加一辆", "加个", "来",
+                "一辆", "一台", "一个", "辆"):
         if t.startswith(pre):
             t = t[len(pre):]
-    t = t.strip(" ，,。.、:：")
+    t = re.sub(r"(?:的|地)+", "", t).strip(" ，,。.、:：;；")
     return t or str(text or "").strip()
+
+
+# 规则兜底里"剥掉从句"用的模式（顺序有讲究：先剥长的）
+_INSERT_STRIP_PATTERNS = (
+    r"(?:与|和|跟|同)?\s*T?\s*[:：]?\s*\d+\s*(?:同向|同方向|相同方向|顺向|一个方向|对向|对头|迎面|逆向|反向|相反方向)?\s*(?:行驶|行进|走|开|行驶的)?",
+    r"(?:跟在|跟随|跟着|尾随|追随)\s*T?\s*[:：]?\s*\d+\s*(?:后面|后方|前方|行驶|走)?",
+    r"T\s*[:：]?\s*\d+",
+    r"(?:同向|同方向|相同方向|顺向|一个方向|对向|对头|迎面|逆向|反向|相反方向)\s*(?:行驶|行进|走|开)?",
+    r"(?:变道|并线|加塞|插队|超车|转弯|掉头|直行|行驶|向前|前方|后方|旁边|左侧|右侧|车道)",
+    r"(?:撞击|撞上|撞向|撞到|相撞|追尾|别车|碰|撞)",
+    r"(?:持续|时长|跑|运动|轨迹)\s*\d+\s*(?:帧|秒|s)?",
+    r"\d+\s*(?:帧|秒|s)",
+)
+
+
+_COLOR_ZH2EN = (
+    (("白色", "白"), "white"),
+    (("黑色", "黑"), "black"),
+    (("红色", "红"), "red"),
+    (("蓝色", "蓝"), "blue"),
+    (("银色", "银灰", "银"), "silver"),
+    (("灰色", "灰"), "gray"),
+    (("黄色", "黄"), "yellow"),
+    (("绿色", "绿"), "green"),
+    (("橙色", "橘色", "橙", "橘"), "orange"),
+    (("棕色", "褐色", "咖啡色"), "brown"),
+    (("紫色", "紫"), "purple"),
+)
+
+_TYPE_ZH2EN = (
+    (("公交车", "巴士", "客车", "公交"), "bus"),
+    (("货车", "卡车", "泥头车", "自卸车", "厢式货车"), "box truck"),
+    (("面包车", "商务车", "mpv"), "van"),
+    (("suv", "越野车", "越野"), "SUV"),
+    (("摩托车", "摩托", "机车"), "motorcycle"),
+    (("自行车", "单车", "电动车"), "bicycle"),
+    (("行人", "路人"), "pedestrian"),
+    (("锥桶", "路锥", "雪糕筒"), "traffic cone"),
+    (("皮卡",), "pickup truck"),
+    (("油罐车", "罐车"), "tanker truck"),
+    (("拖车", "清障车"), "tow truck"),
+    (("工程车", "施工车", "挖掘机"), "construction vehicle"),
+    (("轿车", "小汽车", "小轿车", "汽车", "小车", "轿跑", "跑车"), "sedan"),
+)
+
+
+# "与 T12 同向/对向行驶" → direction_ref（方向以**参照车**为准）
+_SAME_DIR_RE = re.compile(
+    r"(?:与|和|跟|同)?\s*T?\s*[:：]?\s*(\d+)\s*(?:同向|同方向|相同方向|顺向|一个方向)")
+_OPP_DIR_RE = re.compile(
+    r"(?:与|和|跟|同)?\s*T?\s*[:：]?\s*(\d+)\s*(?:对向|对头|迎面|逆向|反向|相反方向)")
+_FOLLOW_RE = re.compile(r"(?:跟在|跟随|跟着|尾随|追随)\s*T?\s*[:：]?\s*(\d+)")
+
+
+def parse_direction_ref(text: str):
+    """解析"与 T<id> 同向/对向"。返回 (ref_id 或 None, same_dir: bool, 说明或 None)。
+
+    这是"与 T100000 同向行驶却生成出对向车"的根因之一：旧实现只看指令里有没有
+    "对向/迎面"两个字，方向是**相对自车**的，而用户是按某一辆**具体的车**说的。
+    """
+    t = str(text or "")
+    m = _SAME_DIR_RE.search(t)
+    if m:
+        return int(m.group(1)), True, "指令写了『与 T%s 同向』" % m.group(1)
+    m = _OPP_DIR_RE.search(t)
+    if m:
+        return int(m.group(1)), False, "指令写了『与 T%s 对向』" % m.group(1)
+    m = _FOLLOW_RE.search(t)
+    if m:
+        return int(m.group(1)), True, "指令写了『跟在 T%s 后面』" % m.group(1)
+    return None, True, None
+
+
+def scenario_from_text(text: str):
+    """规则兜底：从中文里认出事故场景类型（返回 corner_case 的 key 或 None）。"""
+    t = str(text or "")
+    for k, kws in _RULE_SCENARIO_KW:
+        if any(w in t for w in kws):
+            return k
+    return None
+
+
+def fill_roles(scenario: str, ids: List[int]) -> Dict[str, int]:
+    """按场景需要的 roles key 顺序，把指令里列出的车辆 id 填进去。"""
+    try:
+        import corner_case
+        need = [str(r.get("key")) for r in (corner_case.SCENARIOS.get(scenario, {}).get("roles") or [])]
+    except Exception:  # noqa: BLE001
+        need = []
+    out = {}
+    for k, v in zip(need, [int(i) for i in (ids or [])]):
+        out[k] = int(v)
+    return out
+
+
+# 中文关键词 → corner_case 场景（顺序有讲究：更具体的放前面）
+_RULE_SCENARIO_KW = (
+    ("occluded-pedestrian-pileup", ("遮挡", "鬼探头", "视野遮挡")),
+    ("chain-reaction-rear-end", ("连环", "多车追尾", "连环追尾")),
+    ("cutin-brake-pileup", ("加塞急刹", "加塞刹车", "加塞导致")),
+    ("cut-out-reveal", ("前车掉头", "掉头遮挡", "cut-out", "遮挡暴露")),
+    ("pedestrian-crossing", ("行人横穿", "行人", "横穿马路")),
+    ("intersection-tbone", ("路口", "十字", "丁字", "T骨", "侧碰", "交叉路口")),
+    ("head-on", ("对向", "迎面", "逆行", "正面相撞", "对头")),
+    ("lane-change-cutin", ("加塞", "切入", "强行变道", "别车", "变道碰撞", "变道相撞")),
+    ("hard-brake", ("急刹", "急刹停", "紧急制动", "急减速")),
+    ("rear-end", ("追尾", "尾撞", "前车急停")),
+)
 
 
 def rule_plan(instruction: str, summary: List[Dict[str, Any]], num_frames: int = 30,
@@ -203,13 +415,73 @@ def rule_plan(instruction: str, summary: List[Dict[str, Any]], num_frames: int =
     other = (cars[1]["id"] if len(cars) > 1 else None)
     ops: List[Dict[str, Any]] = []
     text = instruction or ""
+    ids_text = instruction_track_ids(text)
+    nf0, _wnf = parse_num_frames(text, fps=fps)
+    nf_used = int(nf0) if nf0 else min(20, num_frames)
+
+    # 0) 扩展操作：延长帧数 / 撤销 / 缩放 / 阴影 / 重排（"生成事故"见下一步）
+    if any(k in text for k in ("延长", "加长", "扩展帧", "增加帧", "加帧")):
+        m = re.search(r"(\d+)\s*帧", text)
+        ops.append({"op": "extend",
+                    "extra_frames": int(m.group(1)) if m else max(20, int(num_frames))})
+    if any(k in text for k in ("撤销", "回退", "undo", "恢复上一步")):
+        ops.append({"op": "undo"})
+    if any(k in text for k in ("放大", "缩小", "缩放", "缩到", "变大", "变小")):
+        m = re.search(r"(\d+(?:\.\d+)?)\s*倍", text)
+        f = float(m.group(1)) if m else 0.8
+        if any(k in text for k in ("缩小", "变小")):
+            f = f if (m and f < 1.0) else (1.0 / max(1.0, f) if m else 0.8)
+        sid = ids_text[0] if ids_text else tgt
+        if sid is not None:
+            ops.append({"op": "scale", "track": int(sid), "factor": max(0.2, min(5.0, f))})
+    if any(k in text for k in ("阴影", "影子")):
+        sid = ids_text[0] if ids_text else tgt
+        on = not any(k in text for k in ("去掉", "关闭", "取消", "移除", "不要"))
+        if sid is not None:
+            ops.append({"op": "shadow", "track": int(sid), "enabled": bool(on)})
+    if any(k in text for k in ("重排", "换个轨迹", "换条轨迹", "重新规划轨迹")):
+        sid = ids_text[0] if ids_text else tgt
+        if sid is not None:
+            ops.append({"op": "replan", "track": int(sid), "mode": "ahead",
+                        "distance": 16.0, "num_frames": nf_used})
+
+    # 1) "生成一个 …事故" → corner case（不能顺手再 insert 一辆车）
+    scen = scenario_from_text(text)
+    if scen is not None and any(k in text for k in ("事故", "场景", "case", "生成", "造", "做一个")):
+        roles = fill_roles(scen, ids_text or [i for i in (tgt, other) if i is not None])
+        if roles:
+            ops.append({"op": "corner_case", "scenario": scen, "roles": roles,
+                        "start_frame": 0, "num_frames": nf_used, "intensity": 1.0})
+        return ops
+
     inserted = False
+    ref_id, same_dir, _why = parse_direction_ref(text)
     if any(k in text for k in KEY_INSERT):
+        # 方向：有参照车就按参照车（看它在场景摘要里的 vs_ego），否则按"相对自车"的老口径
         mode = "oncoming" if ("对向" in text or "迎面" in text or "逆行" in text) else "ahead"
-        nf, _why = parse_num_frames(text, fps=fps)
-        ops.append({"op": "insert", "prompt": rule_insert_prompt(text), "mode": mode,
-                    "distance": 14.0, "speed": 0.0,
-                    "num_frames": int(nf) if nf else min(20, num_frames)})
+        if ref_id is not None:
+            row = next((r for r in summary if int(r.get("id", -1)) == int(ref_id)), None)
+            vs = (row or {}).get("vs_ego")
+            if vs == "对向":
+                mode = "oncoming" if same_dir else "ahead"
+            elif vs == "同向":
+                mode = "ahead" if same_dir else "oncoming"
+            else:
+                mode = "ahead" if same_dir else "oncoming"
+        nf, _why2 = parse_num_frames(text, fps=fps)
+        want_lane = any(k in text for k in KEY_LANE)
+        # 变道撞击：新车先待在目标车旁边一条车道，"lane_offset" 是车体系右侧为正
+        left_side = any(k in text for k in ("左侧", "左边", "左前", "左后", "左道"))
+        lane_off = (-3.5 if left_side else 3.5) if want_lane else 0.0
+        op = {"op": "insert", "prompt": rule_insert_prompt(text), "mode": mode,
+              "distance": 14.0 if ref_id is None else 10.0, "speed": 0.0,
+              "num_frames": int(nf) if nf else min(20, num_frames)}
+        if ref_id is not None:
+            op["direction_ref"] = int(ref_id)
+            op["same_dir"] = bool(same_dir)
+            op["lane_ref"] = int(ref_id)
+            op["lane_offset"] = float(lane_off)
+        ops.append(op)
         inserted = True
 
     # 要生成新车时**不要再去猜别的车的动作**：规则兜底原来会把"变道/相撞"挂到
@@ -217,14 +489,16 @@ def rule_plan(instruction: str, summary: List[Dict[str, Any]], num_frames: int =
     # 涉及新车的 op 用 track=None / a=None 占位，上层拿到新 id 后回填；
     # 被撞的那辆已有车就取指令里写出来的 id。
     if inserted and any(k in text for k in KEY_CRASH):
-        m = _TID_RE.search(text)
-        victim = int(m.group(1) or m.group(2)) if m else None
+        ids = instruction_track_ids(text)
+        victim = ref_id if ref_id is not None else (ids[0] if ids else None)
         if any(k in text for k in KEY_LANE):
-            ops.append({"op": "lane_change", "track": None, "lateral": 3.5,
-                        "start_frame": 0, "duration": max(4, num_frames // 3)})
+            # 新车从 lane_offset 那一侧切进目标车道：方向与 lane_offset 相反
+            lat = -float(lane_off) if abs(float(lane_off)) > 1e-6 else -3.5
+            ops.append({"op": "lane_change", "track": None, "lateral": lat,
+                        "start_frame": 0, "duration": max(4, int(max(1, num_frames) * 0.35))})
         if victim is not None:
-            ops.append({"op": "collide", "a": None, "b": victim,
-                        "frame": max(3, num_frames - 3)})
+            ops.append({"op": "collide", "a": None, "b": int(victim),
+                        "frame": max(3, int(round(num_frames * 0.6)))})
         return ops
 
     if any(k in text for k in KEY_CRASH):
@@ -240,7 +514,11 @@ def rule_plan(instruction: str, summary: List[Dict[str, Any]], num_frames: int =
     if any(k in text for k in KEY_TURN) and tgt is not None:
         ops.append({"op": "turn", "track": tgt, "yaw_deg": 25.0, "start_frame": 0, "duration": 10})
     if any(k in text for k in KEY_REMOVE) and tgt is not None:
-        ops.append({"op": "remove", "track": tgt})
+        # "把 T:x 去掉阴影"里的"去掉"不是删车；已经有 shadow 操作时也不要再删车
+        _shadow_ctx = any(k in text for k in ("阴影", "影子")) or \
+            any(str(o.get("op")) == "shadow" for o in ops)
+        if not _shadow_ctx:
+            ops.append({"op": "remove", "track": tgt})
     return ops
 
 
@@ -302,12 +580,26 @@ def fill_insert_frames(ops: List[Dict[str, Any]], instruction: str = "",
     return ops
 
 
+def corner_scenario_help() -> str:
+    """给 LLM 的"可用事故场景 + 需要的 roles key"清单（从 corner_case 现取，避免写错名字）。"""
+    try:
+        import corner_case
+        out = []
+        for k, v in sorted((corner_case.SCENARIOS or {}).items()):
+            keys = ",".join([str(r.get("key")) for r in (v.get("roles") or [])])
+            out.append(f"{k}({keys})")
+        return "; ".join(out)
+    except Exception:  # noqa: BLE001
+        return "rear-end(attacker,victim); hard-brake(braker); lane-change-cutin(cutter)"
+
+
 def plan(tm, instruction: str, frame_idx: int = 0, num_frames: int = 30,
          new_role: str = NEW_ROLE_AUTO, fps: float = 10.0,
          max_frames: int = 600) -> Dict[str, Any]:
     summary = scene_summary(tm, frame_idx)
     txt = _llm_text(PLAN_PROMPT.format(scene=json.dumps(summary, ensure_ascii=False),
                                        instruction=instruction, frame=frame_idx,
+                                       scenarios=corner_scenario_help(),
                                        num_frames_minus1=max(0, num_frames - 1),
                                        fps=int(round(float(fps or 10.0))),
                                        max_frames=int(max_frames)))
@@ -316,12 +608,14 @@ def plan(tm, instruction: str, frame_idx: int = 0, num_frames: int = 30,
         warn: List[str] = []
         ops = sanitize_ops(tm, data["ops"], instruction, warnings=warn, new_role=new_role)
         if ops:
+            ops = _inject_insert_hints(ops, instruction, warnings=warn)
             ops = fill_insert_frames(ops, instruction, num_frames, fps=fps,
                                      max_frames=max_frames, base_frame=frame_idx)
             return {"source": "llm", "ops": ops, "raw": txt[:1200], "warnings": warn}
     warn = []
     ops = sanitize_ops(tm, rule_plan(instruction, summary, num_frames, fps=fps), instruction,
                        warnings=warn, new_role=new_role)
+    ops = _inject_insert_hints(ops, instruction, warnings=warn)
     ops = fill_insert_frames(ops, instruction, num_frames, fps=fps,
                              max_frames=max_frames, base_frame=frame_idx)
     if not txt:
@@ -335,6 +629,89 @@ def plan(tm, instruction: str, frame_idx: int = 0, num_frames: int = 30,
 def _smoothstep(t: float) -> float:
     t = max(0.0, min(1.0, float(t)))
     return t * t * (3.0 - 2.0 * t)
+
+
+_SIDE_REF_RE = re.compile(
+    r"(?:在|于|从|往)?\s*T?\s*[:：]?\s*(\d+)\s*"
+    r"(左前方|右前方|左后方|右后方|左侧|右侧|左边|右边|左道|右道|左|右)")
+
+
+def parse_lane_ref(text: str):
+    """解析"在 T4 左边/右侧…" → (track_id, lane_offset)；没写返回 (None, 0.0)。
+
+    `lane_offset` 是"目标车体系右侧为正"的横向偏移：`-3.5` = 在它左边一条车道。
+    """
+    m = _SIDE_REF_RE.search(str(text or ""))
+    if not m:
+        return None, 0.0
+    side = m.group(2)
+    return int(m.group(1)), (-3.5 if "左" in side else 3.5)
+
+
+def _inject_insert_hints(ops: List[Dict[str, Any]], instruction: str,
+                         warnings: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """把"与 T<id> 同向/对向""在 T<id> 左边/右侧"这类信息**补进 insert op**。
+
+    为什么要在 LLM 之后再做一遍：小模型经常漏填 `direction_ref/lane_ref`（实测），
+    漏填就会退化成"相对自车"的方向 → 用户说"与 T100000 同向"却生成出对向车。
+    这里用**指令原文**兜底，两个来源都缺才不填。
+    """
+    text = str(instruction or "")
+    has_ins = any(isinstance(o, dict) and str(o.get("op")) == "insert" for o in (ops or []))
+    if not has_ins:
+        return ops
+    ref, same, why = parse_direction_ref(text)
+    lref, loff = parse_lane_ref(text)
+
+    def _as_id(v):
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if iv != 0 else None
+
+    for o in (ops or []):
+        if not isinstance(o, dict) or str(o.get("op")) != "insert":
+            continue
+        # 指令里明写了"与 T<id> 同向/对向" → **以指令为准**（LLM 实测会填错，例如填成主车 900000）
+        if ref is not None:
+            if _as_id(o.get("direction_ref")) != int(ref):
+                if warnings is not None and o.get("direction_ref") is not None:
+                    warnings.append(
+                        "LLM 给的 direction_ref=%s 与指令里的『%s』不一致，已按指令改成 T:%d。"
+                        % (o.get("direction_ref"), why, int(ref)))
+                elif warnings is not None and why:
+                    warnings.append("已按指令『%s』把新车方向绑到 T:%d（避免方向搞反）。" % (why, int(ref)))
+                o["direction_ref"] = int(ref)
+            o["same_dir"] = bool(same)
+        # 车道参照：指令里的"在 T<id> 左/右侧"最优先，其次跟方向参照车同车道
+        if lref is not None:
+            if _as_id(o.get("lane_ref")) != int(lref):
+                o["lane_ref"] = int(lref)
+        elif ref is not None and _as_id(o.get("lane_ref")) != int(ref):
+            o["lane_ref"] = int(ref)
+        if abs(float(o.get("lane_offset") or 0.0)) < 1e-6 and lref is not None:
+            o["lane_offset"] = float(loff)
+        elif abs(float(o.get("lane_offset") or 0.0)) < 1e-6 and any(k in text for k in KEY_LANE):
+            # "变道撞击"没写左右 → 默认从目标车右侧一条车道切进来
+            o["lane_offset"] = 3.5
+    # "变道撞击 X"但 LLM 忘了给新车一条 lane_change → 按 lane_offset 反向补一条
+    want_lane = any(k in text for k in KEY_LANE)
+    crash = any(k in text for k in KEY_CRASH)
+    if want_lane and crash:
+        ins = next((o for o in (ops or []) if isinstance(o, dict) and str(o.get("op")) == "insert"), None)
+        if ins is not None:
+            has_lc = any(isinstance(o, dict) and str(o.get("op")) == "lane_change"
+                         and o.get("track") in (None, -1) for o in (ops or []))
+            if not has_lc:
+                loff2 = float(ins.get("lane_offset") or 3.5)
+                nf = int(ins.get("num_frames") or 30)
+                ops.append({"op": "lane_change", "track": None,
+                            "lateral": -loff2 if abs(loff2) > 1e-6 else -3.5,
+                            "start_frame": 0, "duration": max(4, int(nf * 0.35))})
+                if warnings is not None:
+                    warnings.append("指令里有『变道撞击』，已自动给新车补一条切进目标车道的 lane_change。")
+    return ops
 
 
 def _path_frames(tm, tid: int):
@@ -405,6 +782,15 @@ def sanitize_ops(tm, ops: List[Dict[str, Any]], instruction: str = "",
     # 1. 指令没让生成新车，就不要 insert
     if not any(k in text for k in KEY_INSERT):
         ops = [o for o in ops if str(o.get("op")) != "insert"]
+
+    # 1.2 指令里根本没提"撞/相撞/追尾/碰/别车"，模型却给了 collide → 幻觉，丢掉。
+    #     实测："让 T:0 减速到 3m/s" 被小模型顺手加了一条"主车撞 T:1"。
+    if ops and not (_KEY_CRASH_RE.search(text) or _EGO_RE.search(text) and "撞" in text):
+        kept = [o for o in ops if str(o.get("op")) != "collide"]
+        if len(kept) != len(ops):
+            if warnings is not None:
+                warnings.append("指令里没有提到相撞，模型给出的 collide 已忽略（避免误撞）。")
+            ops = kept
 
     # 1.5 主车不能被动"顺手"删掉：LLM 偶尔会给出 remove 900000。一旦执行，
     #     主车没了、相机也没了，整个场景就没法看了。只有指令**明确**提到
@@ -559,6 +945,29 @@ def sanitize_ops(tm, ops: List[Dict[str, Any]], instruction: str = "",
     cleaned: List[Dict[str, Any]] = []
     for o in ops:
         kind = str(o.get("op"))
+        # 扩展操作里"没有 track 字段"的几种要直接放行，否则会被下面"track 不存在就丢"的
+        # 通用规则误杀（extend/undo 根本没有 track；corner_case 的车辆在 roles 里）。
+        if kind in ("extend", "undo", "redo"):
+            cleaned.append(o)
+            continue
+        if kind == "corner_case":
+            raw = o.get("roles") if isinstance(o.get("roles"), dict) else {}
+            good = {}
+            for k, v in (raw or {}).items():
+                try:
+                    iv = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if _known(iv):
+                    good[str(k)] = iv
+            if not good:
+                if warnings is not None:
+                    warnings.append("事故场景『%s』里指定的车辆在场景里不存在，已跳过该操作。"
+                                    % (o.get("scenario") or o.get("scenario_type")))
+                continue
+            o["roles"] = good
+            cleaned.append(o)
+            continue
         if kind == "insert":
             # LLM 会把提示词里的 "ahead|oncoming|roadside" 原样抄下来（实测）→ 归一化
             mo = str(o.get("mode") or "").strip().lower()
@@ -1385,3 +1794,196 @@ def _op_collide(tm, op, fused=None):
         pass
     _save_snapshot()
     return out
+
+
+# ==================== 扩展操作：把"编辑 / 生成 / 事故生成 / 时间轴"都接到自然语言 ====================
+#
+# 轨迹类操作（speed / lane_change / turn / remove / collide / insert）沿用同一批 `_op_*`
+# 实现与 `fuse_collide_ops`，所以"只做轨迹编辑"时的行为与 apply_ops 完全一致；下面这些
+# 操作让同一句话还能驱动尺寸、阴影、重排、corner case、时间轴、撤销。
+# 顺序就是用户写（或 LLM 排）的顺序，不再分组执行，避免"延长帧数"落在"生成车辆"之后这类错位。
+
+def _op_scale(tm, op):
+    """缩放合成物体（等同 /api/edit/synthetic/scale）：factor 是相对"创建时基准尺寸"的倍数。"""
+    sid = int(op.get("track"))
+    s = tm.synthetic_tracks.get(sid)
+    if not s or not s.get("ply_path"):
+        return {"op": "scale", "ok": False, "track": sid, "error": "该物体不是可缩放的合成模型"}
+    factor = max(0.2, min(5.0, float(op.get("factor") or op.get("scale") or 1.0)))
+    base = float(s.get("base_scale", s.get("scale", 1.0)) or 1.0)
+    base_vec = s.get("base_scale_vec")
+    if base_vec is not None:
+        bv = np.asarray(base_vec, dtype=np.float32).reshape(3)
+        s["scale_vec"] = (bv * factor).astype(np.float32)
+        s["scale"] = float(np.cbrt(max(1e-9, float(s["scale_vec"].prod()))))
+    else:
+        s["scale"] = base * factor
+    s["fit"] = factor
+    bd = s.get("base_dimensions") or s.get("dimensions") or []
+    if len(bd) == 3:
+        s["dimensions"] = [round(max(0.05, float(x) * factor), 3) for x in bd]
+    tm._invalidate_heading_cache(sid)
+    return {"op": "scale", "ok": True, "track": sid, "factor": factor,
+            "scale": s["scale"], "dimensions": s.get("dimensions")}
+
+
+def _op_shadow(tm, op):
+    sid = int(op.get("track"))
+    s = tm.synthetic_tracks.get(sid)
+    if s is None:
+        return {"op": "shadow", "ok": False, "track": sid, "error": "该物体不是合成物体"}
+    s["shadow"] = bool(op.get("enabled", True))
+    tm._invalidate_heading_cache(sid)
+    return {"op": "shadow", "ok": True, "track": sid, "enabled": bool(s["shadow"])}
+
+
+def _op_replan(tm, op, fps: float = 10.0, num_frames: int = 30):
+    """把已有合成物体沿车道重新规划（等同 /api/text2entity/replan）。"""
+    sid = int(op.get("track"))
+    s = tm.synthetic_tracks.get(sid)
+    if not s or not s.get("ply_path"):
+        return {"op": "replan", "ok": False, "track": sid, "error": "该物体不是可重排的合成模型"}
+    try:
+        dims = list(tm.get_track_dimensions(sid))
+    except Exception:  # noqa: BLE001
+        dims = list(s.get("dimensions") or [])
+    plan = nl_entity.plan_collision_free(
+        tm, dims, ignore_id=sid, mode=str(op.get("mode") or "ahead"),
+        start_frame=int(op.get("start_frame") or 0),
+        num_frames=int(op.get("num_frames") or num_frames),
+        distance=float(op.get("distance") or 12.0),
+        lateral=float(op.get("lateral") or 0.0),
+        speed=float(op.get("speed") or 0.0), fps=float(fps))
+    if not plan.get("ok"):
+        return {"op": "replan", "ok": False, "track": sid,
+                "error": plan.get("reason") or "找不到无冲突的位置"}
+    try:
+        # 注意：set_track_trajectory 要的是 [(帧号, 位姿), ...] 列表（不是 dict）
+        tm.set_track_trajectory(sid, list(plan["poses"].items()))
+    except Exception as e:  # noqa: BLE001
+        return {"op": "replan", "ok": False, "track": sid, "error": str(e)}
+    tm._invalidate_heading_cache(sid)
+    return {"op": "replan", "ok": True, "track": sid,
+            "num_frames": len(plan.get("poses") or {}),
+            "mode": plan.get("mode"), "tried": len(plan.get("tried") or [])}
+
+
+def _op_corner_case(tm, op, fps: float = 10.0, num_frames: int = 30):
+    """生成 corner case 事故（等同 /api/corner_case/generate 的同一套引擎）。"""
+    import corner_case
+    scen = str(op.get("scenario") or op.get("scenario_type") or "").strip()
+    if scen not in corner_case.SCENARIOS:
+        low = scen.lower().replace("_", "-")
+        for k in corner_case.SCENARIOS:
+            if low and (low == k.lower() or low in k.lower() or k.lower() in low):
+                scen = k
+                break
+    if scen not in corner_case.SCENARIOS:
+        return {"op": "corner_case", "ok": False,
+                "error": "未知事故类型 '%s'；可用：%s"
+                         % (op.get("scenario"), ", ".join(sorted(corner_case.SCENARIOS)))}
+    need = [str(r.get("key")) for r in (corner_case.SCENARIOS[scen].get("roles") or [])]
+    raw = op.get("roles") if isinstance(op.get("roles"), dict) else {}
+    roles = {}
+    for k, v in (raw or {}).items():
+        kk = str(k)
+        if kk in need and v is not None:
+            try:
+                roles[kk] = int(v)
+            except (TypeError, ValueError):
+                pass
+    # 宽松兜底：LLM 有时给 attacker/victim，但该场景要 cutter/target → 按顺序填
+    if not roles:
+        vals = [int(v) for v in (raw or {}).values()
+                if str(v).lstrip("-").isdigit()]
+        for k, v in zip(need, vals):
+            roles[k] = int(v)
+    if not roles:
+        return {"op": "corner_case", "ok": False,
+                "error": "缺少 %s 场景需要的 roles：%s" % (scen, need)}
+    try:
+        res = corner_case.generate(tm, scen, roles,
+                                   int(op.get("start_frame") or 0),
+                                   int(op.get("num_frames") or num_frames),
+                                   intensity=float(op.get("intensity") or 1.0),
+                                   enable_physics=True, fps=float(fps))
+    except Exception as e:  # noqa: BLE001
+        return {"op": "corner_case", "ok": False, "scenario": scen, "roles": roles, "error": str(e)}
+    return {"op": "corner_case", "ok": True, "scenario": scen, "roles": roles,
+            "affected": res.get("affected_tracks"), "synthesized": res.get("synthesized_tracks"),
+            "collision_frame": res.get("collision_frame"),
+            "critical_frame": res.get("critical_frame"),
+            "collision_analysis": res.get("collision_analysis")}
+
+
+def _op_extend(tm, op):
+    n = int(op.get("extra_frames") or op.get("num_frames") or 30)
+    total = op.get("total_frames")
+    r = tm.extend_timeline(extra_frames=(None if total else n),
+                           total_frames=(int(total) if total else None),
+                           mode=str(op.get("mode") or "extrapolate"))
+    return {"op": "extend", "ok": True, "extra_frames": n,
+            "total_frames": (r or {}).get("total_frames")}
+
+
+def apply_ops_ext(tm, ops: List[Dict[str, Any]], fps: float = 10.0,
+                  num_frames: int = 30) -> List[Dict[str, Any]]:
+    """执行**全部**操作（轨迹编辑 + 尺寸/阴影/重排 + corner case + 时间轴 + 撤销）。
+
+    与 `apply_ops` 的区别只是"认识更多 op"，轨迹类的执行路径完全一致（同一批 `_op_*` +
+    同一个 `fuse_collide_ops`），所以两条入口不会给出互相矛盾的结果。
+    """
+    ops = [dict(o) for o in (ops or []) if isinstance(o, dict)]
+    fused_map = fuse_collide_ops(ops, num_frames=num_frames)
+    report: List[Dict[str, Any]] = []
+    for op in ops:
+        kind = str(op.get("op") or "")
+        try:
+            if kind == "collide":
+                a_key = op.get("a")
+                fused = fused_map.get(int(a_key)) if a_key is not None else None
+                res = _op_collide(tm, op, fused=fused)
+                for c in (fused or {}).get("consumed", []):
+                    res.setdefault("fused_ops", []).append(
+                        {"op": c.get("op"), "track": c.get("track")})
+                report.append(res)
+                continue
+            if op.get("_fused"):
+                report.append({"op": kind, "track": op.get("track"), "ok": True,
+                               "note": "已融合进 collide 的同一次仿真，不再单独执行"})
+                continue
+            if kind == "speed":
+                report.append(_op_speed(tm, op, fps))
+            elif kind == "lane_change":
+                report.append(_op_lane_change(tm, op))
+            elif kind == "turn":
+                report.append(_op_turn(tm, op))
+            elif kind == "remove":
+                tid = int(op["track"])
+                tm.delete_track(tid)
+                report.append({"op": kind, "track": tid, "ok": True})
+            elif kind == "insert":
+                report.append({"op": kind, "ok": True, "note": "由上层生成车辆处理"})
+            elif kind == "scale":
+                report.append(_op_scale(tm, op))
+            elif kind == "shadow":
+                report.append(_op_shadow(tm, op))
+            elif kind == "replan":
+                report.append(_op_replan(tm, op, fps=fps, num_frames=num_frames))
+            elif kind == "corner_case":
+                report.append(_op_corner_case(tm, op, fps=fps, num_frames=num_frames))
+            elif kind == "extend":
+                report.append(_op_extend(tm, op))
+            elif kind == "undo":
+                report.append({"op": kind, "ok": bool(tm.undo())})
+            elif kind == "redo":
+                report.append({"op": kind, "ok": bool(tm.redo())})
+            elif kind in ("replace", "render", "export"):
+                report.append({"op": kind, "ok": False,
+                               "error": "这类操作需要在对应面板里做"
+                                        "（替换需要点选/框选目标，导出需要参数）"})
+            else:
+                report.append({"op": kind, "ok": False, "error": "未知操作"})
+        except Exception as e:  # noqa: BLE001
+            report.append({"op": kind, "ok": False, "error": str(e)})
+    return report

@@ -536,6 +536,68 @@ def refine_vehicle_dims(dims, cat, tm, blend: float = 0.25,
     return out
 
 
+def _ref_pose_series(tm, tid: int, frames) -> Dict[int, np.ndarray]:
+    """取某条轨迹在指定帧的位姿（缺帧用相邻帧插值补齐、两端夹取）。"""
+    known = {}
+    for f in frames:
+        p = tm.get_track_pose(int(tid), int(f))
+        if p is not None:
+            known[int(f)] = np.asarray(p, dtype=np.float32)
+    if not known:
+        return {}
+    keys = sorted(known)
+    out = {}
+    for f in frames:
+        f = int(f)
+        if f in known:
+            out[f] = known[f]
+            continue
+        if f <= keys[0]:
+            out[f] = known[keys[0]]
+            continue
+        if f >= keys[-1]:
+            out[f] = known[keys[-1]]
+            continue
+        for f0, f1 in zip(keys[:-1], keys[1:]):
+            if f0 <= f <= f1:
+                a = (f - f0) / float(max(1, f1 - f0))
+                out[f] = np.asarray(tm.renderer._interp_pose(known[f0], known[f1], a),
+                                    dtype=np.float32)
+                break
+    return out
+
+
+def _ground_path(pts, up_sign, centers: Dict[int, np.ndarray],
+                 fallback_y: Dict[int, float], ref_gy=None):
+    """把一串 (x,z) 位置逐帧估地面高度 → 夹取 → 平滑。返回 (gys, n_sparse, n_fallback)。
+
+    `fallback_y[f]`：连"逐级放大邻域"都找不到点（真·场景外）时用的高度（通常是参照车底面）。
+    """
+    from track_manager import _ground_height_near, _smooth_series
+    gys: Dict[int, float] = {}
+    n_sparse = n_fallback = 0
+    for f in sorted(centers):
+        c = centers[f]
+        # 先用固定 6m 邻域探稠密程度：这一级失败说明已离开静态点密集区（用于给用户提示）
+        gy = _ground_height_near(pts, c, 6.0, up_sign, max_tries=1) if pts is not None else None
+        if gy is None:
+            gy = _ground_height_near(pts, c, 6.0, up_sign) if pts is not None else None
+            if gy is None:
+                gy = float(fallback_y.get(int(f), 0.0))
+                n_fallback += 1
+            else:
+                n_sparse += 1
+        if ref_gy is not None:
+            gy = max(ref_gy - 1.2, min(ref_gy + 1.2, float(gy)))
+        gys[int(f)] = float(gy)
+    if gys:
+        keys = sorted(gys)
+        sm = _smooth_series([gys[k] for k in keys], window=5)
+        for k, v in zip(keys, sm):
+            gys[k] = float(v)
+    return gys, n_sparse, n_fallback
+
+
 def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
                     num_frames: int = 20, distance: float = 12.0, lateral: float = 0.0,
                     speed: float = 0.0, direction_along_ego: bool = True,
@@ -581,9 +643,7 @@ def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
     frames = list(range(int(start_frame), int(start_frame) + int(num_frames)))
     centers: Dict[int, np.ndarray] = {}
     yaws: Dict[int, float] = {}
-    gys: Dict[int, float] = {}
-    n_fallback = 0
-    n_sparse = 0
+    fb_y: Dict[int, float] = {}
     for i, f in enumerate(frames):
         s = s0 + float(distance) + sign * float(speed) * (i / max(1e-6, fps))
         p, t = lane.point_tangent(s)
@@ -596,29 +656,11 @@ def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
             yaw += math.pi
         right = np.array([math.cos(yaw), 0.0, -math.sin(yaw)])
         c = np.array([p[0], 0.0, p[2]], dtype=np.float64) + right * lat
-        # 先用"固定 6m 邻域"探一下稠密程度：这一级失败说明轨迹已经离开静态点密集区
-        # （4DGS 静态点只覆盖相机看过的地方），用于给用户提示"这一段背景会偏空"。
-        gy = _ground_height_near(pts, c, 6.0, up_sign, max_tries=1) if pts is not None else None
-        if gy is None:
-            gy = _ground_height_near(pts, c, 6.0, up_sign) if pts is not None else None
-            if gy is None:
-                # 连放大到 96m 都没有点 → 真·场景外：用自车车体**底面**高度当路面
-                # （而不是车体中心！车体中心比路面高半个车高，会让物体浮空）
-                gy = float(p[1]) - up_sign * (float(ego_h) / 2.0)
-                n_fallback += 1
-            else:
-                n_sparse += 1
-        if ref_gy is not None:
-            gy = max(ref_gy - 1.2, min(ref_gy + 1.2, float(gy)))
         centers[int(f)] = c
         yaws[int(f)] = float(yaw)
-        gys[int(f)] = float(gy)
-    # 逐帧地面高度做滑动平均，避免"路面估计在相邻帧跳 ±5cm"导致车体抖动
-    if gys:
-        keys = sorted(gys)
-        sm = _smooth_series([gys[k] for k in keys], window=5)
-        for k, v in zip(keys, sm):
-            gys[k] = float(v)
+        # 场景覆盖外时的兜底高度 = 自车车体**底面**（不是车体中心！中心会让物体浮空半个车高）
+        fb_y[int(f)] = float(p[1]) - up_sign * (float(ego_h) / 2.0)
+    gys, n_sparse, n_fallback = _ground_path(pts, up_sign, centers, fb_y, ref_gy)
     poses: Dict[int, np.ndarray] = {}
     for f in sorted(centers):
         c = centers[f].copy()
@@ -632,6 +674,224 @@ def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
             "ground_sparse_total": int(n_fallback + n_sparse),
             "ground_y_min": (min(gys.values()) if gys else None),
             "ground_y_max": (max(gys.values()) if gys else None)}
+
+
+def _smooth_route(cs_raw, fwd_raw, window: int = 5):
+    """把一条**可能很抖**的轨迹整理成"平滑的行驶路线"。
+
+    为什么必须做：真实轨迹（尤其稀疏/误检的）会来回折返——参照车自己在 z∈[46,58] 之间反复跳，
+    直接沿它铺轨迹，新车的弧长坐标就会跳（实测新物体位置在几帧内来回摆 10m+）。
+    做法：位置与航向各做一次滑动平均，再**沿平滑航向只允许前进**（步长取前向投影、最小 0.05m）
+    重建路线。这样"路线"是单调的，转弯也保留。
+    """
+    n = len(cs_raw)
+    if n < 2:
+        return list(cs_raw), list(fwd_raw), [0.0] * max(0, n - 1)
+    arr = np.array([np.asarray(c, dtype=np.float64).reshape(3) for c in cs_raw])
+    far = np.array([np.asarray(f, dtype=np.float64).reshape(3) for f in fwd_raw])
+    half = max(0, int(window) // 2)
+    sm = arr.copy()
+    fs = far.copy()
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        sm[i] = arr[lo:hi].mean(axis=0)
+        v = far[lo:hi].mean(axis=0)
+        nv = float(np.linalg.norm(v))
+        fs[i] = v / nv if nv > 1e-6 else far[i]
+    route = [sm[0].copy()]
+    steps = [0.0]
+    for i in range(1, n):
+        d = sm[i] - sm[i - 1]
+        step = float(np.dot(d[[0, 2]], fs[i][[0, 2]]))
+        if not np.isfinite(step) or step < 0.05:
+            step = 0.05          # 不允许"倒着走"（抖动/倒车都会让路线来回折）
+        route.append(route[-1] + fs[i] * step)
+        steps.append(float(step))
+    return route, [f for f in fs], steps
+
+
+def plan_relative_trajectory(tm, dims, *, ref_track: int, same_dir: bool = True,
+                            lane_offset: float = 0.0, distance: float = 12.0,
+                            speed: float = 0.0, start_frame: int = 0,
+                            num_frames: int = 20, impact_frame: Optional[int] = None,
+                            flip: bool = False, fps: float = 10.0) -> Dict[str, Any]:
+    """**以参照车自己的轨迹为基准**给新物体铺轨迹（"与 T:X 同向/对向行驶"）。
+
+    为什么不能复用 plan_trajectory：那一套只懂"相对自车"的 ahead/oncoming；用户说
+    "与 T100000 同向"时它只能猜，实测就猜成了对向。这里直接把新物体铺在参照车走过的
+    那条路上：
+
+    * `same_dir=True`：跟在参照车**后面**同向行驶，前后间距从 `distance` 收到"刚好接触"，
+      撞击发生在 `impact_frame`；
+    * `same_dir=False`：在参照车**前方**迎面上来（沿同一条路反向），同样在 `impact_frame`
+      收到接触；
+    * 横向 = 参照车右向量 × `lane_offset`：`3.5 / -3.5` 就是"旁边一条车道"，
+      再配一条 `lane_change`（切进参照车车道）就是"变道撞击"。
+
+    这样方向、车道、转弯几何都自动跟参照车一致（它转弯，新物体也沿同一条弯道走）。
+    """
+    from track_manager import _ground_height_near  # noqa: F401  (保持与其他规划器一致)
+    frames = list(range(int(start_frame), int(start_frame) + int(num_frames)))
+    ref_poses = _ref_pose_series(tm, int(ref_track), frames)
+    if len(ref_poses) < 3:
+        return {"ok": False, "reason": f"参照车 T:{ref_track} 在这段帧里没有可用轨迹"}
+    pts, up_sign = _ground_setup(tm)
+    ref_gy = None
+    if pts is not None and len(pts):
+        ref_gy = float(np.percentile(pts[:, 1], 55.0 if up_sign < 0 else 45.0))
+
+    ks = sorted(ref_poses)
+    _cs_raw = [np.asarray(ref_poses[k], dtype=np.float64)[:3, 3].copy() for k in ks]
+    _fwd_raw = []
+    for p in (np.asarray(ref_poses[k], dtype=np.float64) for k in ks):
+        f = p[:3, 2].copy()
+        f[1] = 0.0
+        n = float(np.linalg.norm(f))
+        _fwd_raw.append(f / n if n > 1e-6 else np.array([0.0, 0.0, 1.0]))
+    # 参照车轨迹可能很抖（稀疏/误检）→ 先整理成单调、平滑的"路线"再沿它铺轨迹
+    cs, fwd, _steps = _smooth_route(_cs_raw, _fwd_raw, window=5)
+    arc = [0.0]
+    for i in range(1, len(cs)):
+        arc.append(arc[-1] + float(_steps[i]))
+    total = float(arc[-1])
+    # 路线"抖动程度"：原始折线长度 / 平滑后路线长度。>1.6 说明参照车轨迹来回折得厉害
+    # （稀疏/误检），生成出来的路线只能以平滑版为准，得让用户知道。
+    _raw_len = 0.0
+    for i in range(1, len(_cs_raw)):
+        _raw_len += float(np.linalg.norm((_cs_raw[i] - _cs_raw[i - 1])[[0, 2]]))
+    route_roughness = float(_raw_len / max(1e-6, total))
+
+    n = len(ks)
+    dt = 1.0 / max(1e-6, float(fps))
+    if impact_frame is None:
+        imp_i = max(1, int(round(0.6 * (n - 1))))
+    else:
+        imp_i = int(np.clip(int(impact_frame) - int(start_frame), 1, n - 1))
+    # 参照车尺寸 → 接触时的中心距（车头贴车尾）
+    try:
+        rd = list(tm.get_track_dimensions(int(ref_track)))
+    except Exception:  # noqa: BLE001
+        rd = None
+    ref_len = float(rd[2]) if rd and len(rd) == 3 else 4.6
+    contact_gap = 0.5 * (float(dims[2]) + ref_len) + 0.35
+    gap0 = max(float(distance), contact_gap + 1.5)
+
+    def _point_forward(a: float):
+        a = float(a)
+        # 超出折线两端就沿着端点的方向**线性外推**（同向跟在后面时 a 会是负的；
+        # 直接 clamp 到 0 会让新车贴在参照车起点上，等于没有车距）
+        if a < 0.0:
+            return cs[0] + fwd[0] * a, fwd[0]
+        if a > total:
+            return cs[-1] + fwd[-1] * (a - total), fwd[-1]
+        lo = 0
+        for i in range(1, len(arc)):
+            if arc[i] >= a - 1e-9:
+                lo = i - 1
+                break
+        seg = max(1e-9, arc[lo + 1] - arc[lo])
+        u = (a - arc[lo]) / seg
+        c = cs[lo] * (1.0 - u) + cs[lo + 1] * u
+        f = fwd[lo] * (1.0 - u) + fwd[lo + 1] * u
+        nn = float(np.linalg.norm(f))
+        return c, (f / nn if nn > 1e-6 else fwd[lo])
+
+    A0 = float(arc[imp_i]) + gap0          # 对向：起始弧长（在参照车前方）
+    centers: Dict[int, np.ndarray] = {}
+    yaws: Dict[int, float] = {}
+    fb_y: Dict[int, float] = {}
+    for i, f in enumerate(ks):
+        if same_dir:
+            t = min(1.0, i / float(max(1, imp_i)))
+            gap = gap0 + (contact_gap - gap0) * t
+            a = arc[i] - (contact_gap if i > imp_i else gap)
+        else:
+            t = min(1.0, i / float(max(1, imp_i)))
+            a = A0 + (float(arc[imp_i]) - A0) * t
+        c, fw = _point_forward(a)
+        yaw = math.atan2(float(fw[0]), float(fw[2]))
+        if not same_dir:
+            yaw += math.pi
+        if flip:
+            yaw += math.pi
+        right = np.array([math.cos(yaw), 0.0, -math.sin(yaw)])
+        centers[int(f)] = c + right * float(lane_offset)
+        yaws[int(f)] = float(yaw)
+        # 兜底高度：参照车在该点的**底面**（同样不能用车体中心）
+        ref_h = float(rd[1]) if rd and len(rd) == 3 else 1.5
+        fb_y[int(f)] = float(c[1]) - up_sign * (ref_h / 2.0)
+    gys, n_sparse, n_fallback = _ground_path(pts, up_sign, centers, fb_y, ref_gy)
+    # 参照车路线上如果点云估计和"参照车自己实际行驶高度"差了 0.35m 以上（覆盖稀疏、或远处
+    # 有树/建筑被当成路面），就以**参照车自己的底面**为准（新车跑在同一条路上，理应一样高）；
+    # 但参照车自己的 y 也可能被外推成离谱值，所以先夹在"全局路面中位 ±0.6m"以内。
+    from track_manager import _smooth_series
+    lo_b = (float(ref_gy) - 0.6) if ref_gy is not None else None
+    hi_b = (float(ref_gy) + 0.6) if ref_gy is not None else None
+    n_adj = 0
+    for f in sorted(gys):
+        rb = fb_y.get(int(f))
+        if rb is None:
+            continue
+        rb = float(rb)
+        if lo_b is not None:
+            rb = max(lo_b, min(hi_b, rb))
+        if abs(float(gys[f]) - rb) > 0.35:
+            gys[f] = rb
+            n_adj += 1
+    _ks = sorted(gys)
+    _sm = _smooth_series([gys[k] for k in _ks], window=5)
+    for _k, _v in zip(_ks, _sm):
+        gys[_k] = float(_v)
+    poses: Dict[int, np.ndarray] = {}
+    for f in sorted(centers):
+        c = centers[f].copy()
+        c[1] = float(gys[f]) + up_sign * (float(dims[1]) / 2.0)
+        poses[int(f)] = _yaw_pose(c.astype(np.float32), yaws[f])
+    # 实测平均速度（用于回执/报告）
+    spd = 0.0
+    kk = sorted(poses)
+    if len(kk) >= 2:
+        d = np.linalg.norm((np.asarray(poses[kk[-1]], dtype=np.float64)[:3, 3]
+                            - np.asarray(poses[kk[0]], dtype=np.float64)[:3, 3])[[0, 2]])
+        spd = float(d / max(1e-6, (kk[-1] - kk[0]) * dt))
+    return {"ok": bool(poses), "poses": poses, "mode": "relative",
+            "direction_ref": int(ref_track), "same_dir": bool(same_dir),
+            "lateral": float(lane_offset), "distance": float(distance), "speed": spd,
+            "up_sign": up_sign, "impact_frame": int(start_frame) + int(imp_i),
+            "contact_gap": float(contact_gap), "ref_arc_total": total,
+            "route_roughness": round(float(route_roughness), 2),
+            "ground_ref": ref_gy, "ground_fallback_frames": int(n_fallback),
+            "ground_sparse_frames": int(n_sparse),
+            "ground_ref_adjusted": int(n_adj),
+            "ground_sparse_total": int(n_fallback + n_sparse),
+            "ground_y_min": (min(gys.values()) if gys else None),
+            "ground_y_max": (max(gys.values()) if gys else None)}
+
+
+def plan_relative_collision_free(tm, dims, *, ref_track: int, ignore_id: Optional[int] = None,
+                                 **kw) -> Dict[str, Any]:
+    """`plan_relative_trajectory` 的无冲突版本：横向/前后各试几个候选。"""
+    base_lat = float(kw.get("lane_offset", 0.0))
+    base_dist = float(kw.get("distance", 12.0))
+    tried = []
+    for dlat in (0.0, 1.2, -1.2, -3.5, 3.5):
+        for ddist in (0.0, 4.0, -2.0, 8.0):
+            kw2 = dict(kw)
+            kw2["lane_offset"] = base_lat + dlat
+            kw2["distance"] = max(4.0, base_dist + ddist)
+            plan = plan_relative_trajectory(tm, dims, ref_track=int(ref_track), **kw2)
+            if not plan.get("ok"):
+                continue
+            conf = find_conflicts(tm, plan["poses"], dims,
+                                  ignore_id=ref_track if ignore_id is None else ignore_id)
+            tried.append({"lane_offset": round(kw2["lane_offset"], 2),
+                          "distance": round(kw2["distance"], 2),
+                          "n_conflicts": len(conf)})
+            if not conf:
+                plan["conflicts"] = []
+                plan["tried"] = tried
+                return plan
+    return {"ok": False, "reason": "参照车附近找不到无冲突的位置", "tried": tried}
 
 
 def find_conflicts(tm, poses: Dict[int, np.ndarray], dims, *, margin: float = 0.15,
