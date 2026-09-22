@@ -1035,7 +1035,7 @@ START_IDX=110 bash build_scene.sh 017    # 从第 110 帧起
 bash build_scene.sh 017 018 005          # 多个场景依次建
 ```
 
-给**所有** processed 场景一次性补齐标记图（使每个场景都和 005/017/018 一样齐）：
+给**所有** processed 场景一次性补齐标记图：
 
 ```bash
 bash fill_all_masks.sh                   # 只补缺的；--overwrite 全部重做
@@ -1049,6 +1049,29 @@ python tools/mask_status.py              # 看每个场景的齐备情况
 * 别把分组数变量叫 `GROUPS` —— 那是 bash 的**内置只读变量**（当前用户的组 ID 列表），
   赋值会静默失败，导致分组循环一次都不执行，而 `fail=0` 又把它伪装成"成功"。
   脚本里改叫 `N_GROUPS`，并加了"一组都没起来就报错"的守卫。
+
+**产出与 inode 取舍**（`/autodl-fs/data` 只有 20 万 inode 上限，这里必须算清楚）：
+每个场景的那套标记图，每张图片要占 **5 个真实 inode**（`sky_masks`、`custom_masks`、
+`dynamic_masks/{vehicle,human}`、`fine_dynamic_masks/all`；后两者与
+`fine_dynamic_masks/{vehicle,human}` 用硬链接共享，不额外占）。25 个场景 × 990 张 ≈
+需要 10.3 万 inode。所以对**新增的 21 个场景**只写其中 3 个：
+
+| 目录 | 是否写 | 原因 |
+| --- | --- | --- |
+| `sky_masks/` | ✅ | `dataset.py` mode 2 **无条件**要读，缺了直接 IndexError |
+| `fine_dynamic_masks/all` | ✅ | mode 2 区分动/静必需 |
+| `custom_masks/` | ✅ | 上面两样的**来源**，重跑 SegFormer 要 3 小时，必须留下 |
+| `dynamic_masks/{vehicle,human}` | ⬜ | 纯重复：内容完全包含在 `custom_masks` 里 |
+| `fine_dynamic_masks/{human,vehicle}` | ⬜ | 同上（与 `dynamic_masks/` 是硬链接关系） |
+
+后两个随时可以补（每个场景约 1 分钟，25 个场景约 20 分钟）：
+
+```bash
+python datasets/tools/derive_dynamic_masks.py \
+    --data_root data/waymo14/processed/validation --workers 8   # 去掉 --minimal 即写全套
+```
+
+005/016/017/018 是在 inode 还宽裕时做的，**是完整 7 个目录**。
 
 拆开看就是三步：
 

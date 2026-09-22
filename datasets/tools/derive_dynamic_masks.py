@@ -77,19 +77,28 @@ def _link_or_copy(src: str, dst: str):
 
 
 def _one(args):
-    """处理单张语义掩码 → 写 3 个真实文件 + 2 个硬链接。"""
-    f, rv, rh, fa, fv, fh, overwrite = args
+    """处理单张语义掩码。
+
+    `minimal=True` 时**只**写 `fine_dynamic_masks/all`（DGGT 唯一真正读的那份），
+    不写 `dynamic_masks/{vehicle,human}` 与 `fine_dynamic_masks/{human,vehicle}` ——
+    它们的信息完全包含在 `custom_masks` 里，属于纯重复、随时可重建，但要多占
+    `2 × 帧数 × 相机数` 个 inode（25 个场景约 41,000 个），inode 紧张时留给它们不值。
+    """
+    f, rv, rh, fa, fv, fh, overwrite, minimal = args
     base = os.path.splitext(os.path.basename(f))[0]
-    p_rv, p_rh, p_fa = (os.path.join(rv, base + '.png'), os.path.join(rh, base + '.png'),
-                        os.path.join(fa, base + '.png'))
-    if not overwrite and all(os.path.exists(p) for p in (p_rv, p_rh, p_fa)):
-        return 0
+    p_fa = os.path.join(fa, base + '.png')
+    p_rv, p_rh = os.path.join(rv, base + '.png'), os.path.join(rh, base + '.png')
+    if not overwrite:
+        if os.path.exists(p_fa) and (minimal or (os.path.exists(p_rv) and os.path.exists(p_rh))):
+            return 0
     m = _read_mask(f)
     veh = np.isin(m, VEHICLE_VALUES)
     hum = np.isin(m, HUMAN_VALUES)
+    _write_mask(p_fa, np.logical_or(veh, hum))
+    if minimal:
+        return 1
     _write_mask(p_rv, veh)
     _write_mask(p_rh, hum)
-    _write_mask(p_fa, np.logical_or(veh, hum))
     _link_or_copy(p_rv, os.path.join(fv, base + '.png'))
     _link_or_copy(p_rh, os.path.join(fh, base + '.png'))
     return 1
@@ -102,6 +111,8 @@ def main():
                     help='不填就是对 data_root 下所有场景')
     ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--overwrite', action='store_true')
+    ap.add_argument('--minimal', action='store_true',
+                    help='只写 fine_dynamic_masks/all（省 inode；其余可由 custom_masks 随时重建）')
     args = ap.parse_args()
 
     root = args.data_root
@@ -125,7 +136,7 @@ def main():
             os.makedirs(d, exist_ok=True)
         files = sorted(glob.glob(os.path.join(cm_dir, '*.png')))
         jobs = [(f, paths['rv'], paths['rh'], paths['fa'], paths['fv'], paths['fh'],
-                 args.overwrite) for f in files]
+                 args.overwrite, args.minimal) for f in files]
         n = 0
         if args.workers > 1 and len(jobs) > 64:
             with ProcessPoolExecutor(max_workers=args.workers) as ex:

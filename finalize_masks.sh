@@ -18,9 +18,9 @@ if grep -q FAIL /tmp/fill_masks/seg_done_* 2>/dev/null; then
     echo "SEG_FAIL" > /tmp/fill_masks_done
     exit 1
 fi
-echo "[finalize] 派生动态掩码 $(date +%T)" >> /tmp/fill_masks/finalize.log
+echo "[finalize] 派生动态掩码（--minimal：只写 fine_dynamic_masks/all）$(date +%T)" >> /tmp/fill_masks/finalize.log
 /root/autodl-tmp/conda_envs/dggt/bin/python datasets/tools/derive_dynamic_masks.py \
-    --data_root data/waymo14/processed/validation --workers 8 >> /tmp/fill_masks/derive.log 2>&1
+    --data_root data/waymo14/processed/validation --workers 8 --minimal >> /tmp/fill_masks/derive.log 2>&1
 rc=$?
 echo "[finalize] 派生 rc=$rc $(date +%T)" >> /tmp/fill_masks/finalize.log
 if [ "$rc" -ne 0 ]; then echo "DERIVE_FAIL" > /tmp/fill_masks_done; exit 1; fi
