@@ -1031,9 +1031,24 @@ python studio/backend/waymo_map.py \
 
 ```bash
 bash build_scene.sh 017                  # 默认 START_IDX=0 / SEQ=25
-START_IDX=100 bash build_scene.sh 017    # 换起始帧
+START_IDX=110 bash build_scene.sh 017    # 从第 110 帧起
 bash build_scene.sh 017 018 005          # 多个场景依次建
 ```
+
+给**所有** processed 场景一次性补齐标记图（使每个场景都和 005/017/018 一样齐）：
+
+```bash
+bash fill_all_masks.sh                   # 只补缺的；--overwrite 全部重做
+python tools/mask_status.py              # 看每个场景的齐备情况
+```
+
+`fill_all_masks.sh` 把场景分成 3 组并行跑 SegFormer，跑完自动派生动态掩码。两个坑（都已处理）：
+
+* **多个进程同时初始化 CUDA 上下文会互相卡死**（实测都卡在 `init_segmentor`，
+  显存不涨、也没有任何产出）。所以三组必须**错开启动**（`seg_group_runner.sh` 的延时参数）。
+* 别把分组数变量叫 `GROUPS` —— 那是 bash 的**内置只读变量**（当前用户的组 ID 列表），
+  赋值会静默失败，导致分组循环一次都不执行，而 `fail=0` 又把它伪装成"成功"。
+  脚本里改叫 `N_GROUPS`，并加了"一组都没起来就报错"的守卫。
 
 拆开看就是三步：
 
@@ -1068,6 +1083,19 @@ python studio/backend/waymo_map.py --scene output/waymo_eval_14/005/005 \
   当名字，既让目录名对不上，也会让 scale recovery 去读别的段落 —— 已修；
 * 选窗口看自车速度：`data/waymo14/processed/validation/<NNN>/ego_pose/` 相邻帧间距的中位数
   就是每帧位移。拿一段停着不动的帧建出来的场景没有动态物体可用。
+
+**关于 `images_4/`（已移除，可按需重建）**：它是 1/4 下采样图，**没有任何代码读它**
+（`datasets/dataset.py` 只读 `images/`），但每个场景占约 990 个 inode。
+`/autodl-fs/data` 有 20 万 inode 上限，为了给全部 25 个场景补上标记图，这些 inode 被腾了出来。
+需要时按需重建：
+
+```bash
+python datasets/tools/regen_images_4.py                      # 缺的才补
+python datasets/tools/regen_images_4.py --scenes 017 --overwrite
+```
+
+派生动态掩码时，`dynamic_masks/{vehicle,human}` 与 `fine_dynamic_masks/{vehicle,human}`
+内容完全相同，所以后者用**硬链接**指向前者 —— 每个场景省约 1980 个 inode（25 个场景 ≈ 49,500 个）。
 
 第 2 步的 `datasets/tools/derive_dynamic_masks.py` 解决的是：上游
 `extract_masks.py --process_dynamic_mask` 需要另一套 2D 检测器产出的
