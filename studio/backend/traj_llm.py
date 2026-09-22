@@ -2085,11 +2085,60 @@ def _op_corner_case(tm, op, fps: float = 10.0, num_frames: int = 30):
 def _op_extend(tm, op):
     n = int(op.get("extra_frames") or op.get("num_frames") or 30)
     total = op.get("total_frames")
+    # 延长前后的帧数，用来只检查"新长出来的那一段"
+    before_total = int(getattr(tm, "num_frames", 0) or 0)
     r = tm.extend_timeline(extra_frames=(None if total else n),
                            total_frames=(int(total) if total else None),
                            mode=str(op.get("mode") or "extrapolate"))
-    return {"op": "extend", "ok": True, "extra_frames": n,
-            "total_frames": (r or {}).get("total_frames")}
+    after_total = int((r or {}).get("total_frames") or getattr(tm, "num_frames", 0) or 0)
+    out = {"op": "extend", "ok": True, "extra_frames": n,
+           "total_frames": after_total}
+    # 道路约束：外推是"沿各自惯性"推的，没有任何道路概念 —— 推得越长越容易飘出车道。
+    # 这里只体检并如实提示（不改几何：外推出来的轨迹该是什么样就是什么样）。
+    try:
+        rc = _road_check_extended(tm, before_total, after_total)
+        if rc:
+            out["road_constraint"] = rc
+    except Exception as e:  # noqa: BLE001
+        print(f'[road_rules] 外推段道路体检失败: {e}')
+    return out
+
+
+def _road_check_extended(tm, from_frame: int, to_frame: int):
+    """只检查新外推出来的那一段有没有跑出车道走廊（给用户提示用）。"""
+    rm = _road_model_for(tm)
+    if rm is None or to_frame <= from_frame:
+        return None
+    frames = list(range(int(from_frame), int(to_frame)))
+    if len(frames) < 3:
+        return None
+    # 只抽查几辆"有轨迹"的车，别把上百个物体全体检一遍
+    try:
+        objs = tm.get_frame_objects(int(from_frame)) or []
+    except Exception:  # noqa: BLE001
+        return None
+    out = {}
+    for o in objs[:6]:
+        tid = int(o.get("track_id"))
+        centers = {}
+        for f in frames:
+            try:
+                P = tm.get_track_pose(tid, int(f))
+            except Exception:  # noqa: BLE001
+                P = None
+            if P is not None:
+                centers[int(f)] = np.asarray(P, dtype=np.float64)[:3, 3]
+        if len(centers) < 3:
+            continue
+        rep = rm.on_road_report(centers)
+        if rep.get('issues'):
+            out['T:%d' % tid] = {'on_road_ratio': rep.get('on_road_ratio'),
+                                 'dist_med_m': rep.get('dist_med_m'),
+                                 'issues': rep['issues']}
+    if out:
+        out['note'] = ('延长出来的帧是按各自惯性外推的，没有道路概念；上面这些车已经飘出'
+                       '车道走廊。要么少延长一些，要么用语言编辑把它们拉回车道。')
+    return out or None
 
 
 def apply_ops_ext(tm, ops: List[Dict[str, Any]], fps: float = 10.0,
