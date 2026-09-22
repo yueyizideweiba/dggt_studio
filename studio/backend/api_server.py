@@ -72,6 +72,7 @@ studio_state = {
     "edit_history": {},  # 编辑历史
     "preview_tasks": {},  # 预览任务
     "scene_maps": {},     # 场景ID -> waymo 地图（场景系，含对齐结果）；None 表示该场景没有地图
+    "scene_map_notes": {},  # 场景ID -> 地图不可用的原因（给前端提示用）
 }
 
 
@@ -225,20 +226,31 @@ def get_scene_map(scene_id: str, refresh: bool = False):
     if scene_id in studio_state["scene_maps"]:
         return studio_state["scene_maps"][scene_id]
     m = None
+    note = None
     try:
         renderer = studio_state["scenes"].get(scene_id)
         scene_path = getattr(renderer, "scene_path", None) if renderer is not None else None
         if scene_path:
             m = waymo_map.load_scene_map(scene_path)
+            ok, reasons = waymo_map.quality_ok(m)
+            if not ok:
+                note = "地图对齐质量不达标，已拒绝使用：" + "；".join(reasons)
+                print(f"[waymo_map] {scene_id} {note}")
+                m = None
     except Exception as e:  # noqa: BLE001
         print(f"[waymo_map] 场景 {scene_id} 地图不可用: {e}")
         m = None
+        note = f"地图加载/对齐失败：{e}"
     studio_state["scene_maps"][scene_id] = m
+    studio_state["scene_map_notes"][scene_id] = note
     return m
 
 
 def map_unavailable_reason(scene_id: str) -> str:
     """地图取不到时给出人类可读的原因（供前端提示）。"""
+    note = (studio_state.get("scene_map_notes") or {}).get(scene_id)
+    if note:
+        return note
     renderer = studio_state["scenes"].get(scene_id)
     if renderer is None:
         return "场景未加载"
@@ -1109,17 +1121,21 @@ def _draw_topdown_map(image, map_d, cam, max_dist: float = 160.0):
 
 
 def _scene_map_cached(scene_path: str):
-    """按场景目录取地图（与按 scene_id 取等价，供渲染函数使用）。"""
+    """按场景目录取地图（与按 scene_id 取等价，供渲染函数使用）。质量不达标一律返回 None。"""
     if not scene_path:
         return None
     for sid, r in studio_state["scenes"].items():
         if getattr(r, "scene_path", None) == scene_path:
             return get_scene_map(sid)
     try:
-        return waymo_map.load_scene_map(scene_path)
+        m = waymo_map.load_scene_map(scene_path)
+        ok, reasons = waymo_map.quality_ok(m)
+        if not ok:
+            print('[waymo_map] %s 地图对齐质量不达标，跳过叠加：%s' % (scene_path, '；'.join(reasons)))
+            return None
+        return m
     except Exception:  # noqa: BLE001
         return None
-
 
 def _topdown_bounds(tm, renderer, start_frame: int, num_frames: int, focus_tracks=None):
     """俯视相机的取景范围。

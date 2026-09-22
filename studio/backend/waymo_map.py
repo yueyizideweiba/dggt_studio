@@ -463,6 +463,31 @@ def load_scene_map(scene_dir: str, proc_dir: Optional[str] = None,
             c = to_scene(align, f['polygon']).mean(0)
             anchors.append({'kind': 'speed_bump', 'at': c.tolist()})
 
+    # ---- 质量闸门 ----
+    # 老场景没有 scene_meta.json，帧对应关系是猜的；一旦猜错，拟合出来的相似变换会把地图
+    # 甩到几百万米外。这种"看似有地图、其实是错的"必须挡住：宁可说"该场景没有可用地图"，
+    # 也不能给用户画一张错的底图。
+    reasons: List[str] = []
+    if not align.get('scale_ok'):
+        reasons.append('米制尺度不一致（拟合尺度 %.3f，应≈1）' % float(align.get('s') or 0.0))
+    if float(align.get('rms') or 0.0) > 1.0:
+        reasons.append('位置残差 %.2fm 过大' % float(align.get('rms') or 0.0))
+    eg = align.get('ego_lane_med_m')
+    if eg is not None and float(eg) > 3.5:
+        reasons.append('自车离最近车道中心线中位 %.2fm，对齐可疑' % float(eg))
+    span = 0.0
+    if polylines:
+        try:
+            allp = np.concatenate([np.asarray(it['pts'], dtype=np.float64) for it in polylines], axis=0)
+            span = float(max(allp[:, 0].ptp(), allp[:, 2].ptp()))
+        except Exception:  # noqa: BLE001
+            span = 0.0
+    align['map_span_m'] = span
+    if span > 2000.0:
+        reasons.append('变换后的地图跨度 %.0fm 异常（场景与地图很可能不是同一段数据；'
+                       '老场景缺 scene_meta.json 时会退化成猜帧对应关系）' % span)
+    align['quality'] = {'ok': len(reasons) == 0, 'reasons': reasons, 'map_span_m': span}
+
     out = {
         'scene_dir': scene_dir, 'processed_dir': proc,
         'segment': meta.get('segment'), 'meta': meta,
@@ -694,7 +719,13 @@ def _overlay(map_d, scene_dir, out_png, size=1500, scale_px=6.0, cam=0):
     return out_png
 
 
-def _ego_to_lane_stats(map_d, scene_dir, cam=0) -> Dict[str, float]:
+def quality_ok(map_d) -> Tuple[bool, List[str]]:
+    """对齐质量是否可信；不可信时返回原因列表（调用方据此拒绝使用这张地图）。"""
+    q = ((map_d or {}).get('align') or {}).get('quality') or {}
+    return bool(q.get('ok', True)), list(q.get('reasons') or [])
+
+
+def _scene_pts_stats(map_d, scene_dir, cam=0) -> Dict[str, float]:
     ts, fids, mats, gfids = _scene_cam_poses(scene_dir)
     ds = []
     for M in mats:
@@ -726,9 +757,13 @@ def main():
     print('模型相机朝向跨帧一致性(诊断,不参与求解) = %.2f°（中位）' % (al.get('rot_spread_med_deg') or 0))
     if al.get('warning'):
         print('   警告: %s' % al['warning'])
+    q = (al.get('quality') or {})
+    print('质量闸门 = %s%s' % ('通过' if q.get('ok') else '不通过',
+                              ('：' + '；'.join(q.get('reasons') or [])) if not q.get('ok') else ''))
     print('地图     = %s' % json.dumps(m['counts'], ensure_ascii=False))
-    st = _ego_to_lane_stats(m, m['scene_dir'], cam=args.cam)
+    st = _scene_pts_stats(m, m['scene_dir'], cam=args.cam)
     print('自车到最近车道中心线: 中位 %.2fm 最大 %.2fm (n=%d)' % (st['median_m'], st['max_m'], st['n']))
+    print('地图跨度 = %.0fm' % float(al.get('map_span_m') or 0.0))
     print('车道=%d 折线=%d 路口进口=%d 锚点=%d' % (
         len(m['lanes']), len(m['polylines']), len(m['junctions']), len(m['anchors'])))
     if args.at:
