@@ -1321,10 +1321,18 @@ def _op_turn(tm, op):
         info = _lay_turn_along_route(tm, tid, route, fsel, poses, speed_mps=spd_use,
                                      direction=direction)
         if info:
-            return {"op": "turn", "track": tid, "ok": True, "mode": "map_lane_route",
-                    "direction": direction, "turn_deg": round(float(route.get('turn_deg') or 0.0), 1),
-                    "lane_ids": route.get('lane_ids'), "start_frame": f0,
-                    "duration": len(fsel), "speed_cap_mps": round(float(cap), 2), **info}
+            out = {"op": "turn", "track": tid, "ok": True, "mode": "map_lane_route",
+                   "direction": direction, "turn_deg": round(float(route.get('turn_deg') or 0.0), 1),
+                   "lane_ids": route.get('lane_ids'), "start_frame": f0,
+                   "duration": len(fsel), "speed_cap_mps": round(float(cap), 2), **info}
+            if route.get('short_turn'):
+                out["warn"] = (
+                    "这个位置/方向上没有可用的%s转支路（地图里搜到的路线航向只变了 %.0f°，目标 %.0f°）："
+                    "车只是沿当前车道往前开了一段，没有真的转过去。"
+                    "换一个更靠近路口的起始帧，或直接说'沿当前车道行驶'。"
+                    % ({'left': '左', 'right': '右'}.get(direction, direction),
+                       float(route.get('turn_deg') or 0.0), float(route.get('target_turn_deg') or 0.0)))
+            return out
 
     # ---- 兜底：没有地图（或地图里找不到路口）时，绕弧线原地转 ----
     def Ry(a):

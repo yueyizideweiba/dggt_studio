@@ -471,8 +471,14 @@ class RoadModel:
         if best is None:
             return None
         route = _dedup_polyline(np.concatenate(best['segs'], axis=0))
+        want_deg = math.degrees(target)
+        got_deg = math.degrees(best_ang)
+        # 诚实回报：真正匹配的支路可能根本不存在（这一侧没有左转口），
+        # 那就只是"沿本车道往前开"，必须显式告诉调用方，不能假装转过去了。
+        short = abs(got_deg - want_deg) > 40.0 and direction != 'straight'
         return {'pts': route, 'lane_ids': best['lanes'], 'direction': direction,
-                'turn_deg': float(math.degrees(best_ang)),
+                'turn_deg': float(got_deg), 'target_turn_deg': float(want_deg),
+                'short_turn': bool(short),
                 'entry_lane': str(lane0), 'start_xz': xz.tolist(),
                 'start_arc_m': float(s0), 'back_m': float(back_m),
                 'forward_m': float(forward_m), 'n_lanes': len(best['lanes']),
