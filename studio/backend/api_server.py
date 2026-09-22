@@ -1065,7 +1065,60 @@ def render_topdown_frame(renderer, tm, frame_idx: int, cam):
     # 只有"没有可用资产"的物体才退回方框替身（有资产的已经用真实模型渲染了）
     image = _draw_topdown_object_proxies(image, tm, int(frame_idx), cam,
                                          highlight_ego_track=viewer, skip_raw_ids=covered)
+    # 高精地图：把车道/边界折线投影到俯视画面上（真渲染的静态场景在重建覆盖外是空的，
+    # 叠上地图就能看清"车到底在不在路上"）
+    try:
+        map_d = _scene_map_cached(getattr(renderer, "scene_path", "") or "")
+        if map_d is not None:
+            image = _draw_topdown_map(image, map_d, cam)
+    except Exception as e:  # noqa: BLE001
+        print(f"[waymo_map] 俯视叠地图失败: {e}")
     return image
+
+
+def _draw_topdown_map(image, map_d, cam, max_dist: float = 160.0):
+    """把地图折线投影到俯视真渲染画面上（只画相机附近，避免整张地图）。"""
+    c2w, K, W, H = cam
+    img = np.ascontiguousarray(image)
+    eye = np.asarray(c2w, dtype=np.float64)[:3, 3]
+    kinds = [('driveway', (120, 120, 120), 1), ('crosswalk', (230, 60, 230), 1),
+             ('road_edge', (255, 150, 40), 2), ('road_line', (0, 200, 255), 1),
+             ('lane', (60, 200, 60), 2)]
+    for kind, col, thick in kinds:
+        for it in map_d['polylines']:
+            if it['type'] != kind:
+                continue
+            P = np.asarray(it['pts'], dtype=np.float64)
+            if len(P) < 2:
+                continue
+            # 只画相机附近的段
+            dx = P[:, 0] - eye[0]
+            dz = P[:, 2] - eye[2]
+            near = (dx * dx + dz * dz) <= max_dist * max_dist
+            if not near.any():
+                continue
+            pix, ok = _project_points(P, c2w, K, W, H)
+            if not ok:
+                continue
+            pts = np.round(pix).astype(np.int32)
+            for a, b in zip(pts[:-1], pts[1:]):
+                if (abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))) > W:
+                    continue     # 跨越相机后方的长线，跳过
+                cv2.line(img, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), col, thick, cv2.LINE_AA)
+    return img
+
+
+def _scene_map_cached(scene_path: str):
+    """按场景目录取地图（与按 scene_id 取等价，供渲染函数使用）。"""
+    if not scene_path:
+        return None
+    for sid, r in studio_state["scenes"].items():
+        if getattr(r, "scene_path", None) == scene_path:
+            return get_scene_map(sid)
+    try:
+        return waymo_map.load_scene_map(scene_path)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _topdown_bounds(tm, renderer, start_frame: int, num_frames: int, focus_tracks=None):
