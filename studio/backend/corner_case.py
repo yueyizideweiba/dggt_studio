@@ -965,26 +965,28 @@ def _attach_road_report(tm, sim, attacker, victim, frames):
             continue
         centers = {int(f): np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64)[:3, 3]
                    for f in fr}
-        # 撞击前的行驶段吸附回车道（撞击瞬间及之后不动：那里允许压线/冲出车道）
-        pre = {f: c for f, c in centers.items() if cfr is None or f < cfr - 1}
-        if len(pre) >= 3:
-            snap = rm.snap_centers(pre, per_frame=True, max_shift=1.0)
-            if snap['applied']:
-                for f, c in snap['centers'].items():
-                    try:
-                        P = np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64).copy()
-                    except Exception:  # noqa: BLE001
-                        continue
-                    P[0, 3], P[2, 3] = float(c[0]), float(c[2])
-                    tm.set_track_pose(int(tid), int(f), P)
-                # 吸附后重算体检
-                centers = {f: (np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64)[:3, 3]
-                               if (cfr is None or f < cfr - 1) else c)
-                           for f, c in centers.items()}
+        # 撞击前的行驶段吸附回车道：**只动肇事车**。
+        # 被撞车要尽量保持它原来的轨迹（用户明确要求"别大幅改被撞车的轨迹"），
+        # 所以对受害车只做体检、不修改，问题会在 issues 里报出来。
+        if name == 'attacker' and cfr is not None:
+            pre = {f: c for f, c in centers.items() if f < cfr - 1}
+            if len(pre) >= 3:
+                snap = rm.snap_centers(pre, per_frame=True, max_shift=1.0)
+                if snap['applied']:
+                    for f, c in snap['centers'].items():
+                        try:
+                            P = np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64).copy()
+                        except Exception:  # noqa: BLE001
+                            continue
+                        P[0, 3], P[2, 3] = float(c[0]), float(c[2])
+                        tm.set_track_pose(int(tid), int(f), P)
+                    for f, c in snap['centers'].items():
+                        centers[f] = np.asarray(c, dtype=np.float64).reshape(3)
         rep = rm.on_road_report(centers)
         out[name] = {'track': int(tid), 'on_road_ratio': rep.get('on_road_ratio'),
                      'dist_med_m': rep.get('dist_med_m'), 'dist_max_m': rep.get('dist_max_m'),
                      'wrong_way': rep.get('wrong_way'), 'lanes': (rep.get('lanes') or [])[:6],
+                     'snapped': bool(name == 'attacker' and cfr is not None),
                      'issues': rep.get('issues') or []}
     if out:
         sim['road_report'] = out
