@@ -104,9 +104,47 @@ class RoadModel:
     def lane_ids(self) -> List[str]:
         return list(self.map['lanes'].keys())
 
-    def lane_at(self, xz, max_d: float = 12.0) -> Tuple[Optional[str], float]:
-        lid, d, _ = wm.nearest_lane(self.map, xz)
-        return (lid, d) if (lid is not None and d <= max_d) else (None, d)
+    def lane_at(self, xz, max_d: float = 12.0, heading=None,
+                max_ang: float = 75.0) -> Tuple[Optional[str], float]:
+        """取 xz 附近的车道；给了 `heading` 就只在**大致同向**的车道里挑。
+
+        为什么必须要方向过滤：路口附近不同方向的车道中心线会挨得极近。实测 scene 005 的
+        自车在路口处到"最近车道中心线"只有 0.2m，但那条是**横穿**的车道（方向差 88°）——
+        纯按距离选会把正常行驶的车判成逆行，横向吸附时还可能把车吸到对面的车道上。
+        """
+        q = np.asarray(xz, dtype=np.float64).reshape(-1)[:2]
+        h2 = None
+        if heading is not None:
+            hh = np.asarray(heading, dtype=np.float64).reshape(-1)
+            hh = np.array([hh[0], hh[2]]) if hh.size >= 3 else hh[:2]
+            n = float(np.linalg.norm(hh))
+            if n > 1e-9:
+                h2 = hh / n
+        best, bd, any_best, any_d = None, float('inf'), None, float('inf')
+        for lid in self.map['lanes']:
+            P = self._lane_xz(lid)
+            if P is None or len(P) == 0:
+                continue
+            d = float(np.min(np.linalg.norm(P - q, axis=1)))
+            if d < any_d:
+                any_best, any_d = lid, d
+            if d > max_d or d >= bd:
+                continue
+            if h2 is not None:
+                ld = self.lane_dir(lid, q)
+                if ld is not None:
+                    cc = float(np.clip(float(np.dot(h2, ld)), -1.0, 1.0))
+                    if math.degrees(math.acos(cc)) > max_ang:
+                        continue
+            best, bd = lid, d
+        if best is not None:
+            return best, bd
+        # 方向过滤后没有候选：返回最近的（调用方从 lane_dir_ok 之类的体检里能看出不对）
+        return (any_best, any_d) if any_d <= max_d else (None, any_d)
+
+    def _lane_xz(self, lane_id) -> Optional[np.ndarray]:
+        P = self.lane_pts(lane_id)
+        return None if P is None else P[:, [0, 2]]
 
     def lane_dir(self, lane_id, xz) -> Optional[np.ndarray]:
         return wm.lane_heading(self.map, lane_id, xz)
@@ -213,7 +251,7 @@ class RoadModel:
 
     def classify_point(self, xz, heading: Optional[np.ndarray] = None,
                        tol: float = LANE_TOL_M) -> Dict[str, Any]:
-        lid, d = self.lane_at(xz, max_d=1e9)
+        lid, d = self.lane_at(xz, max_d=1e9, heading=heading)
         out = {'lane': lid, 'dist_m': d, 'on_road': bool(d <= tol)}
         if lid is not None:
             out['speed_limit_mps'] = self.speed_limit_mps(lid)
@@ -286,16 +324,35 @@ class RoadModel:
 
     # ------------------------------------------------------------ 横向吸附
 
+    def _traj_headings(self, centers: Dict[int, np.ndarray]):
+        """由中心点序列算每帧的前进方向（场景 xz）。"""
+        frames = sorted(centers)
+        out: Dict[int, Optional[np.ndarray]] = {}
+        for i, f in enumerate(frames):
+            a = np.asarray(centers[f], dtype=np.float64).reshape(3)
+            if i + 1 < len(frames):
+                b = np.asarray(centers[frames[i + 1]], dtype=np.float64).reshape(3)
+                v = np.array([b[0] - a[0], 0.0, b[2] - a[2]])
+            elif i > 0:
+                p = np.asarray(centers[frames[i - 1]], dtype=np.float64).reshape(3)
+                v = np.array([a[0] - p[0], 0.0, a[2] - p[2]])
+            else:
+                v = None
+            n = float(np.linalg.norm(v)) if v is not None else 0.0
+            out[f] = (v / n) if n > 1e-9 else None
+        return out
+
     def snap_point(self, xz, lane: Optional[str] = None,
-                   max_shift: float = SNAP_MAX_M) -> Dict[str, Any]:
+                   max_shift: float = SNAP_MAX_M, heading=None) -> Dict[str, Any]:
         """把一个点横向吸附到最近（或指定）车道的中心线上。
 
         只做**横向**修正（保留沿车道方向的进度），且修正量超过 `max_shift` 就不动 ——
         宁可保留原样并报警，也不能把车"瞬移"到几十米外的另一条路上。
+        `heading` 用于挑车道（路口附近横向车道挨得极近，不按方向过滤会吸错）。
         """
         xz = np.asarray(xz, dtype=np.float64)[:2]
         if lane is None:
-            lid, d, _ = wm.nearest_lane(self.map, xz)
+            lid, _d = self.lane_at(xz, heading=heading)
             lane = lid
         if lane is None:
             return {'xz': xz, 'lane': None, 'shift': 0.0, 'applied': False, 'dist': float('inf')}
@@ -326,12 +383,15 @@ class RoadModel:
                     'lane': None, 'report': {'n': 0}}
         before = self.classify(centers)
         frames = sorted(centers)
-        # 主导车道：整条轨迹中出现最多的车道（更稳，避免逐帧跳到隔壁车道）
+        heads = self._traj_headings(centers)
+        # 主导车道：整条轨迹中出现最多的车道（更稳，避免逐帧跳到隔壁车道）。
+        # 选车道时按每帧的前进方向过滤，否则路口处会统计到横穿的车道。
         dom = lane
         if dom is None and not per_frame:
             votes: Dict[str, int] = {}
             for f in frames:
-                lid, d = self.lane_at(np.asarray(centers[f]).reshape(3)[[0, 2]])
+                lid, _d = self.lane_at(np.asarray(centers[f]).reshape(3)[[0, 2]],
+                                       heading=heads.get(f))
                 if lid is not None:
                     votes[lid] = votes.get(lid, 0) + 1
             if votes:
@@ -341,13 +401,16 @@ class RoadModel:
                     'skipped_frames': len(frames), 'lane': None, 'report': before}
         out: Dict[int, np.ndarray] = {}
         snapped = skipped = 0
+        used_lanes: Dict[str, int] = {}
         for f in frames:
             c = np.asarray(centers[f], dtype=np.float64).reshape(3).copy()
             r = self.snap_point(c[[0, 2]], lane=dom if not per_frame else None,
-                                max_shift=max_shift)
+                                max_shift=max_shift, heading=heads.get(f))
             if r['applied']:
                 c[0], c[2] = float(r['xz'][0]), float(r['xz'][1])
                 snapped += 1
+                if r.get('lane'):
+                    used_lanes[r['lane']] = used_lanes.get(r['lane'], 0) + 1
             else:
                 skipped += 1
             out[f] = c
@@ -357,6 +420,7 @@ class RoadModel:
         applied = bool(snapped and improved and skipped <= 0.2 * len(frames))
         return {'centers': out if applied else dict(centers), 'applied': applied,
                 'snapped_frames': snapped, 'skipped_frames': skipped, 'lane': dom,
+                'lanes_used': sorted(used_lanes, key=lambda k: -used_lanes[k])[:6],
                 'report': before, 'report_after': after}
 
     # ------------------------------------------------------------ R4：路口
@@ -366,7 +430,7 @@ class RoadModel:
 
         比"离某个锚点最近"更符合语义：车在路口之前，左边那个路口不算"前方路口"。
         """
-        lane, d = self.lane_at(xz, max_d=8.0)
+        lane, d = self.lane_at(xz, max_d=8.0, heading=heading)
         if lane is None:
             return None
         xz = np.asarray(xz, dtype=np.float64)[:2]
@@ -416,7 +480,7 @@ class RoadModel:
         返回一条路线折线（场景系）+ 用到的车道序列；调用方按弧长铺逐帧位姿，
         位置和航向都来自地图 —— 所以是真的"在路口拐弯"，而不是原地转方向。
         """
-        lane0, _d = self.lane_at(xz, max_d=8.0)
+        lane0, _d = self.lane_at(xz, max_d=8.0, heading=heading)
         if lane0 is None:
             return None
         xz = np.asarray(xz, dtype=np.float64)[:2]

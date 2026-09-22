@@ -1177,7 +1177,7 @@ def _op_lane_change(tm, op):
             c0 = P0[:3, 3]
             side = 'right' if lat > 0 else 'left'
             c0_xz = c0[[0, 2]]
-            lane_from, d_from = rm.lane_at(c0_xz, max_d=6.0)
+            lane_from, d_from = rm.lane_at(c0_xz, max_d=6.0, heading=P0[:3, 2])
             nb = None
             if lane_from is not None:
                 # 邻居的横向偏移要以**本车道中心线**为基准量（车子自己可能本来就偏在车道一侧）
@@ -1848,6 +1848,9 @@ def _op_collide(tm, op, fused=None):
         "separation_frames_fixed": sep.get("frames_fixed"),
         "engine": "corner_case.simulate_pair_collision",
     }
+    # 道路体检（撞前谁在路上、有没有逆行）—— 由 corner_case._attach_road_report 附加
+    if sim.get("road_report"):
+        out["road_report"] = sim["road_report"]
     if replayed:
         out["idempotent_replay"] = True
     elif replay_miss is not None:
