@@ -1022,6 +1022,16 @@ python studio/backend/waymo_map.py \
 
 ### 4. 用任意 waymo14 段落重建场景
 
+一条命令（processed 已就绪时；缺标记图会自动补，最后打印对齐验收）：
+
+```bash
+bash build_scene.sh 017                  # 默认 START_IDX=0 / SEQ=25
+START_IDX=100 bash build_scene.sh 017    # 换起始帧
+bash build_scene.sh 017 018 005          # 多个场景依次建
+```
+
+拆开看就是三步：
+
 ```bash
 # 1) 解析 tfrecord（位姿 + 相机内参外参 + 图片 + 地图）
 python datasets/waymo14_preprocess.py --dst data/waymo14 \
@@ -1030,7 +1040,7 @@ python datasets/waymo14_preprocess.py --dst data/waymo14 \
 # 2) 补 DGGT 需要的标记图（SegFormer 语义 → sky_masks/custom_masks + 派生动态掩码）
 bash tools_make_masks.sh 005
 
-# 3) 重建（脚本已把 ninja/nvcc 放进 PATH —— gsplat 首次渲染要 JIT 编译 CUDA kernel）
+# 3) 重建（`run_inference.sh` 已把 ninja/nvcc 放进 PATH —— gsplat 首次渲染要 JIT 编译 CUDA kernel）
 bash run_inference.sh --image_dir data/waymo14/processed/validation --scene_names 5 \
     --input_views 1 --sequence_length 25 --start_idx 0 --mode 2 \
     --ckpt_path pretrained/model_latest_waymo.pt --output_path output/waymo_eval_14/005 -images
@@ -1039,6 +1049,20 @@ bash run_inference.sh --image_dir data/waymo14/processed/validation --scene_name
 python studio/backend/waymo_map.py --scene output/waymo_eval_14/005/005 \
     --processed data/waymo14/processed/validation/005 --overlay /tmp/map005.png
 ```
+
+几个容易踩的坑（现在都会**提前报清楚**，不再抛晦涩的 `IndexError`）：
+
+* **缺 `sky_masks/` 或 `fine_dynamic_masks/all`**：mode 2 会无条件读天空掩码，缺图时只会抛
+  `IndexError: list index out of range`，指向一行看起来毫不相干的代码。现在 `inference.py`
+  在**加载模型之前**就 `preflight_check()`，直接列出哪个场景缺哪个目录 + 给出补图命令；
+* **`-depth` 不需要 GT 深度**：它存的是渲染出的预测深度。只有 `comparison.mp4` 需要
+  `depth_flows_4`（GT 深度），没有时会明说跳过，而不是抛 `KeyError('gt_depth')`；
+* **`--intervals` 在 mode 2 下无效**（dataset 内部固定 interval=1），想要别的窗口用
+  `--start_idx` / `--sequence_length`；
+* **输出目录名 = 真实输入场景名**（`output/waymo_eval_14/017/017`）。上游用"第几个 batch"
+  当名字，既让目录名对不上，也会让 scale recovery 去读别的段落 —— 已修；
+* 选窗口看自车速度：`data/waymo14/processed/validation/<NNN>/ego_pose/` 相邻帧间距的中位数
+  就是每帧位移。拿一段停着不动的帧建出来的场景没有动态物体可用。
 
 第 2 步的 `datasets/tools/derive_dynamic_masks.py` 解决的是：上游
 `extract_masks.py --process_dynamic_mask` 需要另一套 2D 检测器产出的
