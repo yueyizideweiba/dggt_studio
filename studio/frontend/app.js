@@ -128,6 +128,18 @@ class DGGTStudio {
             v3dTraj.classList.toggle('active', on);
         });
 
+        const v3dRoad = document.getElementById('v3dRoadBtn');
+        if (v3dRoad) v3dRoad.addEventListener('click', () => {
+            if (!this.viewer3d) return;
+            if (!this.viewer3d.roadMap) {
+                const why = (this.viewer3d.roadMapStatus && this.viewer3d.roadMapStatus.reason) || '本场景没有高精地图';
+                this.updateStatus(`无法显示道路：${why}`);
+                return;
+            }
+            const on = this.viewer3d.toggleRoadMap();
+            v3dRoad.classList.toggle('active', on);
+        });
+
         const v3dTrajEdit = document.getElementById('v3dTrajEditBtn');
         if (v3dTrajEdit) v3dTrajEdit.addEventListener('click', () => {
             if (!this.viewer3d) return;
@@ -738,6 +750,7 @@ class DGGTStudio {
                 await this.loadFrame(this.state.currentFrame);
                 this._autoHeadingLoad();
                 this.loadEgoInfo();
+                this.loadSceneMap();          // 高精地图（道路）图层
                 this.updateStatus(`场景已加载: ${this.state.sceneId}`);
             }
         } catch (error) {
@@ -747,6 +760,41 @@ class DGGTStudio {
         }
     }
 
+
+    // 高精地图（道路）：取回后交给 3D 视图叠加，并在场景信息里说明
+    async loadSceneMap() {
+        this.state.sceneMap = null;
+        if (!this.state.sceneId) return;
+        try {
+            const r = await fetch(`${API_BASE}/scene/map/${this.state.sceneId}`);
+            const d = await r.json();
+            if (d.available) {
+                this.state.sceneMap = d;
+                if (this.viewer3d) this.viewer3d.setRoadMap(d);
+                const n = d.counts || {};
+                const rms = d.align && d.align.rms_m != null ? d.align.rms_m.toFixed(2) : '-';
+                this._setMapStatus(
+                    `已接入 ${n.lane || 0} 车道 / ${n.road_line || 0} 标线 / `
+                    + `${n.road_edge || 0} 边界 / ${n.crosswalk || 0} 斑马线（对齐 ${rms} m）`, false);
+            } else {
+                if (this.viewer3d) this.viewer3d.setRoadMap({ available: false });
+                this._setMapStatus(d.reason || '本场景没有高精地图', true);
+            }
+        } catch (e) {
+            console.warn('加载高精地图失败', e);
+            if (this.viewer3d) this.viewer3d.setRoadMap({ available: false });
+            this._setMapStatus('加载失败（后端未响应）', true);
+        }
+        const btn = document.getElementById('v3dRoadBtn');
+        if (btn) btn.classList.toggle('active', !!(this.viewer3d && this.viewer3d.showRoadMap && this.viewer3d.roadMap));
+    }
+
+    _setMapStatus(text, bad) {
+        const el = document.getElementById('sceneMapStatus');
+        if (!el) return;
+        el.textContent = text;
+        el.style.color = bad ? '#ff9a6b' : '#8fe38f';
+    }
 
     async loadFrame(frameIdx) {
         if (!this.state.sceneId) return;

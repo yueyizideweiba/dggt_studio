@@ -820,6 +820,39 @@ def plan_relative_trajectory(tm, dims, *, ref_track: int, same_dir: bool = True,
         # 兜底高度：参照车在该点的**底面**（同样不能用车体中心）
         ref_h = float(rd[1]) if rd and len(rd) == 3 else 1.5
         fb_y[int(f)] = float(c[1]) - up_sign * (ref_h / 2.0)
+    # ---- 道路约束（R1/R2/R5）：把生成的中心点吸附回车道走廊 ----
+    # 新车的轨迹是"沿参照车路线横向平移"来的：参照车自身轨迹一旦有噪声/误检，新车的横向
+    # 位置就会飘出车道。这里用高精地图的车道中心线做一次有界横向吸附 —— 每帧吸附到各自
+    # 最近的车道（而不是整条轨道主导车道），这样"变道撞击"的变道结构不会被压平。
+    road_info: Dict[str, Any] = {}
+    road_rm = None
+    try:
+        import road_rules as _rr
+        _sd = (getattr(getattr(tm, 'renderer', None), 'scene_path', None)
+               or getattr(tm, 'scene_path', None))
+        road_rm = _rr.get_road_model(str(_sd)) if _sd else None
+    except Exception:  # noqa: BLE001
+        road_rm = None
+    if road_rm is not None:
+        try:
+            _snap = road_rm.snap_centers(centers, per_frame=True, max_shift=1.2)
+            centers = _snap['centers']
+            _rep = road_rm.on_road_report(centers)
+            road_info = {
+                'applied': bool(_snap['applied']),
+                'snapped_frames': int(_snap['snapped_frames']),
+                'skipped_frames': int(_snap['skipped_frames']),
+                'lanes': (_rep.get('lanes') or [])[:6],
+                'on_road_ratio': _rep.get('on_road_ratio'),
+                'dist_med_m': _rep.get('dist_med_m'),
+                'dist_max_m': _rep.get('dist_max_m'),
+                'heading_err_med_deg': _rep.get('heading_err_med_deg'),
+                'wrong_way': _rep.get('wrong_way'),
+                'issues': _rep.get('issues') or [],
+            }
+        except Exception as _e:  # noqa: BLE001
+            print(f'[road_rules] 相对轨迹吸附失败: {_e}')
+
     gys, n_sparse, n_fallback = _ground_path(pts, up_sign, centers, fb_y, ref_gy)
     # 参照车路线上如果点云估计和"参照车自己实际行驶高度"差了 0.35m 以上（覆盖稀疏、或远处
     # 有树/建筑被当成路面），就以**参照车自己的底面**为准（新车跑在同一条路上，理应一样高）；
@@ -857,6 +890,7 @@ def plan_relative_trajectory(tm, dims, *, ref_track: int, same_dir: bool = True,
     return {"ok": bool(poses), "poses": poses, "mode": "relative",
             "direction_ref": int(ref_track), "same_dir": bool(same_dir),
             "lateral": float(lane_offset), "distance": float(distance), "speed": spd,
+            "road_constraint": road_info,
             "up_sign": up_sign, "impact_frame": int(start_frame) + int(imp_i),
             "contact_gap": float(contact_gap), "ref_arc_total": total,
             "route_roughness": round(float(route_roughness), 2),

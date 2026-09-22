@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260920n">
+    <link rel="stylesheet" href="styles.css?v=20260922a">
 </head>
 <body>
     <div id="app">
@@ -100,6 +100,10 @@
                         <div class="info-item">
                             <span class="label">总帧数:</span>
                             <span id="sceneTotalFrames" class="value">0</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="label">高精地图:</span>
+                            <span id="sceneMapStatus" class="value">-</span>
                         </div>
                         <div class="info-item">
                             <span class="label">时间轴:</span>
@@ -444,6 +448,9 @@
                         </button>
                         <button id="v3dTrajBtn" class="tool-btn active" title="显示/隐藏运动轨迹">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M4 19c4-1 4-12 8-12s4 11 8 10" stroke="currentColor" stroke-width="2" fill="none"/><circle cx="4" cy="19" r="2"/><circle cx="20" cy="17" r="2"/></svg>
+                        </button>
+                        <button id="v3dRoadBtn" class="tool-btn active" title="显示/隐藏高精地图（车道中心线/标线/道路边界/斑马线）">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 2h2l1.2 20H9.2L8 2zm6 0h2l-1.2 20h-2L14 2zM11.2 4h1.6v3h-1.6V4zm0 5h1.6v3h-1.6V9zm0 5h1.6v3h-1.6v-3z"/></svg>
                         </button>
                         <button id="v3dResetViewBtn" class="tool-btn" title="复位视角">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3L2 12h3v8h6v-6h2v6h6v-8h3L12 3z"/></svg>
@@ -1101,9 +1108,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260920n"></script>
-    <script src="app.js?v=20260920n"></script>
+    <script src="viewer3d.js?v=20260922a"></script>
+    <script src="app.js?v=20260922a"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260920n"></script>
+    <script src="ui-panels.js?v=20260922a"></script>
 </body>
 </html>

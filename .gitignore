@@ -12,6 +12,7 @@ venv/
 # 数据集
 waymo/
 data/waymo/
+data/waymo14/
 pretrained/
 datasets/**/raw/
 # 渲染结果与日志

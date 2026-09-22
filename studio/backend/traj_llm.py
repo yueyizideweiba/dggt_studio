@@ -83,7 +83,7 @@ vs_ego=相对主车是同向还是对向（没有 yaw 表示该帧静止或测�
 {{"ops": [
  {{"op":"speed","track":<id>,"speed_mps":<数>,"start_frame":<帧>,"end_frame":<帧>}},
  {{"op":"lane_change","track":<id 或 null>,"lateral":<米，车体右侧为正>,"start_frame":<帧>,"duration":<帧数>}},
- {{"op":"turn","track":<id>,"yaw_deg":<相对角度，正=左转>,"start_frame":<帧>,"duration":<帧数>}},
+ {{"op":"turn","track":<id>,"direction":"left|right|straight","at":"intersection"(可选),"yaw_deg":<相对角度，正=左转>,"start_frame":<帧>,"duration":<帧数>,"forward_m":<可选，拐多远>}},
  {{"op":"remove","track":<id>}},
  {{"op":"scale","track":<id>,"factor":<倍数，1=原样>}},
  {{"op":"shadow","track":<id>,"enabled":<true/false>}},
@@ -1169,28 +1169,122 @@ def _op_lane_change(tm, op):
             "lateral": lat, "start_frame": f0, "duration": dur}
 
 
+def _road_model_for(tm):
+    """取该场景的道路约束模型（没有高精地图时返回 None）。"""
+    try:
+        import road_rules
+        sd = getattr(getattr(tm, 'renderer', None), 'scene_path', None) or getattr(tm, 'scene_path', None)
+        if not sd:
+            return None
+        return road_rules.get_road_model(str(sd))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _lay_turn_along_route(tm, tid: int, route, frames, poses, *, fps: float = 10.0,
+                          speed_mps: float = 0.0, direction: str = "left"):
+    """把"地图算出来的转弯路线"铺成逐帧位姿：位置沿弧长前进，航向取车道方向。"""
+    import road_rules as rr
+    P = np.asarray(route['pts'], dtype=np.float64)
+    if len(P) < 2 or not frames:
+        return None
+    c0 = np.asarray(poses[frames[0]], dtype=np.float64)[:3, 3]
+    s0 = rr.project_arc(P, c0[[0, 2]])
+    n = len(frames)
+    dt = 1.0 / max(1e-6, float(fps))
+    v = float(speed_mps) if speed_mps and speed_mps > 0.5 else 6.0
+    v = float(np.clip(v, 2.0, 18.0))
+    total = rr.polyline_total(P)
+    dist = min(v * dt * (n - 1), max(6.0, total - s0 - 1.0))
+    up_sign = float(route.get('up_sign') or -1.0)
+    moved = 0.0
+    prev = None
+    for i, f in enumerate(frames):
+        s = s0 + (dist * i / float(max(1, n - 1)))
+        c, h = rr.sample_polyline(P, s)
+        if c is None:
+            continue
+        # 高度沿用原来的轨迹（转弯是水平面内的事，不该把车抬起来/按下去）
+        y = float(np.asarray(poses[f], dtype=np.float64)[1, 3])
+        if prev is not None:
+            moved += float(np.linalg.norm((c[[0, 2]] - prev)))
+        prev = c[[0, 2]].copy()
+        yaw = math.atan2(float(h[0]), float(h[2]))
+        c = np.array([float(c[0]), y, float(c[2])], dtype=np.float32)
+        P4 = np.eye(4, dtype=np.float32)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+        P4[0, 0], P4[0, 2] = cy, sy
+        P4[2, 0], P4[2, 2] = -sy, cy
+        P4[:3, 3] = c
+        tm.set_track_pose(int(tid), int(f), P4)
+    return {'moved_m': round(moved, 2), 'speed_mps': round(dist / max(1e-6, dt * (n - 1)), 2)}
+
+
 def _op_turn(tm, op):
+    """让某辆车真的"在路口拐弯"。
+
+    有高精地图时：在**车道图**上搜出一条与该方向匹配的路线（用净航向变化判定左右），
+    然后沿这条真实几何铺逐帧位姿 —— 位置和航向都来自地图，所以不会"原地打转"。
+    没有地图时退回到"原地把朝向慢慢转过去"的老行为。
+    """
     tid = int(op["track"])
     yaw = math.radians(float(op.get("yaw_deg") or 0.0))
     f0 = int(op.get("start_frame") or 0)
     dur = max(1, int(op.get("duration") or 10))
+    direction = str(op.get("direction") or "").strip().lower()
+    if direction not in ("left", "right", "straight"):
+        direction = "left" if yaw > 0 else ("right" if yaw < 0 else "straight")
     frames, poses = _path_frames(tm, tid)
     if not frames:
         return {"op": "turn", "ok": False, "error": "没有轨迹"}
 
+    # ---- 优先：沿地图几何转弯 ----
+    rm = _road_model_for(tm)
+    route = None
+    if rm is not None:
+        try:
+            route = rm.turn_for_track(tm, tid, direction, f0,
+                                      forward_m=float(op.get("forward_m") or 55.0))
+        except Exception as e:  # noqa: BLE001
+            print(f'[road_rules] turn 规划失败: {e}')
+            route = None
+    fsel = [f for f in frames if f >= f0][:dur]
+    if route is not None and len(fsel) >= 3:
+        spd = _track_speed(tm, tid)
+        # 转弯要减速：取"当前速度"和"车道限速的一半"里较小的那个（下限 3m/s）
+        try:
+            lim = rm.speed_limit_mps(route.get('entry_lane')) if rm is not None else None
+        except Exception:  # noqa: BLE001
+            lim = None
+        cap = max(3.0, 0.5 * float(lim)) if lim else 8.0
+        spd_use = min(max(spd, 3.0), cap) if spd > 0.5 else cap
+        info = _lay_turn_along_route(tm, tid, route, fsel, poses, speed_mps=spd_use,
+                                     direction=direction)
+        if info:
+            return {"op": "turn", "track": tid, "ok": True, "mode": "map_lane_route",
+                    "direction": direction, "turn_deg": round(float(route.get('turn_deg') or 0.0), 1),
+                    "lane_ids": route.get('lane_ids'), "start_frame": f0,
+                    "duration": len(fsel), "speed_cap_mps": round(float(cap), 2), **info}
+
+    # ---- 兜底：没有地图（或地图里找不到路口）时，绕弧线原地转 ----
     def Ry(a):
         c, s = math.cos(a), math.sin(a)
         return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
 
+    c0 = np.asarray(poses.get(f0, poses[frames[0]]), dtype=np.float32)[:3, 3].copy()
     for f in frames:
+        if f < f0:
+            continue
         a = _smoothstep((f - f0) / float(dur)) * yaw
         if abs(a) < 1e-6:
             continue
         P = poses[f].copy()
         P[:3, :3] = Ry(a) @ P[:3, :3]
         tm.set_track_pose(tid, f, P)
-    return {"op": "turn", "track": tid, "ok": True,
-            "yaw_deg": round(math.degrees(yaw), 1), "start_frame": f0, "duration": dur}
+    return {"op": "turn", "track": tid, "ok": True, "mode": "in_place_fallback",
+            "direction": direction,
+            "yaw_deg": round(math.degrees(yaw), 1), "start_frame": f0, "duration": dur,
+            "note": "没有高精地图可用，只改变了朝向（建议用带地图的场景）"}
 
 
 def _yaw_of(P) -> float:

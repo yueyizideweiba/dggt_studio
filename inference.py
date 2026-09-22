@@ -71,6 +71,34 @@ def parse_scene_names(scene_names_str):
     else:
         return [str(int(x)).zfill(3) for x in scene_names_str.split()]
     
+def _batch_scene_name(batch, dataset, scene_idx):
+    """取当前 batch 对应的**真实输入场景名**。
+
+    上游用 `str(scene_idx).zfill(3)`（第几个 batch）当场景名，于是 scale recovery 会去读
+    **另一个段落**的 ego_pose 当 GT，`scale_factor` 随之算错 —— 场景的米制尺度整体偏，
+    地图根本对不上。这里优先从 `image_paths` 反推目录名，再退化成 `dataset.scenes`，最后才用计数器。
+    """
+    try:
+        ip = batch['image_paths'] if 'image_paths' in batch else None
+        while isinstance(ip, (list, tuple)) and len(ip) > 0:
+            ip = ip[0]
+        if isinstance(ip, str):
+            p = os.path.dirname(ip)
+            if os.path.basename(p) == 'images':
+                p = os.path.dirname(p)
+            if p:
+                return os.path.basename(p)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        scenes = getattr(dataset, 'scenes', None)
+        if scenes and 0 <= scene_idx - 1 < len(scenes):
+            return str(scenes[scene_idx - 1])
+    except Exception:  # noqa: BLE001
+        pass
+    return str(scene_idx).zfill(3)
+
+
 def calculate_scale_factor(P1, P2):
     """
     Calculate scale factor between predicted and GT trajectories.
@@ -191,6 +219,9 @@ def main():
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
 
+            # 当前 batch 的真实输入场景名（用于 scale recovery / 输出目录 / scene_meta）
+            input_scene_name = _batch_scene_name(batch, dataset, scene_idx)
+
             if args.mode == 3:
                 target_images = batch['targets'].to(device)
                 target_sky_masks = batch['target_masks'].to(device)
@@ -252,7 +283,7 @@ def main():
                 # --- RECONSTRUCTION MODE LOGIC & SETUP ---
                 if args.mode == 2:
                     # Prepare Output Directories
-                    scene_name = str(scene_idx).zfill(3)
+                    scene_name = input_scene_name
                     scene_out_dir = os.path.join(args.output_path, scene_name)
                     ego_dir = os.path.join(scene_out_dir, "ego_pose")
                     obj_dir = os.path.join(scene_out_dir, "dynamic_objects")
@@ -275,11 +306,13 @@ def main():
                     # --------------------------------------------------------------------------
                     scene_dir = os.path.join(args.image_dir, scene_name)
                     scale_factor = 1.0  # Default fallback
+                    # mode 1/2 的 dataset 内部 interval 固定为 1，只有 mode 3 用 --intervals 抽帧
+                    _interval = int(args.intervals) if args.mode == 3 else 1
 
                     try:
                         # Load GT ego pose translations
-                        # Use start_idx to get correct frame indices (e.g., start_idx=40 means frames 40-59)
-                        frame_indices = list(range(args.start_idx, args.start_idx + S))
+                        # 必须按 (start_idx, interval) 取真实帧号，否则 scale_factor 会被算错
+                        frame_indices = list(range(args.start_idx, args.start_idx + S * _interval, _interval))
                         gt_translations = load_ego_pose_translations(scene_dir, frame_indices, dataset=args.dataset)
 
                         # Extract predicted translations from extrinsic (W2C matrices)
@@ -315,6 +348,7 @@ def main():
 
                         frame_ego_data = {
                             "frame_id": t,
+                            "global_frame": int(args.start_idx + t * _interval),
                             "camera": {
                                 "width": W,
                                 "height": H
@@ -469,6 +503,23 @@ def main():
                             os.path.join(gs_dir, "sky_scene.ply")
                         )
 
+                    # ------------------------------------------------------------------
+                    # scene_meta.json：场景 ↔ processed 的帧对应关系与米制尺度
+                    # （地图对齐、轨迹查询、编辑/事故生成都用它把两边坐标系钉在一起）
+                    # ------------------------------------------------------------------
+                    save_json({
+                        "scene_name": scene_name,
+                        "image_dir": os.path.abspath(args.image_dir),
+                        "dataset": args.dataset,
+                        "start_idx": int(args.start_idx),
+                        "interval": int(_interval),
+                        "sequence_length": int(S),
+                        "num_scene_frames": int(S),
+                        "frame_ids": [int(args.start_idx + t * _interval) for t in range(S)],
+                        "scale_factor": float(scale_factor),
+                        "camera_ids": [int(c) for c in camera_ids],
+                    }, os.path.join(scene_out_dir, "scene_meta.json"))
+
                     # Setup for Rendering (Standard Logic for validation)
                     static_mask = (bg_mask & (dy_map < 0.5))
                     static_points = point_map[static_mask].reshape(-1, 3)
@@ -571,7 +622,7 @@ def main():
                 target_image = images[0]
 
             # Post-Processing
-            scene_name = str(scene_idx).zfill(3)
+            scene_name = input_scene_name
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
 

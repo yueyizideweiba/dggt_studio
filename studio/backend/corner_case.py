@@ -921,8 +921,12 @@ def simulate_pair_collision(tm, attacker, victim, frames, fps=10.0, intensity=1.
     `attacker_lateral` / `victim_lateral`：叠加在追击动力学之上的横向偏移
     （按 `lateral_ramp` 做 smoothstep 渐变）——"变道 + 撞"要用它，否则
     纯粹的追击会把之前做好的横移覆盖掉。
+
+    事故生成同样受**道路约束**：返回结果里带 `road_report`，说明双方轨迹是否还在车道
+    走廊内（撞车瞬间压线/冲出路面是合理的，但"整条路径都不在路上"就是错的，要能让
+    用户看到）。有高精地图时还会把**撞击之前**的行驶段轻度吸附回车道。
     """
-    return _simulate_pursuit_collision(
+    sim = _simulate_pursuit_collision(
         tm, attacker, victim, list(frames), fps, intensity,
         enable_physics=enable_physics,
         victim_brake_decel=victim_brake_decel,
@@ -934,6 +938,56 @@ def simulate_pair_collision(tm, attacker, victim, frames, fps=10.0, intensity=1.
         impact_frame=impact_frame,
         attacker_target_speed=attacker_target_speed,
     )
+    try:
+        _attach_road_report(tm, sim, attacker, victim, frames)
+    except Exception as e:  # noqa: BLE001
+        print(f'[road_rules] 事故道路体检失败: {e}')
+    return sim
+
+
+def _attach_road_report(tm, sim, attacker, victim, frames):
+    """给事故仿真结果附上"双方轨迹的道路合规性"体检（有地图时还会轻度吸附撞击前段）。"""
+    import road_rules as rr
+    sd = (getattr(getattr(tm, 'renderer', None), 'scene_path', None)
+          or getattr(tm, 'scene_path', None))
+    rm = rr.get_road_model(str(sd)) if sd else None
+    if rm is None:
+        return
+    cfr = sim.get('collision_frame')
+    cfr = int(cfr) if cfr is not None else None
+    out = {}
+    for name, tid in (('attacker', attacker), ('victim', victim)):
+        try:
+            fr = [f for f in frames if tm.get_track_pose(int(tid), int(f)) is not None]
+        except Exception:  # noqa: BLE001
+            continue
+        if len(fr) < 3:
+            continue
+        centers = {int(f): np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64)[:3, 3]
+                   for f in fr}
+        # 撞击前的行驶段吸附回车道（撞击瞬间及之后不动：那里允许压线/冲出车道）
+        pre = {f: c for f, c in centers.items() if cfr is None or f < cfr - 1}
+        if len(pre) >= 3:
+            snap = rm.snap_centers(pre, per_frame=True, max_shift=1.0)
+            if snap['applied']:
+                for f, c in snap['centers'].items():
+                    try:
+                        P = np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64).copy()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    P[0, 3], P[2, 3] = float(c[0]), float(c[2])
+                    tm.set_track_pose(int(tid), int(f), P)
+                # 吸附后重算体检
+                centers = {f: (np.asarray(tm.get_track_pose(int(tid), int(f)), dtype=np.float64)[:3, 3]
+                               if (cfr is None or f < cfr - 1) else c)
+                           for f, c in centers.items()}
+        rep = rm.on_road_report(centers)
+        out[name] = {'track': int(tid), 'on_road_ratio': rep.get('on_road_ratio'),
+                     'dist_med_m': rep.get('dist_med_m'), 'dist_max_m': rep.get('dist_max_m'),
+                     'wrong_way': rep.get('wrong_way'), 'lanes': (rep.get('lanes') or [])[:6],
+                     'issues': rep.get('issues') or []}
+    if out:
+        sim['road_report'] = out
 
 
 # ==================== 入口 ====================

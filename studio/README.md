@@ -873,7 +873,7 @@ SAM3D 重建的 `.ply` 高斯**没有烘焙阴影**，插进场景后会显得"�
 | --- | --- | --- |
 | `speed` | 变速（保持原路径形态，按 k 重定时） | `track`、`speed_mps` |
 | `lane_change` | 平滑变道 | `track`、`lateral`（车体右侧为正）、`duration` |
-| `turn` | 转向 | `track`、`yaw_deg`（正=左转）、`duration` |
+| `turn` | 转向（有高精地图时**沿车道几何在路口真转弯**） | `track`、`direction`（`left`/`right`/`straight`）、`yaw_deg`（正=左转，作为兜底）、`duration`、`forward_m` |
 | `remove` | 删除车辆 | `track` |
 | `collide` | 碰撞编排 | `a`（肇事车）、`b`（被撞车）、`frame` |
 | `insert` | 生成新车（复用 LLaDA+SAM3D） | `prompt`、`mode`、`distance`、`speed`、`num_frames` |
@@ -927,3 +927,114 @@ SAM3D 重建的 `.ply` 高斯**没有烘焙阴影**，插进场景后会显得"�
 `a`/`b` 与动作的 `track` 写 `null`（或 `-1`）即代表"刚生成的那辆新车"，`apply` 会先跑完
 生成拿到新 track id 再替换占位符，于是「生成一辆红色轿车，向左变道后撞上 T:1」能一步到位地
 生成车辆**并**生成它引发事故的轨迹。
+
+## 高精地图（Waymo v1.4 map）——道路约束
+
+`data/waymo14/processed/validation/<NNN>/map/` 里存着 Waymo 官方地图（车道中心线、
+车道标线、道路边界、斑马线、停车标志、减速带、出入口），和 `ego_pose` 同一全局坐标系。
+studio 把它**当成一套道路约束规则**接进了渲染、路径编辑和事故生成。
+
+### 1. 地图怎么对齐到重建出来的场景
+
+DGGT 场景的世界系是模型内部归一化坐标乘 `scale_factor` 的产物，它和 Waymo 全局系之间
+只差一个固定的 3D 相似变换 `p_scene = s·R·p_global + t`。两边都有同一台相机的观测，所以
+闭式解、**不需要人工标定**（`studio/backend/waymo_map.py`）：
+
+```
+processed 侧（米制、全局系）：T_g_i = ego_pose[frame_ids[i]] @ extrinsics[cam]
+scene     侧（米制、场景系）：T_s_i = 相机位姿 (camera_extrinsics_world)
+```
+
+1. **帧对应关系**由 `scene_meta.json` 给出（inference.py 导出：`start_idx`/`interval`/
+   `frame_ids`/`scale_factor`），所以是确定的，不用猜；
+2. 水平面（全局 `x,y` → 场景 `x,z`）做 2D 相似变换，竖直方向由**场景的"上"方向**唯一
+   确定（相机图像"下"方向就是场景 +y ⇒ 场景"上"是 -y），两者一起给出一个 `det(R)=+1`
+   的完整旋转；
+3. 只用**相机位置**做 Procrustes，**不用相机朝向**：实测模型的相机朝向预测与 WOD 的
+   相机轴向约定差一个固定常数阵（同一场景里用旋转去解 R 会偏 100° 以上），旋转只当
+   诊断指标；位置拟合的残差是厘米级。
+
+实测（scene 016，四向环岛路口，25 帧）：
+
+| 指标 | 数值 |
+| --- | --- |
+| 尺度 `s`（应当 ≈1，两边都米制） | **1.0011** |
+| 位置残差 rms | **0.062 m** |
+| 自车到最近车道中心线（中位 / 最大） | **0.15 m / 0.25 m** |
+| 解析出的"上"方向一致性 `up_dot` | **+1.000** |
+
+> 一个必须修的坑：上游 `inference.py` 用 `str(scene_idx).zfill(3)`（**第几个 batch**）
+> 当场景名去读 GT 位姿算 `scale_factor`，只要传入的场景名不是 `001`，scale 就会用**别的
+> 段落**的位姿去算 —— 整个场景的米制尺度全错，地图自然对不上。现已改为按
+> `batch['image_paths']` 反推真实场景名（并写进 `scene_meta.json`）。
+
+### 2. 在视图里可视化
+
+* **3D 视图叠加**（工具栏最右的"道路"按钮）：`viewer3d.js` 把车道中心线（绿）、车道标线
+  （黄）、道路边界（橙）、斑马线（洋红）、停车标志/路口锚点（红/蓝点）投影到叠加上，
+  只画相机 140m 内的段；
+* **俯视 BEV 示意图**：`render_bev_frame()` 把地图当底图画在网格之上、物体之下；
+* **场景信息栏**显示"已接入 N 车道 / N 标线 / … （对齐 x.xx m）"，没地图的场景会说明原因；
+* 接口：`GET /api/scene/map/{scene_id}?kinds=lane,road_edge&max_points=…`（场景世界系、
+  单位米、折线保留 2 位小数），不可用时返回 `available:false` 和 `reason`。
+
+命令行诊断（对齐指标 + 俯视叠图）：
+
+```bash
+python studio/backend/waymo_map.py \
+    --scene output/waymo_eval_14/016/016 \
+    --processed data/waymo14/processed/validation/016 \
+    --overlay /tmp/map016.png
+```
+
+### 3. 道路约束规则（`studio/backend/road_rules.py`）
+
+| 规则 | 含义 | 落地方式 |
+| --- | --- | --- |
+| R1 车道走廊 | 轨迹点应落在某条 LaneCenter 走廊内（默认 ±3.5m） | `snap_centers()`：**有界**横向吸附（单帧最多 2.6m，超了就只报警不动），返回吸附前后体检对照 |
+| R2 航向一致 | 车头方向应与所在车道方向一致，反向即逆行 | `classify()` → `wrong_way` |
+| R3 车道连通 | 跨车道只能走 entry/exit/左右邻居边 | `successors()` / `plan_turn()` 的 BFS |
+| R4 路口转向 | 左/右转只发生在路口，且要沿出口支路几何转弯 | `plan_turn()` / `turn_for_track()` |
+| R5 限速 | 车速上限取车道 `speed_limit_mph` | `speed_limit_mps()`；转弯还会再压到限速的一半 |
+| R6 语义锚点 | 停车标志 / 斑马线 / 路口进口 | `anchors_near()` / `junction_ahead()` |
+
+**R4 为什么要在车道图上"多搜几跳"**：Waymo 的路口结构是"进口车道先扇出成若干条平行车道，
+再各自接到不同去向"（实测 scene 016：进口 49 → {40,52,53,54} → 分别接 39 / 58(左, +111°)
+/ 50 / …）。只看一跳看不出转向，所以 `plan_turn()` 从当前车道出发做有界 BFS，用**路径走
+`forward_m` 之后的净航向变化**去匹配目标方向（`turn_side() > 0` = 左转）。
+
+接入点：
+
+* **插入实体**（`nl_entity.plan_relative_trajectory`）：生成的中心点先做一次**逐帧**
+  最近车道吸附（不是整条轨道吸附到单一车道 —— 这样"变道撞击"的变道结构不会被压平），
+  吸附结果写进回执的 `road_constraint`，`/api/text2entity/*` 会把它转成前端 warning；
+* **语言转向**（`traj_llm._op_turn`）：有地图就 `map_lane_route`（位置沿车道弧长前进、
+  航向取车道方向、速度压到限速一半），没有地图才退回"原地把朝向转过去"并附 `note`；
+* **事故生成**（`corner_case.simulate_pair_collision`）：撞击**之前**的行驶段做轻度吸附
+  （≤1.0m），撞后不动（撞车时压线/冲出路面是合理的）；结果里附 `road_report`
+  （双方 `on_road_ratio` / `dist_med_m` / `wrong_way` / `issues`）。
+
+### 4. 用任意 waymo14 段落重建场景
+
+```bash
+# 1) 解析 tfrecord（位姿 + 相机内参外参 + 图片 + 地图）
+python datasets/waymo14_preprocess.py --dst data/waymo14 \
+    --index_from data/waymo_mytest_list.txt --only data/waymo_mytest_list.txt
+
+# 2) 补 DGGT 需要的标记图（SegFormer 语义 → sky_masks/custom_masks + 派生动态掩码）
+bash tools_make_masks.sh 005
+
+# 3) 重建（脚本已把 ninja/nvcc 放进 PATH —— gsplat 首次渲染要 JIT 编译 CUDA kernel）
+bash run_inference.sh --image_dir data/waymo14/processed/validation --scene_names 5 \
+    --input_views 1 --sequence_length 25 --start_idx 0 --mode 2 \
+    --ckpt_path pretrained/model_latest_waymo.pt --output_path output/waymo_eval_14/005 -images
+
+# 4) 核对地图对齐
+python studio/backend/waymo_map.py --scene output/waymo_eval_14/005/005 \
+    --processed data/waymo14/processed/validation/005 --overlay /tmp/map005.png
+```
+
+第 2 步的 `datasets/tools/derive_dynamic_masks.py` 解决的是：上游
+`extract_masks.py --process_dynamic_mask` 需要另一套 2D 检测器产出的
+`dynamic_masks/{human,vehicle}` 粗掩码；没有那一步时直接用 SegFormer 的
+Vehicle/Person/Cyclist 类当粗掩码，等价于 `valid = semantic ∧ rough`。

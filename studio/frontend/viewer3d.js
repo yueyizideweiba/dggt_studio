@@ -25,6 +25,13 @@ class DGGTViewer3D {
         this.adaptiveInfluence = 6;     // 影响半径（前后帧数）
         this.criticalFrames = null;     // 碰撞关键帧信息 {critical_frame, collision_frame, ...}
 
+        // 高精地图（Waymo lane/road_edge/crosswalk…，已对齐到场景世界系）
+        this.roadMap = null;            // {available, polylines, anchors, align, ...}
+        this.showRoadMap = true;        // 3D 视图里是否叠加道路
+        this.showRoadAnchors = true;    // 是否标注停车标志等锚点
+        this.roadMapStatus = null;      // {available:false, reason} 之类
+  
+
         // 三维极端天气：随渲染请求传给后端，在相机视锥内生成3D粒子
         this.weather = { type: 'clear', intensity: 0.0, visibility: 80, wind: [0, 0] };
 
@@ -574,6 +581,11 @@ class DGGTViewer3D {
         const sx = ow / this.renderWidth;
         const sy = oh / this.renderHeight;
 
+        // 高精地图（道路）—— 画在最底层，物体包围盒/轨迹压在上面
+        if (this.showRoadMap && this.roadMap) {
+            this._drawRoadMap(sx, sy);
+        }
+
         // 绘制所有动态物体的包围盒
         if (this.showBoxes && this.objects) {
             this.objects.forEach(obj => {
@@ -1007,6 +1019,94 @@ class DGGTViewer3D {
         this.showTrajectory = (show === undefined) ? !this.showTrajectory : show;
         this._drawOverlay();
         return this.showTrajectory;
+    }
+
+    // ==================== 高精地图（道路）图层 ====================
+    // data 来自 GET /api/scene/map/{scene_id}；null / {available:false} 表示该场景没有地图
+    setRoadMap(data) {
+        this.roadMapStatus = data || null;
+        if (!data || data.available === false) {
+            this.roadMap = null;
+        } else {
+            // 预先按类型分组，绘制时不用每帧过滤
+            const byType = {};
+            (data.polylines || []).forEach(p => {
+                (byType[p.type] = byType[p.type] || []).push(p.pts);
+            });
+            this.roadMap = {
+                byType,
+                anchors: (data.anchors || []).concat(
+                    (data.junctions || []).map(j => ({ kind: 'junction', at: j.at }))),
+                align: data.align || null,
+                counts: data.counts || {},
+                segment: data.segment || null,
+            };
+        }
+        this._drawOverlay();
+        return this.roadMap;
+    }
+
+    toggleRoadMap(show) {
+        this.showRoadMap = (show === undefined) ? !this.showRoadMap : !!show;
+        this._drawOverlay();
+        return this.showRoadMap;
+    }
+
+    toggleRoadAnchors(show) {
+        this.showRoadAnchors = (show === undefined) ? !this.showRoadAnchors : !!show;
+        this._drawOverlay();
+        return this.showRoadAnchors;
+    }
+
+    // 把地图折线投影到屏幕；只画离相机一定距离内的段，避免几百条线全画
+    _drawRoadMap(sx, sy) {
+        const m = this.roadMap;
+        if (!m || !this.lastC2W) return;
+        const ctx = this.octx;
+        const STYLE = {
+            lane: { color: 'rgba(70, 220, 70, 0.85)', width: 2.0, order: 4 },
+            road_line: { color: 'rgba(255, 210, 60, 0.55)', width: 1.0, order: 3 },
+            road_edge: { color: 'rgba(255, 150, 40, 0.60)', width: 1.5, order: 2 },
+            crosswalk: { color: 'rgba(235, 70, 235, 0.55)', width: 1.0, order: 1 },
+            driveway: { color: 'rgba(140, 140, 140, 0.35)', width: 1.0, order: 0 },
+        };
+        const order = Object.keys(STYLE).sort((a, b) => STYLE[a].order - STYLE[b].order);
+        const camPos = this._cameraPosition();
+        const maxDist = 140;   // 只看相机附近
+        order.forEach(kind => {
+            const polys = m.byType[kind];
+            if (!polys) return;
+            const st = STYLE[kind];
+            ctx.strokeStyle = st.color;
+            ctx.lineWidth = st.width;
+            ctx.beginPath();
+            for (const pts of polys) {
+                let started = false;
+                for (let i = 0; i < pts.length; i++) {
+                    const p = pts[i];
+                    const dx = p[0] - camPos[0], dz = p[2] - camPos[2];
+                    if (dx * dx + dz * dz > maxDist * maxDist) { started = false; continue; }
+                    const sp = this._worldToScreen(p, this.lastC2W);
+                    if (!sp) { started = false; continue; }
+                    const x = sp.x * sx, y = sp.y * sy;
+                    if (!started) { ctx.moveTo(x, y); started = true; }
+                    else ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+        });
+        if (this.showRoadAnchors) {
+            for (const a of (m.anchors || [])) {
+                const sp = this._worldToScreen(a.at, this.lastC2W);
+                if (!sp) continue;
+                const x = sp.x * sx, y = sp.y * sy;
+                ctx.beginPath();
+                ctx.arc(x, y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = a.kind === 'stop_sign' ? 'rgba(250, 70, 70, 0.9)'
+                    : (a.kind === 'junction' ? 'rgba(90, 190, 255, 0.85)' : 'rgba(235, 90, 235, 0.8)');
+                ctx.fill();
+            }
+        }
     }
 
     // 设置碰撞关键帧信息（用于在轨迹上高亮最晚反应帧/碰撞帧）

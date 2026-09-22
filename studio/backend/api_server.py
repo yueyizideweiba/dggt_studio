@@ -49,6 +49,7 @@ import diffusion_refine
 import sim_runtime
 import sensor_rig
 import scenario_export
+import waymo_map
 
 # 创建FastAPI应用
 app = FastAPI(title="DGGT Studio API V2", version="2.0.0")
@@ -69,7 +70,8 @@ studio_state = {
     "active_scene_id": None,
     "render_cache": {},  # 渲染缓存
     "edit_history": {},  # 编辑历史
-    "preview_tasks": {}  # 预览任务
+    "preview_tasks": {},  # 预览任务
+    "scene_maps": {},     # 场景ID -> waymo 地图（场景系，含对齐结果）；None 表示该场景没有地图
 }
 
 
@@ -199,6 +201,157 @@ def get_track_manager_or_404(scene_id: str) -> TrackManager:
         tm = TrackManager(studio_state["scenes"][scene_id])
         studio_state["track_managers"][scene_id] = tm
     return tm
+
+
+# ==================== 高精地图（Waymo v1.4 map） ====================
+
+# 地图要素配色（BGR）——和 waymo_map 的叠图保持一致
+MAP_COLORS = {
+    "lane": (60, 200, 60),          # 绿：车道中心线
+    "road_line": (0, 200, 255),     # 黄：车道标线
+    "road_edge": (255, 150, 40),    # 橙：道路边界
+    "crosswalk": (230, 60, 230),    # 洋红：斑马线
+    "stop_sign": (60, 60, 245),     # 红：停车标志
+    "speed_bump": (0, 150, 255),    # 橙黄：减速带
+    "driveway": (120, 120, 120),    # 灰：出入口
+}
+
+
+def get_scene_map(scene_id: str, refresh: bool = False):
+    """取场景对应的 Waymo 高精地图（已变换到场景世界系）；没有则返回 None（带缓存）。"""
+    if refresh:
+        studio_state["scene_maps"].pop(scene_id, None)
+        waymo_map.clear_cache()
+    if scene_id in studio_state["scene_maps"]:
+        return studio_state["scene_maps"][scene_id]
+    m = None
+    try:
+        renderer = studio_state["scenes"].get(scene_id)
+        scene_path = getattr(renderer, "scene_path", None) if renderer is not None else None
+        if scene_path:
+            m = waymo_map.load_scene_map(scene_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"[waymo_map] 场景 {scene_id} 地图不可用: {e}")
+        m = None
+    studio_state["scene_maps"][scene_id] = m
+    return m
+
+
+def map_unavailable_reason(scene_id: str) -> str:
+    """地图取不到时给出人类可读的原因（供前端提示）。"""
+    renderer = studio_state["scenes"].get(scene_id)
+    if renderer is None:
+        return "场景未加载"
+    scene_path = getattr(renderer, "scene_path", None) or ""
+    if not scene_path:
+        return "场景没有 scene_path"
+    if not os.path.exists(os.path.join(scene_path, "scene_meta.json")):
+        return "该场景没有 scene_meta.json（旧数据/未用新 inference 重建），无法确定帧对应关系与米制尺度"
+    proc = waymo_map.resolve_processed_dir(scene_path)
+    if not proc:
+        return "找不到对应的 processed 目录（含 map/ 的那份数据）"
+    if not os.path.exists(os.path.join(proc, "map", "map_features.json")):
+        return "对应的 processed 目录里没有 map/map_features.json"
+    return "地图加载失败（详见后端日志）"
+
+
+def _map_draw_scale(bounds, size: int, pad: int = 28):
+    """BEV/俯视图共用的世界→像素换算（与 render_bev_frame 的取景一致）。"""
+    W = H = int(size)
+    min_x, max_x, min_z, max_z = bounds
+    span_x = max(1e-6, max_x - min_x)
+    span_z = max(1e-6, max_z - min_z)
+    s = min((W - 2 * pad) / span_x, (H - 2 * pad) / span_z)
+    off_x = 0.5 * (W - span_x * s)
+    off_y = 0.5 * (H - span_z * s)
+
+    def to_px(x, z):
+        return (off_x + (x - min_x) * s, H - off_y - (z - min_z) * s)
+
+    return to_px, s
+
+
+def _clip_polyline_to_bounds(pts, bounds, margin: float = 30.0):
+    """按包围盒裁剪折线：只保留与取景范围相交的段，避免每帧画整张地图（几百条线）。"""
+    min_x, max_x, min_z, max_z = bounds
+    min_x -= margin
+    max_x += margin
+    min_z -= margin
+    max_z += margin
+    out = []
+    for a, b in zip(pts[:-1], pts[1:]):
+        if (max(a[0], b[0]) < min_x or min(a[0], b[0]) > max_x
+                or max(a[2], b[2]) < min_z or min(a[2], b[2]) > max_z):
+            continue
+        out.append((a, b))
+    return out
+
+
+def draw_map_bev(img, map_d, bounds, size: int, alpha: float = 1.0,
+                 kinds=None, draw_anchors: bool = True, pad: int = 28):
+    """把地图画到 BEV 图上（车道/标线/边界/斑马线/停车标志）。作为底图，先画。"""
+    if map_d is None:
+        return img
+    to_px, _ = _map_draw_scale(bounds, size, pad)
+    kinds = set(kinds) if kinds else {"lane", "road_line", "road_edge", "crosswalk", "driveway"}
+    # 道路边界最粗最暗，先画；车道中心线最后画（最显眼）
+    order = ["driveway", "crosswalk", "road_edge", "road_line", "lane"]
+    for kind in order:
+        if kind not in kinds:
+            continue
+        col = MAP_COLORS.get(kind, (150, 150, 150))
+        thick = 2 if kind in ("lane", "road_edge") else 1
+        for it in map_d["polylines"]:
+            if it["type"] != kind:
+                continue
+            P = np.asarray(it["pts"], dtype=np.float64)
+            for a, b in _clip_polyline_to_bounds(P, bounds):
+                p1, p2 = to_px(a[0], a[2]), to_px(b[0], b[2])
+                cv2.line(img, (int(round(p1[0])), int(round(p1[1]))),
+                         (int(round(p2[0])), int(round(p2[1]))), col, thick, cv2.LINE_AA)
+    if draw_anchors:
+        for a in map_d.get("anchors", []):
+            if a["kind"] == "stop_sign":
+                p = np.asarray(a["at"], dtype=np.float64)
+                px = to_px(p[0], p[2])
+                cv2.circle(img, (int(round(px[0])), int(round(px[1]))), 4, MAP_COLORS["stop_sign"], -1, cv2.LINE_AA)
+    return img
+
+
+def map_payload(map_d, kinds=None, max_points: int = 0, ndigits: int = 2) -> Dict[str, Any]:
+    """地图 → 前端 JSON（场景系，单位米）。points 保留 ndigits 位小数以压缩体积。"""
+    if map_d is None:
+        return {"available": False}
+    keep = set(kinds) if kinds else None
+    polys = []
+    for it in map_d["polylines"]:
+        if keep and it["type"] not in keep:
+            continue
+        pts = it["pts"]
+        if max_points and len(pts) > max_points:
+            step = max(1, len(pts) // max_points)
+            pts = pts[::step]
+        polys.append({
+            "id": it.get("id"), "type": it["type"],
+            "pts": [[round(float(p[0]), ndigits), round(float(p[1]), ndigits), round(float(p[2]), ndigits)]
+                    for p in pts],
+        })
+    al = map_d["align"]
+    return {
+        "available": True,
+        "segment": map_d.get("segment"),
+        "processed_dir": map_d.get("processed_dir"),
+        "counts": map_d.get("counts", {}),
+        "polylines": polys,
+        "junctions": map_d.get("junctions", []),
+        "anchors": map_d.get("anchors", []),
+        "align": {
+            "scale": al.get("s"), "rms_m": al.get("rms"),
+            "rot_spread_med_deg": al.get("rot_spread_med_deg"),
+            "n_pairs": al.get("n_pairs"), "source": al.get("source"),
+            "scale_ok": al.get("scale_ok"), "theta_deg": al.get("theta_deg"),
+        },
+    }
 
 
 def project_point_to_image(point_3d: np.ndarray, viewmat: torch.Tensor, K: torch.Tensor, device: str = "cuda") -> Optional[tuple]:
@@ -506,8 +659,14 @@ BEV_COLLISION_COLOR = (70, 70, 235)   # BGR 红
 BEV_EGO_COLOR = (0, 215, 255)         # 主车：亮黄（与自车箭头同色）
 
 
-def _bev_world_bounds(tm, start_frame: int, num_frames: int, margin: float = 8.0):
-    """取整段窗口内所有物体的世界 XZ 范围（视频全程固定，避免画面抖动）。"""
+def _bev_world_bounds(tm, start_frame: int, num_frames: int, margin: float = 8.0,
+                      max_dist: float = 55.0, max_span: float = 90.0):
+    """取整段窗口内**主体附近**的世界 XZ 范围（视频全程固定，避免画面抖动）。
+
+    4DGS 重建出来的轨迹里混着误检的远处点，直接用 min/max 会把窗口拉到几百米，
+    画面里只剩几个像素（高精地图也就看不见了）。所以：
+      ① 先按"离中位中心有多远"剔掉远点；② 再做 2%~98% 分位裁剪；③ 最后把跨度封顶。
+    """
     xs, zs = [], []
     for f in range(int(start_frame), int(start_frame) + int(num_frames)):
         try:
@@ -523,18 +682,33 @@ def _bev_world_bounds(tm, start_frame: int, num_frames: int, margin: float = 8.0
             zs.append(float(c[2]))
     if not xs:
         return (-20.0, 20.0, -20.0, 20.0)
-    # 少量远处离群轨迹会把视角拉得过远：用 2%~98% 分位裁剪，保证主体（自车+参与者）看得清
-    if len(xs) >= 8:
-        lo_x, hi_x = np.percentile(xs, [2.0, 98.0])
-        lo_z, hi_z = np.percentile(zs, [2.0, 98.0])
-        xs = list(xs) + [float(lo_x), float(hi_x)]
-        zs = list(zs) + [float(lo_z), float(hi_z)]
-    return (min(xs) - margin, max(xs) + margin, min(zs) - margin, max(zs) + margin)
+    ax, az = np.asarray(xs), np.asarray(zs)
+    cx, cz = float(np.median(ax)), float(np.median(az))
+    keep = (np.abs(ax - cx) <= max_dist) & (np.abs(az - cz) <= max_dist)
+    if keep.sum() >= 4:
+        ax, az = ax[keep], az[keep]
+    if len(ax) >= 8:
+        lo_x, hi_x = np.percentile(ax, [2.0, 98.0])
+        lo_z, hi_z = np.percentile(az, [2.0, 98.0])
+    else:
+        lo_x, hi_x, lo_z, hi_z = ax.min(), ax.max(), az.min(), az.max()
+    lo = (float(lo_x) - margin, float(lo_z) - margin)
+    hi = (float(hi_x) + margin, float(hi_z) + margin)
+    # 跨度封顶：以中位中心为准收缩
+    for i in range(2):
+        span = hi[i] - lo[i]
+        if span > max_span:
+            mid = 0.5 * (hi[i] + lo[i])
+            lo = lo[:i] + (mid - max_span / 2.0,) + lo[i + 1:]
+            hi = hi[:i] + (mid + max_span / 2.0,) + hi[i + 1:]
+    return (lo[0], hi[0], lo[1], hi[1])
 
 
 def render_bev_frame(tm, renderer, frame_idx: int, bounds, size: int = 560,
-                     highlight_tracks=None, collision_frame=None, draw_ids: bool = False):
-    """渲染一帧俯视（BEV）示意图：物体=填充矩形（按朝向），历史轨迹=折线，自车=黄色箭头。
+                     highlight_tracks=None, collision_frame=None, draw_ids: bool = False,
+                     map_d=None, draw_map: bool = True):
+    """渲染一帧俯视（BEV）示意图：地图=底图（车道/标线/边界），物体=填充矩形（按朝向），
+    历史轨迹=折线，自车=黄色箭头。
 
     这是"上帝视角"，用于补充主车视角看不到的场景关系（谁在谁前面、从哪来）。
     """
@@ -567,6 +741,13 @@ def render_bev_frame(tm, renderer, frame_idx: int, bounds, size: int = 560,
         p1, p2 = to_px(vis_x0, gz), to_px(vis_x1, gz)
         cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (34, 42, 52), 1)
         gz += step
+
+    # 高精地图作为底图（在网格之上、物体之下）
+    if draw_map and map_d is not None:
+        try:
+            draw_map_bev(img, map_d, bounds, size, pad=PAD)
+        except Exception as e:  # noqa: BLE001
+            print(f"[waymo_map] BEV 画地图失败: {e}")
 
     try:
         objs = tm.get_frame_objects(frame_idx)
@@ -1014,7 +1195,8 @@ def render_topdown_sequence_video(renderer, tm, start_frame: int, num_frames: in
 
 def render_bev_sequence_video(tm, renderer, start_frame: int, num_frames: int, fps: float,
                               out_path: str, size: int = 560, highlight_tracks=None,
-                              collision_frame=None, draw_ids: bool = False):
+                              collision_frame=None, draw_ids: bool = False,
+                              map_d=None, draw_map: bool = True):
     """把俯视（BEV）逐帧画出来并编码成 mp4。"""
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     bounds = _bev_world_bounds(tm, start_frame, num_frames)
@@ -1022,7 +1204,8 @@ def render_bev_sequence_video(tm, renderer, start_frame: int, num_frames: int, f
     for i in range(int(max(1, num_frames))):
         try:
             frames.append(render_bev_frame(tm, renderer, int(start_frame) + i, bounds, size,
-                                           highlight_tracks, collision_frame, draw_ids))
+                                           highlight_tracks, collision_frame, draw_ids,
+                                           map_d=map_d, draw_map=draw_map))
         except Exception as e:  # noqa: BLE001
             print(f"[bev] 跳过帧 {int(start_frame) + i}: {e}")
     if not frames:
@@ -2820,7 +3003,8 @@ async def generate_corner_case_batch(request: CornerCaseBatchRequest):
                             size=request.bev_size,
                             highlight_tracks=result.get("collision_tracks"),
                             collision_frame=result.get("collision_frame"),
-                            draw_ids=request.bev_draw_ids)
+                            draw_ids=request.bev_draw_ids,
+                            map_d=get_scene_map(getattr(request, "scene_id", "")))
                     except Exception as e:  # noqa: BLE001
                         print(f"[batch] 俯视视频失败 {iid}: {e}")
                         bev_path = None
@@ -3020,7 +3204,8 @@ async def corner_case_video(request: CornerCaseVideoRequest):
                 bev_path = str(out_dir / f"{name}_bev.mp4")
                 render_bev_sequence_video(
                     tm, renderer, start, num, request.fps, bev_path,
-                    size=request.bev_size, draw_ids=request.bev_draw_ids)
+                    size=request.bev_size, draw_ids=request.bev_draw_ids,
+                    map_d=get_scene_map(request.scene_id))
             except Exception as e:  # noqa: BLE001
                 print(f"[video] 俯视示意图失败: {e}")
         top_path = None
@@ -3266,6 +3451,24 @@ def _matrix_to_list(pose):
     if isinstance(pose, torch.Tensor):
         return pose.detach().cpu().numpy().astype(float).tolist()
     return np.asarray(pose, dtype=float).tolist()
+
+
+@app.get("/api/scene/map/{scene_id}")
+async def scene_map_endpoint(scene_id: str, kinds: Optional[str] = None,
+                             refresh: bool = False, max_points: int = 0):
+    """场景世界系下的 Waymo 高精地图（车道中心线/标线/道路边界/斑马线/停车标志 + 路口锚点）。
+
+    `kinds` 逗号分隔过滤要素类型；`max_points` >0 时对每条折线抽稀；`refresh` 强制重算对齐。
+    """
+    get_scene_or_404(scene_id)
+    m = get_scene_map(scene_id, refresh=refresh)
+    if m is None:
+        return {"success": True, "available": False, "scene_id": scene_id,
+                "reason": map_unavailable_reason(scene_id)}
+    kl = [k.strip() for k in kinds.split(",")] if kinds else None
+    payload = map_payload(m, kinds=kl, max_points=max_points)
+    payload.update({"success": True, "scene_id": scene_id})
+    return payload
 
 
 @app.get("/api/scene3d/{scene_id}/frame/{frame_idx}")
@@ -4835,6 +5038,18 @@ def _insert_warnings(plan: Dict[str, Any]) -> List[str]:
                 "（自车起点后方没有路面点）：这几帧改用自车车底高度/远邻域推算贴地，"
                 "背景也会偏空。想看完整的行驶过程，建议减少帧数/降低速度，"
                 "或把起始帧往后挪。")
+    except Exception:  # noqa: BLE001
+        pass
+    # 道路约束（高精地图）体检结果
+    try:
+        rc = plan.get("road_constraint") or {}
+        if rc:
+            if rc.get("applied"):
+                out.append(
+                    f"已用高精地图把轨迹横向吸附回车道的 {int(rc.get('snapped_frames') or 0)} 帧"
+                    f"（吸附后偏离车道中位 {float(rc.get('dist_med_m') or 0):.2f}m）。")
+            for it in (rc.get("issues") or []):
+                out.append("道路约束：" + str(it))
     except Exception:  # noqa: BLE001
         pass
     return out
