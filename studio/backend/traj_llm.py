@@ -1150,6 +1150,13 @@ def _op_speed(tm, op, fps):
 
 
 def _op_lane_change(tm, op):
+    """平滑变道。
+
+    有高精地图时按**车道几何**做：先算目标横向位置（本车当前车道 + `lateral`），
+    再把终点吸附到"目标车道中心线"，最后用 smoothstep 在当前位置与目标车道之间插值
+    —— 这样变道终点是真实的车道中心，不是"往右挪 3.0m"这种拍脑袋的偏移。
+    没有地图时退回原来的纯横向平移。
+    """
     tid = int(op["track"])
     lat = float(op.get("lateral") or 0.0)
     f0 = int(op.get("start_frame") or 0)
@@ -1157,16 +1164,69 @@ def _op_lane_change(tm, op):
     frames, poses = _path_frames(tm, tid)
     if not frames:
         return {"op": "lane_change", "ok": False, "error": "没有轨迹"}
+    fs = [f for f in frames if f >= f0]
+    if not fs:
+        return {"op": "lane_change", "track": tid, "ok": False, "error": "起始帧之后没有轨迹"}
+
+    rm = _road_model_for(tm)
+    target_xz: Optional[np.ndarray] = None
+    lane_from = lane_to = None
+    if rm is not None and abs(lat) > 0.2:
+        try:
+            P0 = np.asarray(poses[fs[0]], dtype=np.float64)
+            c0 = P0[:3, 3]
+            side = 'right' if lat > 0 else 'left'
+            c0_xz = c0[[0, 2]]
+            lane_from, d_from = rm.lane_at(c0_xz, max_d=6.0)
+            nb = None
+            if lane_from is not None:
+                # 邻居的横向偏移要以**本车道中心线**为基准量（车子自己可能本来就偏在车道一侧）
+                on_lane = rm.snap_point(c0_xz, lane=lane_from, max_shift=12.0)
+                base_xz = np.asarray(on_lane['xz'], dtype=np.float64) if on_lane['applied'] else c0_xz
+                nb = rm.neighbor_lane(lane_from, side, xz=base_xz)
+                if nb is None:
+                    # 变道是"往前开的过程中并过去"，所以起点旁边没有目标车道不算数 ——
+                    # 再沿本车道往前看一段（按本车速度估），用那里的几何重试一次。
+                    try:
+                        Pn = np.asarray(poses[fs[-1]], dtype=np.float64)[:3, 3]
+                        look = rm.snap_point(Pn[[0, 2]], lane=lane_from, max_shift=12.0)
+                        if look['applied']:
+                            nb = rm.neighbor_lane(lane_from, side,
+                                                  xz=np.asarray(look['xz'], dtype=np.float64))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if nb is not None:
+                lane_to = nb['lane']
+                # 目标点 = 目标车道中心线上"沿本车道方向、落到本车前方同一位置"的点
+                tp = rm.snap_point(c0_xz, lane=lane_to, max_shift=12.0)
+                if tp['applied']:
+                    target_xz = np.asarray(tp['xz'], dtype=np.float64)
+        except Exception as e:  # noqa: BLE001
+            print(f'[road_rules] 变道目标车道解析失败: {e}')
+
     for f in frames:
+        if f < f0:
+            continue
         a = _smoothstep((f - f0) / float(dur))
         if a <= 0:
             continue
         P = poses[f].copy()
         right = P[:3, 0]
-        P[:3, 3] = P[:3, 3] + right * (lat * a)
+        if target_xz is None:
+            P[:3, 3] = P[:3, 3] + right * (lat * a)
+        else:
+            # 终点 = 目标车道中心线；起点 = 当前横向位置，按 smoothstep 插值
+            c = np.asarray(poses[fs[0]], dtype=np.float64)[:3, 3]
+            delta = np.array([float(target_xz[0]) - float(c[0]), 0.0,
+                              float(target_xz[1]) - float(c[2])])
+            P[:3, 3] = P[:3, 3] + delta * a
         tm.set_track_pose(tid, f, P)
-    return {"op": "lane_change", "track": tid, "ok": True,
-            "lateral": lat, "start_frame": f0, "duration": dur}
+    out = {"op": "lane_change", "track": tid, "ok": True,
+           "lateral": lat, "start_frame": f0, "duration": dur}
+    if lane_to is not None:
+        out.update({"mode": "map_lane_target", "lane_from": lane_from, "lane_to": lane_to,
+                    "note": "变道终点吸附到高精地图里真实相邻车道的中心线"})
+    return out
 
 
 def _road_model_for(tm):
@@ -1959,7 +2019,8 @@ def _op_replan(tm, op, fps: float = 10.0, num_frames: int = 30):
     tm._invalidate_heading_cache(sid)
     return {"op": "replan", "ok": True, "track": sid,
             "num_frames": len(plan.get("poses") or {}),
-            "mode": plan.get("mode"), "tried": len(plan.get("tried") or [])}
+            "mode": plan.get("mode"), "tried": len(plan.get("tried") or []),
+            "road_constraint": plan.get("road_constraint")}
 
 
 def _op_corner_case(tm, op, fps: float = 10.0, num_frames: int = 30):

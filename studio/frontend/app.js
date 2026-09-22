@@ -259,6 +259,14 @@ class DGGTStudio {
 
             const viewer = this.ensureViewer3d();
             viewer.show();
+            // 3D 视图是懒加载的：地图可能在它创建之前就已经取回来了，这里补一次
+            if (viewer && !viewer.roadMap && this.state.sceneMap) {
+                viewer.setRoadMap(this.state.sceneMap);
+            }
+            const roadBtn = document.getElementById('v3dRoadBtn');
+            if (roadBtn) {
+                roadBtn.classList.toggle('active', !!(viewer && viewer.showRoadMap && viewer.roadMap));
+            }
             if (this.state.sceneId) {
                 viewer.loadFrame(this.state.sceneId, this.state.currentFrame);
             }

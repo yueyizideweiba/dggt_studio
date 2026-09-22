@@ -460,6 +460,46 @@ def _yaw_pose(center: np.ndarray, yaw: float) -> np.ndarray:
     return P
 
 
+def _road_model(tm):
+    """取该场景的道路约束模型（没有高精地图时返回 None）。
+
+    高精地图是"可选增强"：老场景没有 map/ 目录时统一返回 None，所有道路约束接口都会
+    安全退化成 no-op，调用方不用写 if。
+    """
+    try:
+        import road_rules
+        sd = (getattr(getattr(tm, 'renderer', None), 'scene_path', None)
+              or getattr(tm, 'scene_path', None))
+        if not sd:
+            return None
+        return road_rules.get_road_model(str(sd))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _road_snap_info(rm, centers: Dict[int, np.ndarray], max_shift: float = 1.2):
+    """把轨迹横向吸附回车道走廊，返回 (新的中心点, 给前端看的体检信息)。
+
+    用 `per_frame=True`：每帧吸附到各自最近的车道 —— 这样"变道撞击"里故意跨车道的
+    结构不会被压平（整条轨道吸附到单一车道会把它抹掉）。
+    """
+    snap = rm.snap_centers(centers, per_frame=True, max_shift=max_shift)
+    rep = rm.on_road_report(snap['centers'])
+    info = {
+        'applied': bool(snap['applied']),
+        'snapped_frames': int(snap['snapped_frames']),
+        'skipped_frames': int(snap['skipped_frames']),
+        'lanes': (rep.get('lanes') or [])[:6],
+        'on_road_ratio': rep.get('on_road_ratio'),
+        'dist_med_m': rep.get('dist_med_m'),
+        'dist_max_m': rep.get('dist_max_m'),
+        'heading_err_med_deg': rep.get('heading_err_med_deg'),
+        'wrong_way': rep.get('wrong_way'),
+        'issues': rep.get('issues') or [],
+    }
+    return snap['centers'], info
+
+
 def _ground_setup(tm):
     """返回 (静态点, up_sign) 供贴地使用。"""
     from track_manager import _scene_points_cpu, _ground_height_near  # noqa: F401
@@ -661,6 +701,19 @@ def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
         # 场景覆盖外时的兜底高度 = 自车车体**底面**（不是车体中心！中心会让物体浮空半个车高）
         fb_y[int(f)] = float(p[1]) - up_sign * (float(ego_h) / 2.0)
     gys, n_sparse, n_fallback = _ground_path(pts, up_sign, centers, fb_y, ref_gy)
+
+    # ---- 道路约束（R1）：沿自车车道铺出来的轨迹也吸附回车道走廊 ----
+    # 和 plan_relative_trajectory 用同一套规则：有高精地图才做，没有就原样返回。
+    road_info: Dict[str, Any] = {}
+    road_rm = _road_model(tm)
+    if road_rm is not None:
+        try:
+            centers, road_info = _road_snap_info(road_rm, centers)
+        except Exception as _e:  # noqa: BLE001
+            print(f'[road_rules] 车道轨迹吸附失败: {_e}')
+        except Exception as _e:  # noqa: BLE001
+            print(f'[road_rules] 车道轨迹吸附失败: {_e}')
+
     poses: Dict[int, np.ndarray] = {}
     for f in sorted(centers):
         c = centers[f].copy()
@@ -669,6 +722,7 @@ def plan_trajectory(tm, dims, *, mode: str = "ahead", start_frame: int = 0,
     return {"ok": bool(poses), "poses": poses, "lane_s0": s0, "lateral": lat,
             "speed": speed, "direction_along_ego": direction_along_ego,
             "mode": mode, "distance": float(distance), "up_sign": up_sign,
+            "road_constraint": road_info,
             "ground_ref": ref_gy, "ground_fallback_frames": int(n_fallback),
             "ground_sparse_frames": int(n_sparse),
             "ground_sparse_total": int(n_fallback + n_sparse),
@@ -825,31 +879,10 @@ def plan_relative_trajectory(tm, dims, *, ref_track: int, same_dir: bool = True,
     # 位置就会飘出车道。这里用高精地图的车道中心线做一次有界横向吸附 —— 每帧吸附到各自
     # 最近的车道（而不是整条轨道主导车道），这样"变道撞击"的变道结构不会被压平。
     road_info: Dict[str, Any] = {}
-    road_rm = None
-    try:
-        import road_rules as _rr
-        _sd = (getattr(getattr(tm, 'renderer', None), 'scene_path', None)
-               or getattr(tm, 'scene_path', None))
-        road_rm = _rr.get_road_model(str(_sd)) if _sd else None
-    except Exception:  # noqa: BLE001
-        road_rm = None
+    road_rm = _road_model(tm)
     if road_rm is not None:
         try:
-            _snap = road_rm.snap_centers(centers, per_frame=True, max_shift=1.2)
-            centers = _snap['centers']
-            _rep = road_rm.on_road_report(centers)
-            road_info = {
-                'applied': bool(_snap['applied']),
-                'snapped_frames': int(_snap['snapped_frames']),
-                'skipped_frames': int(_snap['skipped_frames']),
-                'lanes': (_rep.get('lanes') or [])[:6],
-                'on_road_ratio': _rep.get('on_road_ratio'),
-                'dist_med_m': _rep.get('dist_med_m'),
-                'dist_max_m': _rep.get('dist_max_m'),
-                'heading_err_med_deg': _rep.get('heading_err_med_deg'),
-                'wrong_way': _rep.get('wrong_way'),
-                'issues': _rep.get('issues') or [],
-            }
+            centers, road_info = _road_snap_info(road_rm, centers)
         except Exception as _e:  # noqa: BLE001
             print(f'[road_rules] 相对轨迹吸附失败: {_e}')
 

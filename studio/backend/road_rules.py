@@ -142,6 +142,75 @@ class RoadModel:
 
     # ------------------------------------------------------------ R1/R2/R5：约束检查
 
+    def _right_vec(self, heading) -> np.ndarray:
+        """场景系里"车的右方"= forward × up。"""
+        h = np.asarray(heading, dtype=np.float64).reshape(-1)
+        f = np.array([h[0], 0.0, h[2]])
+        n = float(np.linalg.norm(f))
+        f = f / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+        up = np.array([0.0, -1.0, 0.0]) if self.up_sign < 0 else np.array([0.0, 1.0, 0.0])
+        return np.cross(f, up)
+
+    def neighbor_lane(self, lane_id, side: str, xz=None) -> Optional[Dict[str, Any]]:
+        """取车道的左/右相邻车道（规则 R3：跨车道只能走地图里真的连着的邻居边）。
+
+        map 里的 `left_neighbors` / `right_neighbors` 是按**行驶方向**定义的，这里再用
+        几何复核一遍（邻居中心线相对本车道的横向偏移方向要和 `side` 一致），
+        避免左右命名与场景系朝向不一致时选错。
+        """
+        L = self.map['lanes'].get(str(lane_id))
+        if not L:
+            return None
+        cands = []
+        for key in ('left_neighbors', 'right_neighbors'):
+            cands += [str(x) for x in (L.get(key) or []) if str(x) in self.map['lanes']]
+        P = np.asarray(L['pts'], dtype=np.float64)
+        if xz is None:
+            i = len(P) // 2
+            xz = P[i][[0, 2]]
+        else:
+            xz = np.asarray(xz, dtype=np.float64)[:2]
+        h = self.lane_dir(lane_id, xz)
+        if h is None:
+            h = _dir_at_start(P)[[0, 2]]
+        right = self._right_vec(np.array([h[0], 0.0, h[1]]))[[0, 2]]
+        want = 1.0 if str(side).lower().startswith('r') else -1.0
+
+        # 地图没给邻居边时的几何兜底：找一条**方向平行**、且横向偏在指定一侧的车道。
+        if not cands:
+            for c, L2 in self.map['lanes'].items():
+                if str(c) == str(lane_id):
+                    continue
+                Q = self.lane_pts(c)
+                if Q is None or len(Q) < 2:
+                    continue
+                j = int(np.argmin(np.linalg.norm(Q[:, [0, 2]] - xz, axis=1)))
+                h2 = self.lane_dir(c, Q[j][[0, 2]])
+                if h2 is None:
+                    continue
+                par = abs(float(np.dot(h2, h)))
+                if par < 0.75:                     # 只接受大致同向的车道（不是对向/横穿）
+                    continue
+                off = float(np.dot(Q[j][[0, 2]] - xz, right))
+                if off * want <= 0.5 or abs(off) > 8.0:
+                    continue
+                cands.append(str(c))
+        best, bs = None, None
+        for c in cands:
+            Q = self.lane_pts(c)
+            if Q is None or len(Q) == 0:
+                continue
+            j = int(np.argmin(np.linalg.norm(Q[:, [0, 2]] - xz, axis=1)))
+            off = float(np.dot(Q[j][[0, 2]] - xz, right))
+            if off * want <= 0.2:          # 方向不对（或几乎重合）就不要
+                continue
+            if abs(off) > 6.0:             # 一次变道最多跨 1~2 条车道，十几米外的不算
+                continue
+            score = abs(off)
+            if bs is None or score < bs:
+                best, bs = {'lane': c, 'offset_m': off, 'score': score}, score
+        return best
+
     def classify_point(self, xz, heading: Optional[np.ndarray] = None,
                        tol: float = LANE_TOL_M) -> Dict[str, Any]:
         lid, d = self.lane_at(xz, max_d=1e9)
