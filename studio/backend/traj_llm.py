@@ -1242,26 +1242,30 @@ def _road_model_for(tm):
 
 
 def _lay_turn_along_route(tm, tid: int, route, frames, poses, *, fps: float = 10.0,
-                          speed_mps: float = 0.0, direction: str = "left"):
-    """把"地图算出来的转弯路线"铺成逐帧位姿：位置沿弧长前进，航向取车道方向。"""
+                          speed_mps: float = 0.0, direction: str = "left",
+                          active: int = 0):
+    """把"地图算出来的转弯路线"铺成逐帧位姿：位置沿弧长前进，航向取车道方向。
+
+    `frames` 要传**从起始帧到该轨迹最后一帧的全部帧**（不只是 duration 那一段）：
+    只铺 duration 帧的话，后面的帧会留着操作前的值，车在转弯结束处会**瞬移**回去
+    （实测 300 帧的转弯只在第 302 帧截断，第 303 帧从 (-51,175) 跳回 (0,483)）。
+    所以按固定弧长步进 `v·dt` 连续铺到底；路线走到头后 `sample_polyline` 会沿末端
+    方向线性外推，相当于"出了这段地图继续往前开"，仍然连续。
+    """
     import road_rules as rr
     P = np.asarray(route['pts'], dtype=np.float64)
     if len(P) < 2 or not frames:
         return None
     c0 = np.asarray(poses[frames[0]], dtype=np.float64)[:3, 3]
     s0 = rr.project_arc(P, c0[[0, 2]])
-    n = len(frames)
     dt = 1.0 / max(1e-6, float(fps))
     v = float(speed_mps) if speed_mps and speed_mps > 0.5 else 6.0
     v = float(np.clip(v, 2.0, 18.0))
-    total = rr.polyline_total(P)
-    dist = min(v * dt * (n - 1), max(6.0, total - s0 - 1.0))
     up_sign = float(route.get('up_sign') or -1.0)
     moved = 0.0
     prev = None
     for i, f in enumerate(frames):
-        s = s0 + (dist * i / float(max(1, n - 1)))
-        c, h = rr.sample_polyline(P, s)
+        c, h = rr.sample_polyline(P, s0 + v * dt * i)
         if c is None:
             continue
         # 高度沿用原来的轨迹（转弯是水平面内的事，不该把车抬起来/按下去）
@@ -1277,7 +1281,8 @@ def _lay_turn_along_route(tm, tid: int, route, frames, poses, *, fps: float = 10
         P4[2, 0], P4[2, 2] = -sy, cy
         P4[:3, 3] = c
         tm.set_track_pose(int(tid), int(f), P4)
-    return {'moved_m': round(moved, 2), 'speed_mps': round(dist / max(1e-6, dt * (n - 1)), 2)}
+    return {'moved_m': round(moved, 2), 'speed_mps': round(v, 2),
+            'pos_after_turn': [round(float(prev[0]), 2), round(float(prev[1]), 2)] if prev is not None else None}
 
 
 def _op_turn(tm, op):
@@ -1308,7 +1313,9 @@ def _op_turn(tm, op):
         except Exception as e:  # noqa: BLE001
             print(f'[road_rules] turn 规划失败: {e}')
             route = None
-    fsel = [f for f in frames if f >= f0][:dur]
+    # 铺满"起始帧到轨迹末尾"的**全部**帧（不只是 duration 那一段），否则尾巴会瞬移，见 _lay_turn_along_route
+    fsel = [f for f in frames if f >= f0]
+    dur_rel = max(1, min(int(dur), len(fsel)))
     if route is not None and len(fsel) >= 3:
         spd = _track_speed(tm, tid)
         # 转弯要减速：取"当前速度"和"车道限速的一半"里较小的那个（下限 3m/s）
@@ -1324,14 +1331,29 @@ def _op_turn(tm, op):
             out = {"op": "turn", "track": tid, "ok": True, "mode": "map_lane_route",
                    "direction": direction, "turn_deg": round(float(route.get('turn_deg') or 0.0), 1),
                    "lane_ids": route.get('lane_ids'), "start_frame": f0,
-                   "duration": len(fsel), "speed_cap_mps": round(float(cap), 2), **info}
+                   "turn_at_m": route.get('turn_at_m'),
+                   "duration": int(dur_rel), "frames_written": len(fsel),
+                   "speed_cap_mps": round(float(cap), 2), **info}
+            warns = []
             if route.get('short_turn'):
-                out["warn"] = (
+                warns.append(
                     "这个位置/方向上没有可用的%s转支路（地图里搜到的路线航向只变了 %.0f°，目标 %.0f°）："
                     "车只是沿当前车道往前开了一段，没有真的转过去。"
                     "换一个更靠近路口的起始帧，或直接说'沿当前车道行驶'。"
                     % ({'left': '左', 'right': '右'}.get(direction, direction),
                        float(route.get('turn_deg') or 0.0), float(route.get('target_turn_deg') or 0.0)))
+            # 转弯点可能在几十米外，而这批帧根本走不到 —— 那样画面上看不到拐弯，
+            # 必须告诉用户"要加多少帧 / 起始帧往后挪多少"，而不是让他以为功能坏了。
+            turn_at = float(route.get('turn_at_m') or 0.0)
+            if turn_at > float(info.get('moved_m') or 0.0) + 3.0:
+                v = max(0.5, float(spd_use))
+                need = int(round((turn_at / v) * float(getattr(tm, 'fps', 10.0)))) + 3
+                warns.append(
+                    "转弯点在 %.0fm 外（这 %d 帧只走了 %.0fm），画面上还看不到拐弯："
+                    "把 duration 加到约 %d 帧，或把起始帧往后挪到更靠近路口的位置。"
+                    % (turn_at, len(fsel), float(info.get('moved_m') or 0.0), need))
+            if warns:
+                out["warn"] = " ".join(warns)
             return out
 
     # ---- 兜底：没有地图（或地图里找不到路口）时，绕弧线原地转 ----
@@ -1349,10 +1371,28 @@ def _op_turn(tm, op):
         P = poses[f].copy()
         P[:3, :3] = Ry(a) @ P[:3, :3]
         tm.set_track_pose(tid, f, P)
+    # 兜底原因要分清，别一律说"没有地图"
+    f_after = [f for f in frames if f >= f0]
+    has_at_f0 = False
+    try:
+        has_at_f0 = tm.get_track_pose(tid, int(f0)) is not None
+    except Exception:  # noqa: BLE001
+        has_at_f0 = False
+    if rm is None:
+        why = "本场景没有高精地图，只能原地改朝向"
+    elif not has_at_f0:
+        why = ("T:%d 在第 %d 帧没有轨迹（它的轨迹是第 %s~%s 帧），"
+               "start_frame 要落在它的轨迹范围内"
+               % (tid, f0, frames[0] if frames else '?', frames[-1] if frames else '?'))
+    elif not f_after:
+        why = "T:%d 在第 %d 帧之后就没有轨迹了" % (tid, f0)
+    else:
+        why = ("地图里从 T:%d 第 %d 帧的位置找不到可走的车道/路线"
+               "（可能它当时不在车道上，或这一带的车道图是断的）" % (tid, f0))
     return {"op": "turn", "track": tid, "ok": True, "mode": "in_place_fallback",
             "direction": direction,
             "yaw_deg": round(math.degrees(yaw), 1), "start_frame": f0, "duration": dur,
-            "note": "没有高精地图可用，只改变了朝向（建议用带地图的场景）"}
+            "note": why}
 
 
 def _yaw_of(P) -> float:

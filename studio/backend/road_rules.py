@@ -516,22 +516,31 @@ class RoadModel:
 
         target = {'left': math.radians(88.0), 'right': math.radians(-88.0),
                   'straight': 0.0}.get(direction, 0.0)
-        best, best_score, best_ang = None, None, 0.0
+        best, best_score, best_ang, best_probe = None, None, 0.0, 0.0
         for p in results:
             route = _dedup_polyline(np.concatenate(p['segs'], axis=0))
             total = polyline_total(route)
             if total - s0 < 8.0:
                 continue
-            probe = min(total, s0 + float(forward_m))
-            if probe - s0 < 8.0:
+            # 转向要在**整条候选路径的末端**去量，而不是固定的 forward_m 处：
+            # 路口的转弯常常是"进口直行几十米 → 那条车道自己弯过去"，实测 scene 018
+            # 进口 120 → 135 → 165 → 184 的左转在 144m 外才弯完（184 这条车道自己弯 +92°）。
+            # 只量 s0+55m 会看到 +1°，于是把明明存在的左转判成"没有支路"。
+            # 同时保留 forward_m 处的结果，取"转得最像目标"的那个采样点。
+            cands_ang = []
+            for s_probe in (s0 + float(forward_m), total):
+                if s_probe - s0 < 8.0:
+                    continue
+                _c, hh = sample_polyline(route, min(total, s_probe))
+                cands_ang.append((turn_side(h_start, hh, self.up_sign), float(min(total, s_probe))))
+            if not cands_ang:
                 continue
-            _c, h_end = sample_polyline(route, probe)
-            ang = turn_side(h_start, h_end, self.up_sign)     # >0 左转
+            ang, probe = max(cands_ang, key=lambda t: -abs(t[0] - target))
             score = -abs(ang - target)
             if direction == 'straight' and len(p['lanes']) == 2:
                 score += 0.25      # 直行时优先用真正连着的下一跳，别绕环岛一整圈
             if best_score is None or score > best_score:
-                best, best_score, best_ang = p, score, ang
+                best, best_score, best_ang, best_probe = p, score, ang, probe
         if best is None:
             return None
         route = _dedup_polyline(np.concatenate(best['segs'], axis=0))
@@ -542,6 +551,7 @@ class RoadModel:
         short = abs(got_deg - want_deg) > 40.0 and direction != 'straight'
         return {'pts': route, 'lane_ids': best['lanes'], 'direction': direction,
                 'turn_deg': float(got_deg), 'target_turn_deg': float(want_deg),
+                'turn_at_m': round(float(best_probe - s0), 1),
                 'short_turn': bool(short),
                 'entry_lane': str(lane0), 'start_xz': xz.tolist(),
                 'start_arc_m': float(s0), 'back_m': float(back_m),
