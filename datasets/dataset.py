@@ -191,6 +191,7 @@ class WaymoOpenDataset(Dataset):
 
         self.start_idx = start_idx
 
+        loaded, skipped = [], []
         for scene_name in scene_names:
             scene_path = os.path.join(image_dir, scene_name, "images")
             if os.path.isdir(scene_path):
@@ -322,7 +323,17 @@ class WaymoOpenDataset(Dataset):
                         self.semantic_mask_path.append(views_sem_lists)
                 else:
                     self.semantic_mask_path.append([] if self.views == 1 else [[] for _ in self.camera_ids])
+                loaded.append(scene_name)
+            else:
+                skipped.append(scene_name)
 
+        # self.scenes 必须**只含真正加载成功的场景**：否则 __len__ 与实际列表长度不一致，
+        # `dataset[i]` 会错位，按 idx 反查场景名（inference 写 scene_meta 用）也会错。
+        self.scenes = loaded
+        self.skipped_scenes = skipped
+        if skipped:
+            print('[dataset] 跳过 %d 个不存在的场景（缺 images/ 目录）：%s'
+                  % (len(skipped), ', '.join(skipped[:8]) + (' ...' if len(skipped) > 8 else '')))
 
     def __len__(self):
         return len(self.scenes)

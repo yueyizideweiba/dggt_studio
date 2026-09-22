@@ -71,6 +71,10 @@ def parse_scene_names(scene_names_str):
     else:
         return [str(int(x)).zfill(3) for x in scene_names_str.split()]
     
+class _SkipComparison(Exception):
+    """对比视频缺少 GT 深度时用来跳过的内部信号（不该被当成真错误打日志）。"""
+
+
 def _batch_scene_name(batch, dataset, scene_idx):
     """取当前 batch 对应的**真实输入场景名**。
 
@@ -97,6 +101,39 @@ def _batch_scene_name(batch, dataset, scene_idx):
     except Exception:  # noqa: BLE001
         pass
     return str(scene_idx).zfill(3)
+
+
+def preflight_check(image_dir, scene_names, mode=2, verbose=True):
+    """开跑前检查标记图是否齐全。
+
+    为什么需要：mode 2 的 `__getitem__` 会**无条件**用 `sky_mask_paths[i]` 取天空掩码，
+    缺 `sky_masks/` 时只会抛一句 `IndexError: list index out of range`，指向一行
+    看起来毫不相干的代码（dataset.py 的 mask_seq 那行），非常难查。这里提前查，
+    并直接给出补图命令。
+
+    返回缺失清单 [(scene, 子目录), ...]；空列表 = 全部就绪。
+    """
+    need = ['sky_masks', os.path.join('fine_dynamic_masks', 'all')]
+    missing = []
+    for name in scene_names:
+        for d in need:
+            p = os.path.join(image_dir, str(name), d)
+            try:
+                n = len([f for f in os.listdir(p) if not f.startswith('.')]) if os.path.isdir(p) else 0
+            except Exception:  # noqa: BLE001
+                n = 0
+            if n == 0:
+                missing.append((str(name), d))
+    if missing and verbose:
+        print('\n' + '=' * 72)
+        print('!! 场景缺少标记图，跑不起来（会抛 IndexError: list index out of range）')
+        for s, d in missing:
+            print('   %-8s 缺 %s' % (s, d))
+        print('   补图： bash tools_make_masks.sh %s'
+              % ' '.join(sorted({s for s, _ in missing})))
+        print('   （用 SegFormer 出语义掩码，再派生 DGGT 需要的动态掩码；每个场景约 10 分钟）')
+        print('=' * 72 + '\n')
+    return missing
 
 
 def calculate_scale_factor(P1, P2):
@@ -155,12 +192,16 @@ def main():
                         help='Dataset type: waymo (default) or nuscenes')
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)
+    scene_names_str = ' '.join(args.scene_names)
+    scene_names = parse_scene_names(scene_names_str)
+
+    # 先查标记图再加载任何模型：缺图时 1 秒内就给出可操作的提示（而不是等模型加载完再抛 IndexError）
+    if preflight_check(args.image_dir, scene_names, mode=args.mode):
+        raise SystemExit(2)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float32
     loss_fn = lpips.LPIPS(net='alex').to(device)
-
-    scene_names_str = ' '.join(args.scene_names)
-    scene_names = parse_scene_names(scene_names_str)
 
     # 视角选择：--camera_ids 优先（可"留出"某些相机用于 novel-view 评测）
     camera_ids = ([int(x) for x in str(args.camera_ids).split(",")] if args.camera_ids else list(range(args.input_views)))
@@ -213,8 +254,18 @@ def main():
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
+            if 'dynamic_mask' not in batch:
+                raise RuntimeError(
+                    '场景缺 fine_dynamic_masks/all，无法区分动/静，重建出来的场景不可用。'
+                    '补图： bash tools_make_masks.sh <场景号>')
             gt_dy_map = batch['dynamic_mask'].to(device)
-            gt_depth = batch['gt_depth'].to(device)
+            # -depth / -metrics 需要 GT 深度；processed 目录里没有 depth_flows_4 时
+            # 就明说跳过，不要抛 KeyError('gt_depth') 让人猜。
+            gt_depth = batch['gt_depth'].to(device) if 'gt_depth' in batch else None
+            if gt_depth is None and not getattr(main, '_warned_depth', False):
+                print('[inference] 该 processed 目录没有 depth_flows_4，'
+                      'GT 深度指标会跳过（不影响重建与导出）')
+                main._warned_depth = True
 
             bg_mask = (sky_mask == 0).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
@@ -692,8 +743,9 @@ def main():
             gt_dy_map = gt_dy_map[0].sigmoid().detach().cpu()
             if args.mode == 2:
                 depth_frames = depth_frames.detach().cpu()  # Use accumulated depth from renders
-                gt_depth = gt_depth[..., 0:1]
-                gt_depth = gt_depth[0].squeeze(-1).detach().cpu()
+                if gt_depth is not None:
+                    gt_depth = gt_depth[..., 0:1]
+                    gt_depth = gt_depth[0].squeeze(-1).detach().cpu()
                 sky_mask = sky_mask.detach().cpu()
             if args.mode == 3:
                 depth_frames = depth_interp[0].detach().cpu()
@@ -703,10 +755,15 @@ def main():
             out_video = os.path.join(scene_out_dir, "comparison.mp4")
             # 对比视频目前只支持 1/3 视角布局；其它视角数跳过多视角拼图（不影响 gaussians/ego_pose 等主产物）
             try:
+                if gt_depth is None:
+                    print("[inference] 跳过对比视频（该 processed 目录没有 GT 深度）")
+                    raise _SkipComparison()
                 make_comparison_video_quad(gt_frames, pred_frames, gt_dy_map, dyn_frames, gt_depth,
                                            depth_frames, sky_mask, out_video, fps=8,
                                            views=args.input_views)
                 print("Saved comparison video:", out_video)
+            except _SkipComparison:
+                pass
             except Exception as _e:  # noqa: BLE001
                 print(f"[inference] 跳过对比视频（views={args.input_views} 布局不支持）: {_e}")
 
