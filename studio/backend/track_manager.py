@@ -1668,6 +1668,23 @@ class TrackManager:
         if raw is not None:
             return np.asarray(raw, dtype=np.float32)
 
+        # 该帧没有原始位姿 → **资产化**：在相邻"有检测"的帧之间插值，让物体在漏检的帧
+        # 里也持续存在（不因某一帧没识别到就整帧消失）。只覆盖"首次检测 ~ 末次检测"
+        # 之间的内部空隙；末次检测之后不夹取（物体可能真的离开场景了）。
+        raw_frames = sorted(self.track_raw_poses.get(track_id, {}).keys())
+        if raw_frames:
+            if frame_idx < raw_frames[0] or frame_idx > raw_frames[-1]:
+                return None
+            if frame_idx in self.track_raw_poses[track_id]:
+                return np.asarray(self.track_raw_poses[track_id][frame_idx], dtype=np.float32)
+            for f0, f1 in zip(raw_frames[:-1], raw_frames[1:]):
+                if f0 < frame_idx < f1:
+                    alpha = (frame_idx - f0) / float(max(1, f1 - f0))
+                    return np.asarray(self.renderer._interp_pose(
+                        self.track_raw_poses[track_id][f0],
+                        self.track_raw_poses[track_id][f1], alpha), dtype=np.float32)
+            return None
+
         # 该帧无原始位姿（稀疏关键帧轨迹）：在编辑关键帧之间插值
         if edits:
             frames = sorted(edits.keys())
@@ -1969,6 +1986,47 @@ class TrackManager:
                 "transform": torch.tensor(transform, device=device, dtype=torch.float32),
                 "synth_track_id": int(sid),
             })
+
+        # ---- 资产化：补回"这一帧漏检、但 track 仍应存在"的真实物体 ----
+        # 单目检测偶发漏掉某一帧，导致那帧的逐帧元数据里没有该物体。这里用
+        # "该物体最后一次出现的外观 + 相邻检测帧插值出的位姿"把它补回来，避免整帧消失。
+        try:
+            present = {int(o["object_id"]) for o in self.renderer.load_real_frame_objects(frame_idx)}
+        except Exception:  # noqa: BLE001
+            present = set()
+        for tid, frames_map in self.track_to_frames.items():
+            if tid in self.track_deleted or tid in self.track_replaced or tid in self.synthetic_tracks:
+                continue
+            if not frames_map:
+                continue
+            fmin, fmax = min(frames_map.keys()), max(frames_map.keys())
+            if not (fmin <= frame_idx <= fmax):
+                continue
+            rid_this = frames_map.get(frame_idx)
+            if rid_this is not None and int(rid_this) in present:
+                continue                     # 这一帧本来就有，不用补
+            pose = self.get_track_pose(int(tid), frame_idx)
+            if pose is None:
+                continue
+            # donor 用"这一帧之前最近一次检测"的 raw id：渲染是顺序进行的，它的外观一定
+            # 已经在 `_obj_appearance` 缓存里。别用 `_track_render_raw`（那是**末次**检测的
+            # id，可能还没渲染到，缓存里没有 → 回退失败）。
+            donor_raw = None
+            for f2 in sorted(frames_map.keys(), reverse=True):
+                if f2 <= frame_idx:
+                    donor_raw = frames_map[f2]
+                    break
+            if donor_raw is None:
+                donor_raw = frames_map[min(frames_map.keys())]
+            if donor_raw is None:
+                continue
+            extras.append({
+                "donor_object_id": int(donor_raw),
+                "transform": torch.tensor(np.asarray(pose, dtype=np.float32),
+                                          device=device, dtype=torch.float32),
+                "synth_track_id": None,      # 不是合成物体，别被 ego/synth 过滤误伤
+                "persistent": True,
+            })
         return extras
 
     # ==================== 帧级物体列表（带 track_id） ====================
@@ -2028,6 +2086,35 @@ class TrackManager:
                 "edited": self.is_track_edited(int(tid)),
                 "synthetic": False,
                 "extended": True,      # 该帧是"延长出来"的，位姿由轨迹外推
+            })
+
+        # 资产化：**内部漏检帧** —— track 的检测区间覆盖这一帧、但这一帧的逐帧元数据里
+        # 没有它（单目检测偶发漏掉），用相邻检测帧插值位姿把它补回来，别让物体"整帧消失"。
+        for tid, frames_map in self.track_to_frames.items():
+            if int(tid) in seen_tracks:
+                continue
+            if tid in self.track_deleted or tid in self.track_replaced:
+                continue
+            if not frames_map:
+                continue
+            fmin, fmax = min(frames_map.keys()), max(frames_map.keys())
+            if not (fmin <= frame_idx <= fmax):
+                continue
+            pose = self.get_track_pose(int(tid), frame_idx)
+            if pose is None:
+                continue
+            pose_list = np.asarray(pose, dtype=np.float32).astype(float).tolist()
+            meta = self.track_meta.get(int(tid), {}) or {}
+            result.append({
+                "track_id": int(tid),
+                "raw_object_id": self.get_raw_object_id(int(tid), frame_idx),
+                "type": meta.get("type", "动态物体"),
+                "dimensions": meta.get("dimensions", []) or self.get_track_dimensions(int(tid)),
+                "pose_world": pose_list,
+                "center": [pose_list[0][3], pose_list[1][3], pose_list[2][3]],
+                "edited": self.is_track_edited(int(tid)),
+                "synthetic": False,
+                "persisted": True,      # 该帧是"补出来的"（检测漏帧，位姿由相邻帧插值）
             })
 
         # 合成参与者 + 主车（EGO 实体）

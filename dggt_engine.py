@@ -1036,6 +1036,18 @@ class DGGTRenderer:
                     dyn_scales.append(dyn_gs["scales"][mask])
                     dyn_opac.append(dyn_gs["opacities"][mask])
                     dyn_cols.append(dyn_gs["colors"][mask])
+                else:
+                    # 资产化兜底：这一帧的逐帧 PLY 里没有这个 donor（检测漏帧），
+                    # 回退到"该物体最后一次出现"的外观缓存，仍按给定位姿渲染。
+                    part = self._obj_appearance.get((int(donor_view), int(donor_raw)))
+                    if part is None:
+                        continue
+                    p_world, q_world = self._transform_gaussians(part["means"], part["quats"], transform)
+                    dyn_means.append(p_world)
+                    dyn_quats.append(q_world)
+                    dyn_scales.append(part["scales"])
+                    dyn_opac.append(part["opacities"])
+                    dyn_cols.append(part["colors"])
 
         # 渲染 SAM 3D 导入物体（自带 .ply 高斯，无需 donor 克隆）
         if self.sam3d_objects and not self.static_only:
