@@ -261,6 +261,7 @@ class TrackManager:
         # track_id -> {frame_idx: pose}：**超出磁盘数据帧**的外推位姿。与 track_edits 分开存，
         # 这样"延长出来的轨迹"不会被当成用户手动编辑（但仍可被编辑覆盖）。
         self.track_extended = {}
+        self._road_model_cache = None    # 场景高精地图模型（懒加载、缓存；没有地图时为 None）
         # track_id -> 该 track 用于渲染的稳定 raw object_id（超范围帧没有逐帧数据，
         # 外观沿用最后一次出现的那一份）
         self._track_render_raw = {}
@@ -393,6 +394,89 @@ class TrackManager:
             out[int(f)] = P.astype(np.float32)
         return out
 
+    def _road_model(self):
+        """场景的高精地图道路模型（`road_rules.RoadModel`）；没有地图时返回 None（带缓存）。"""
+        rm = getattr(self, "_road_model_cache", None)
+        if rm is None:
+            try:
+                import road_rules
+                sd = getattr(self.renderer, "scene_path", None)
+                self._road_model_cache = road_rules.get_road_model(str(sd)) if sd else None
+            except Exception:  # noqa: BLE001
+                self._road_model_cache = None
+            rm = self._road_model_cache
+        return rm
+
+    def _extrapolate_along_lane(self, poses, targets, max_speed=35.0, dims=None):
+        """沿**车道中心线**外推位姿（替代常速度直线外推）。
+
+        解决"延长一辆正在转弯的车，结果它直着开出去"的问题：找该车最后所在的车道，
+        沿车道几何继续往前走，位置取车道中心线、航向取车道方向 —— 转弯的车就延成转弯。
+
+        返回 `None` 表示"这辆车不在车道上/没有地图"，调用方应退回直线外推。
+        """
+        road = self._road_model()
+        if road is None:
+            return None
+        import road_rules as rr
+        keys = sorted(poses)
+        tgt = [int(f) for f in targets if int(f) > keys[-1]]
+        if not tgt:
+            return {}
+        last_f = int(keys[-1])
+        last = np.asarray(poses[last_f], dtype=np.float32)
+        c0 = last[:3, 3]
+        fwd = last[:3, 2]
+        lane, d = road.lane_at(c0[[0, 2]], heading=fwd, max_d=6.0)
+        if lane is None:
+            return None
+        route = road.route_forward(c0[[0, 2]], lane=lane, heading=fwd, distance=400.0)
+        if not route or len(route['pts']) < 2:
+            return None
+        P = np.asarray(route['pts'], dtype=np.float64)
+        s0 = rr.project_arc(P, c0[[0, 2]])
+        # 速度：末尾若干帧的中位步长；夹在 [0.5, min(max_speed, 车道限速)]
+        dt = 1.0 / max(1e-6, float(getattr(self, "fps", 10.0)))
+        win = keys[-max(2, min(8, len(keys))):]
+        steps = []
+        for fa, fb in zip(win[:-1], win[1:]):
+            a = np.asarray(poses[fa], np.float32)[:3, 3]
+            b = np.asarray(poses[fb], np.float32)[:3, 3]
+            steps.append(float(np.linalg.norm((b - a)[[0, 2]]) / max(1, fb - fa)))
+        spd = float(np.median(steps)) / dt if steps else 0.0
+        lim = float(road.speed_limit_mps(lane) or max_speed)
+        spd = float(np.clip(spd, 0.5, min(max_speed, max(lim, 3.0))))
+        dd = list(dims) if dims and len(dims) >= 3 else [1.86, 1.45, 4.9]
+        out = {}
+        for f in tgt:
+            s = s0 + spd * dt * (int(f) - last_f)
+            c, h = rr.sample_polyline(P, s)
+            if c is None:
+                continue
+            yaw = math.atan2(float(h[0]), float(h[2]))
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            Pm = last.copy()
+            Pm[:3, 0] = (cy, 0.0, -sy)
+            Pm[:3, 1] = (0.0, 1.0, 0.0)
+            Pm[:3, 2] = (sy, 0.0, cy)
+            gy = self.ground_y_at(float(c[0]), float(c[2]))
+            Pm[1, 3] = float(gy) + self.world_up_sign() * (0.5 * float(dd[1])) if gy is not None \
+                else float(last[1, 3])
+            Pm[:3, 3] = np.array([float(c[0]), float(Pm[1, 3]), float(c[2])], dtype=np.float32)
+            out[int(f)] = Pm.astype(np.float32)
+        return out
+
+    def _extrapolate_poses_smart(self, poses, targets, mode="extrapolate", window=8,
+                                 max_speed=35.0, dims=None):
+        """先沿车道外推，不行再退回直线外推。`hold` 模式不沿车道。"""
+        if mode == "hold":
+            return self._extrapolate_poses(poses, targets, mode="hold",
+                                           window=window, max_speed=max_speed)
+        lane = self._extrapolate_along_lane(poses, targets, max_speed=max_speed, dims=dims)
+        if lane:
+            return lane
+        return self._extrapolate_poses(poses, targets, mode=mode, window=window, max_speed=max_speed)
+
     def get_track_dimensions_local(self, track_id=None, pose=None):
         """外推时用：拿到尺寸（拿不到就给一个轿车默认值）。"""
         if track_id is not None:
@@ -436,8 +520,9 @@ class TrackManager:
             s = self.synthetic_tracks.get(self.ego_track_id)
             if s and s.get("poses"):
                 ego_poses = {int(f): np.asarray(v, dtype=np.float32) for f, v in s["poses"].items()}
-                new = self._extrapolate_poses(ego_poses, targets,
-                                              mode=(ego_mode or mode))
+                new = self._extrapolate_poses_smart(ego_poses, targets,
+                                                    mode=(ego_mode or mode),
+                                                    dims=(s.get("dimensions") or None))
                 s["poses"].update(new)
                 s["base_poses"].update({f: v.copy() for f, v in new.items()})
                 self._invalidate_heading_cache(self.ego_track_id)
@@ -460,7 +545,11 @@ class TrackManager:
                     poses[int(f)] = np.asarray(v, dtype=np.float32)
                 if len(poses) < 2:
                     continue
-                new = self._extrapolate_poses(poses, targets, mode=mode)
+                try:
+                    tdims = list(self.get_track_dimensions(int(tid)))
+                except Exception:  # noqa: BLE001
+                    tdims = None
+                new = self._extrapolate_poses_smart(poses, targets, mode=mode, dims=tdims)
                 if not new:
                     continue
                 self.track_extended.setdefault(int(tid), {}).update(new)
@@ -474,8 +563,9 @@ class TrackManager:
                 poses = spec.get("poses") or {}
                 if len(poses) < 2:
                     continue
-                new = self._extrapolate_poses({int(f): v for f, v in poses.items()}, targets,
-                                              mode=mode)
+                new = self._extrapolate_poses_smart({int(f): v for f, v in poses.items()}, targets,
+                                                    mode=mode,
+                                                    dims=(spec.get("dimensions") or None))
                 if new:
                     spec["poses"].update(new)
                     self._invalidate_heading_cache(int(sid))

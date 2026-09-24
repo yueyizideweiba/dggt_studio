@@ -598,6 +598,53 @@ class RoadModel:
         route = _dedup_polyline(np.concatenate([s for s in segs if s is not None], axis=0))
         return {'pts': route, 'lane_ids': ids}
 
+    def route_forward(self, xz, lane: Optional[str] = None, heading=None, *,
+                      distance: float = 200.0, max_lanes: int = 40) -> Optional[Dict[str, Any]]:
+        """沿车道图**往前走** `distance` 米，用来做"沿路延伸"。
+
+        和 `plan_along_lane` 的区别：遇到分叉（路口/多车道扇出）时**不停止**，而是选
+        "初始方向最接近当前航向"的那条出口继续走 —— 这样延一辆正在接近路口的车时，
+        它会选直行出口继续开，而不是在路口原地停下。
+        """
+        if lane is None:
+            lane, _ = self.lane_at(xz, heading=heading, max_d=6.0)
+        if lane is None:
+            return None
+        P0 = self.lane_pts(lane)
+        if P0 is None or len(P0) < 2:
+            return None
+        if heading is not None:
+            h = np.asarray(heading, dtype=np.float64).reshape(-1)
+            h = np.array([h[0], h[2]]) if h.size >= 3 else h[:2]
+            n = float(np.linalg.norm(h))
+            h = h / n if n > 1e-9 else _dir_at_end(P0)[[0, 2]]
+        else:
+            h = _dir_at_end(P0)[[0, 2]]
+        segs, ids, cur, acc = [P0], [str(lane)], str(lane), self.lane_length(lane)
+        for _hop in range(int(max_lanes)):
+            if acc >= distance:
+                break
+            exs = self.pure_successors(cur)
+            if not exs:
+                break
+            best, bs = None, None
+            for e in exs:
+                Q = self.lane_pts(e)
+                if Q is None or len(Q) < 2:
+                    continue
+                sc = float(np.dot(_dir_at_start(Q)[[0, 2]], h))   # 越大越"直行"
+                if bs is None or sc > bs:
+                    best, bs = e, sc
+            if best is None:
+                break
+            Q = self.lane_pts(best)
+            segs.append(Q)
+            ids.append(best)
+            cur = best
+            acc += self.lane_length(best)
+        route = _dedup_polyline(np.concatenate(segs, axis=0))
+        return {'pts': route, 'lane_ids': ids}
+
 
 # ---------------------------------------------------------------- 小工具
 
