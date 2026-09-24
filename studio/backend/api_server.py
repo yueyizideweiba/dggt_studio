@@ -4573,46 +4573,69 @@ async def sam_frame_candidates(request: SamFrameCandidatesRequest):
 
 
 def _ply_bbox_and_orientation(ply_path: str, target_dims=None, sigma_k=None):
-    """读 .ply 的 xyz，返回 (质心, 三轴尺寸, 朝向修正 3x3 旋转矩阵)。
+    """读 .ply 的 xyz，返回 (质心, 三轴尺寸[宽,高,长], 朝向修正 3x3 旋转矩阵)。
 
-    与早期版本的区别（解决"替换后比原模型大一圈"）：
-    - 不再用"高斯中心的 min/max bbox"，而是用**可见轮廓**：每个高斯按其可见半径
-      （sigma_k × 高斯尺度，尺度用 99.5% 分位截断防离群）向外扩张后的包络。
-      早期只按中心 bbox 对齐，会忽略 SAM3D 输出的"虚边"，替换后看起来偏大。
-    `sigma_k` 默认取环境变量 DGGT_SAM3D_SIGMA_K（默认 2.0，约 2σ 可见范围）。
+    **朝向不再假设 SAM3D 每次重建都落在同一个 canonical 方位**（实测朝向经常漂，导致
+    导入的模型横着/斜着摆）。这里用 PCA 找模型自身的三个主轴，把"最长的水平轴"当作
+    前进方向（长）、"最短轴"当作高、剩下的当作宽，再旋转到 DGGT 物体局部系
+    (X=宽, Y=高, Z=长)。
 
-    朝向修正：SAM3D canonical(上=-Z, 前=-Y, 右=+X) → DGGT 物体局部系(X=宽, Y=高, Z=长)，
-    R = Ry(180°)·Rx(+90°) = [[-1,0,0],[0,0,-1],[0,-1,0]]（纯旋转，det=+1）。
+    朝向符号用 SAM3D 文档里的 canonical（上=-Z, 前=-Y）来消歧：几何上"上/下、前/后"
+    无法区分，这里取 canonical 最近的那一侧，保证结果稳定。
+
+    与旧版的区别：返回的 `ext` 已经是物体局部系的 [宽, 高, 长] 顺序（而不是 canonical
+    的 min/max），`corr` 也不再是固定置换阵、而是真正的 PCA 旋转 —— 下游 `_fit_scale_and_dims`
+    不再需要 `|corr|` 重排。
     """
     from plyfile import PlyData
     v = PlyData.read(ply_path)["vertex"]
     xyz = np.stack([np.asarray(v["x"]), np.asarray(v["y"]), np.asarray(v["z"])], axis=-1).astype(np.float32)
-    # 每个高斯的可见半径：scale 是未激活的 log 值，exp 还原；用 99.5% 分位截断，
-    # 避免个别超大高斯把尺寸撑飞。
     if sigma_k is None:
         sigma_k = float(os.environ.get("DGGT_SAM3D_SIGMA_K", "2.0"))
+    # 可见半径（仅用于把包围盒包到"渲染出来的可见轮廓"，避免替换后大一圈）
     try:
         sc = np.stack([np.asarray(v["scale_0"]), np.asarray(v["scale_1"]),
                        np.asarray(v["scale_2"])], axis=-1).astype(np.float32)
         sc = np.exp(np.clip(sc, -30.0, 2.0))
         sc = np.minimum(sc, np.percentile(sc, 99.5, axis=0).astype(np.float32))
         rad = float(sigma_k) * sc
-        # 可见轮廓 = 高斯中心 ± 可见半径 的包络（比只看中心的 bbox 更贴近渲染结果，
-        # 否则替换后的模型会看起来"大一圈"）
-        lo = (xyz - rad).min(axis=0)
-        hi = (xyz + rad).max(axis=0)
-        ext = hi - lo
-        # 质心通常不等于包围盒中心（高斯在前脸密、车尾疏），而渲染时是"减去 center"把
-        # 它挪到位姿原点、贴地又按"位姿中心 ± 高度/2"推算的。用质心会让模型相对位姿
-        # 偏上/偏下 → 看起来悬空或沉一半。这里统一用**可见轮廓包围盒中心**。
-        center = (lo + hi) / 2.0
+        canon_lo = (xyz - rad).min(axis=0)
+        canon_hi = (xyz + rad).max(axis=0)
     except Exception:  # noqa: BLE001
-        p_lo = np.percentile(xyz, 0.5, axis=0)
-        p_hi = np.percentile(xyz, 99.5, axis=0)
-        ext = np.asarray(p_hi - p_lo, dtype=np.float32)
-        center = (p_lo + p_hi) / 2.0
-    R = np.array([[-1, 0, 0], [0, 0, -1], [0, -1, 0]], dtype=np.float32)
-    return center, np.asarray(ext, dtype=np.float32), R
+        canon_lo = np.percentile(xyz, 0.5, axis=0)
+        canon_hi = np.percentile(xyz, 99.5, axis=0)
+
+    # ---- PCA：最短轴=高，最长水平轴=长，剩下=宽 ----
+    mean = xyz.mean(axis=0).astype(np.float64)
+    cov = (xyz.astype(np.float64) - mean).T @ (xyz.astype(np.float64) - mean)
+    cov = cov / max(1, len(xyz))
+    evals, evecs = np.linalg.eigh(cov)                    # 升序：evecs[:,0] 最短轴
+    up = evecs[:, 0].astype(np.float64)                   # 最短 ≈ 高
+    l_axis = evecs[:, 2].astype(np.float64)               # 最长水平 ≈ 长
+    # 符号消歧（canonical 上=-Z、前=-Y）
+    if float(np.dot(up, [0.0, 0.0, -1.0])) < 0:
+        up = -up
+    if float(np.dot(l_axis, [0.0, -1.0, 0.0])) < 0:
+        l_axis = -l_axis
+    up = up / (np.linalg.norm(up) or 1.0)
+    l_axis = l_axis / (np.linalg.norm(l_axis) or 1.0)
+    w_axis = np.cross(up, l_axis)
+    w_axis = w_axis / (np.linalg.norm(w_axis) or 1.0)
+    l_axis = np.cross(w_axis, up)                          # 保证三者严格正交、右手系
+    M = np.stack([w_axis, up, l_axis], axis=0).astype(np.float32)   # 行=宽/高/长 → local = M @ canonical
+
+    # 把 canonical 包围盒的 8 个角转到局部系，得到局部 [宽,高,长] 的包络
+    corners = np.array([[x, y, z]
+                        for x in (canon_lo[0], canon_hi[0])
+                        for y in (canon_lo[1], canon_hi[1])
+                        for z in (canon_lo[2], canon_hi[2])], dtype=np.float64)
+    local_corners = corners @ M.T.astype(np.float64)
+    lo = local_corners.min(axis=0)
+    hi = local_corners.max(axis=0)
+    ext = (hi - lo).astype(np.float32)                     # [宽, 高, 长]
+    center_local = ((lo + hi) / 2.0).astype(np.float64)
+    center = (M.T.astype(np.float64) @ center_local).astype(np.float32)
+    return center, ext, M
 
 
 def _tight_model_dims(recon_ext, scale=None, scale_vec=None, corr=None, floor=0.10):
@@ -4633,10 +4656,9 @@ def _tight_model_dims(recon_ext, scale=None, scale_vec=None, corr=None, floor=0.
     让碰撞体退化成"纸片"而永远算不出碰撞。
     """
     ext = np.abs(np.asarray(recon_ext, dtype=np.float64).reshape(3))
-    if corr is None:
-        corr = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]], dtype=np.float64)
-    corr = np.abs(np.asarray(corr, dtype=np.float64).reshape(3, 3))
-    dims = corr @ ext
+    # ext 已经是物体局部系的 [宽, 高, 长]（`_ply_bbox_and_orientation` 现在用 PCA 直接
+    # 在局部系里量尺寸），不再需要 `|corr|` 重排。
+    dims = ext
     if scale_vec is not None:
         sv = np.abs(np.asarray(scale_vec, dtype=np.float64).reshape(3))
         if scale is not None:
@@ -4668,10 +4690,8 @@ def _fit_scale_and_dims(recon_ext, target_dims, fit=1.0, corr=None, flat_ratio_m
     回报，用于提示"换更清晰的目标或上传参考图"，不再改变尺寸逻辑。
     """
     ext = np.abs(np.asarray(recon_ext, dtype=np.float64).reshape(3))
-    corr_m = np.abs(np.asarray(
-        corr if corr is not None else np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]]),
-        dtype=np.float64).reshape(3, 3))
-    mapped = corr_m @ ext                       # 物体局部 [宽, 高, 长]
+    # ext 已经是物体局部系的 [宽, 高, 长]（PCA 后），无需 corr 重排
+    mapped = ext
     tgt = [float(x) for x in target_dims[:3]]
     if len(tgt) < 3:
         tgt = [4.5, 1.6, 2.0]
@@ -4682,8 +4702,8 @@ def _fit_scale_and_dims(recon_ext, target_dims, fit=1.0, corr=None, flat_ratio_m
     base = max(1e-3, min(1000.0, min(by_height, fit_inside)))
     scale = max(1e-3, min(1000.0, base * float(fit)))
 
-    tight = [float(x) for x in _tight_model_dims(ext, scale=scale, corr=corr, floor=floor)]
-    model_h = float((corr_m @ (ext * scale))[1])                      # 渲染后的模型高度（局部 Y）
+    tight = [float(x) for x in _tight_model_dims(ext, scale=scale, floor=floor)]
+    model_h = float((ext * scale)[1])                      # 渲染后的模型高度（局部 Y）
     flat = float(ext.min()) / max(1e-6, float(ext.max()))
     info = {
         "recon_flat_ratio": round(flat, 4),
