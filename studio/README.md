@@ -1169,3 +1169,45 @@ Vehicle/Person/Cyclist 类当粗掩码，等价于 `valid = semantic ∧ rough`�
 > 注意：资产化目前只覆盖"内部漏检帧"。更彻底的"资产化重建"（例如从 PLY 直接提取每个物体
 > 一份静态资产、按 track 复用到任意帧，甚至插值不同帧的外观）是下一步方向，当前实现已经
 > 能解决"某一帧漏检 → 该帧缺物体"的直接痛点。
+
+## 自然冲突生成（保轨迹、调时序）—— 参数控制的核心
+
+项目定位是**通过 4DGS + 交通参与对象运动参数，批量生成 Corner Case**。Corner Case 的核心是
+**参数控制**：什么时候发生、发生/不发生都由参数决定；研究目的是**避免事故**，所以重点是
+"最晚反应点 / 回避条件"，而不是撞完之后怎么飞。
+
+此前 `scenario_engine.prim_regularize` 会把轨迹擦成匀速直线再重摆（`prim_layout_pair`），
+这就是"套模板 → 千篇一律"的根源：a 本来在路口左转、b 直行，套模板后两车都被拉直。
+
+新增 **`natural-conflict` 场景**（`natural_conflict.py` + `scenario_engine.plan_natural_conflict`）：
+
+* **保留原轨迹**：a 左转还是左转、b 直行还是直行，只做**纵向重定时**（沿它自己的轨迹
+  加速/减速），让两车在它们**本来就交汇**的冲突点同时到达（碰撞）、差一点到达（险情）、
+  或一车刹停（避免）。不再改写路径形状。
+* **自动识别冲突几何**：由两车在冲突点处的航向判 `head-on / crossing / same-dir`，
+  并自动找"与 ego 轨迹交汇"的 other（`other` 角色可省略）。
+* **参数**：
+  | 参数 | 含义 |
+  | --- | --- |
+  | `outcome` | `collide`（同到）/ `near_miss`（差 `time_gap_s` 到）/ `avoid`（ego 刹停） |
+  | `time_gap_s` | near_miss 时两车到达冲突点的时间间隔 |
+  | `adjust` | 变速对象 `auto / ego / other`（auto=选改动幅度小的一方） |
+  | `ego_brake_decel_mps2` | avoid 时 ego 的制动力度 |
+* **最晚反应点**：复用 `compute_critical_frame`（碰撞帧 + critical_frame + TTC + 严重度），
+  并在 near_miss/avoid（gap 较大、`compute_critical_frame` 返回 None）时自算
+  "最近接近帧 + TTC"，保证回避场景也有可读指标。
+
+实测 scene 018（T12↔T17 路口交汇 75.6°）：
+
+| outcome | 变速 | 碰撞 | 关键帧 | TTC |
+| --- | --- | --- | --- | --- |
+| collide | T17 ×0.94 | 帧9 | 帧6 | 0.30s |
+| near_miss | T12 ×0.82 | 否 | 帧11 | 0.28s |
+| avoid | ego 制动 | 否 | 帧5 | — |
+
+三条结果来自**同一对车、同一窗口**，只改 `outcome` 参数，轨迹路径全程不变。
+
+> 边界（如实说明）：自然冲突的撞后状态只做了"碰撞判定 + 关键帧"，没有额外的撞后推挤
+> 仿真（符合"关注回避、少关注撞后"的定位）；`avoid` 目前是"纵向制动避免"，还没做转向避让。
+> 下一步可扩展：转向避让、基于车道图自动选"会交汇的参与者"、把更多模板场景改造成
+> "保轨迹 + 调参"模式。
