@@ -57,6 +57,7 @@ class _Ctx:
         self.affected: list = []
         self.collision_pair = None
         self.sim = None
+        self.natural = None   # 自然冲突生成的附加结果（冲突类型/速度因子等）
 
     def ensure(self, key, anchor_key=None):
         """若角色未指定则自动合成；返回 track_id。"""
@@ -74,7 +75,7 @@ class _Ctx:
         return int(tid)
 
     def finish(self):
-        return (self.affected, self.synth, self.collision_pair, self.sim)
+        return (self.affected, self.synth, self.collision_pair, self.sim, self.natural)
 
 
 # ==================== 运动原语 ====================
@@ -418,6 +419,74 @@ def plan_cutin_brake(ctx: _Ctx):
     ctx.collision_pair = (int(follower), int(target))
 
 
+def plan_natural_conflict(ctx: _Ctx):
+    """自然冲突：保留两车原轨迹（a 左转还是左转、b 直行还是直行），只调时序/速度制造
+    或避免冲突 —— 不再套模板把轨迹拉直。
+
+    roles: ego（保留轨迹的主车）/ other（冲突车，可自动找）
+    参数：outcome=collide|near_miss|avoid, time_gap_s, adjust=auto|ego|other, ego_brake_decel_mps2
+    """
+    import natural_conflict as nc
+    s = ctx.sampling
+    if ctx.roles.get("ego") is None:
+        raise ValueError("自然冲突需要指定 ego（保留轨迹的那辆）")
+    ego = int(ctx.roles["ego"])
+    other = ctx.roles.get("other")
+    if other is None:
+        other = _pick_conflicting_track(ctx.tm, ego, ctx.frames, ctx.fps)
+        if other is None:
+            raise ValueError("找不到与 ego 轨迹交汇的其它车辆（可显式指定 other，或用模板化场景）")
+        ctx.roles["other"] = int(other)
+    other = int(other)
+
+    outcome = s.get("outcome", "collide")
+    time_gap = _sample_float(s, "time_gap_s", 0.4)
+    adjust = s.get("adjust", "auto")
+    brake = _sample_float(s, "ego_brake_decel_mps2", 6.0)
+
+    res = nc.generate_natural_conflict(
+        ctx.tm, ego, other, ctx.frames, ctx.fps,
+        outcome=outcome, time_gap_s=time_gap, adjust=adjust, ego_brake_decel=brake)
+
+    ctx.affected = [ego, other]
+    ctx.collision_pair = (ego, other)
+    ca = res.get("collision_analysis") or {}
+    if ca:
+        ctx.sim = {"collided": bool(ca.get("collided")),
+                   "collision_frame": ca.get("collision_frame"),
+                   "frames": list(ctx.frames), "fps": float(ctx.fps),
+                   "attacker": int(ego), "victim": int(other),
+                   "dims_a": _get_dimensions(ctx.tm, ego),
+                   "dims_v": _get_dimensions(ctx.tm, other)}
+    ctx.natural = res
+
+
+def _pick_conflicting_track(tm, ego, frames, fps):
+    """找一条与 ego 轨迹**交汇**的其它真实车辆（用于自然冲突的 other 角色）。"""
+    import natural_conflict as nc
+    path_ego = nc.extract_path(tm, ego, frames, fps)
+    if not path_ego.get("valid"):
+        return None
+    best, best_dist = None, None
+    skip = {int(ego)}
+    skip |= set(getattr(tm, "track_deleted", set()) or set())
+    skip |= set(getattr(tm, "track_replaced", set()) or set())
+    skip |= set(getattr(tm, "synthetic_tracks", {}) or {})
+    for tid in list(getattr(tm, "track_to_frames", {}) or {}):
+        if int(tid) in skip:
+            continue
+        p = nc.extract_path(tm, tid, frames, fps)
+        if not p.get("valid"):
+            continue
+        ap = nc._closest_approach(path_ego, p)
+        if ap is None:
+            continue
+        if best_dist is None or ap["dist"] < best_dist:
+            best, best_dist = int(tid), ap["dist"]
+    return best if (best is not None and best_dist is not None
+                    and best_dist <= nc.CONFLICT_MAX_DIST) else None
+
+
 def plan_occluded_ped(ctx: _Ctx):
     """遮挡行人横穿追尾：vehicle / pedestrian / follower。"""
     vehicle, pedestrian, follower, synth = _ensure_occluded_roles(ctx.tm, ctx.roles, ctx.frames, ctx.fps, ctx.intensity)
@@ -448,6 +517,7 @@ SCENARIO_PLANS = {
     "chain-reaction-rear-end": plan_chain,
     "cutin-brake-pileup": plan_cutin_brake,
     "occluded-pedestrian-pileup": plan_occluded_ped,
+    "natural-conflict": plan_natural_conflict,
 }
 
 

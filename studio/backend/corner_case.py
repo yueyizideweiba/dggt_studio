@@ -96,6 +96,15 @@ SCENARIOS = {
             {"key": "follower", "label": "后方跟车", "optional": True, "auto": True},
         ],
     },
+    "natural-conflict": {
+        "name": "自然冲突（保轨迹调时序）",
+        "desc": "保留两车原始轨迹（转弯还是转弯、直行还是直行），只通过加速/减速其中一车来制造碰撞、"
+                "险情或避免事故——不再套模板拉直轨迹",
+        "roles": [
+            {"key": "ego", "label": "主车（保留轨迹，可被制动/变速）"},
+            {"key": "other", "label": "冲突车（可自动找）", "optional": True, "auto": True},
+        ],
+    },
 }
 
 
@@ -1120,8 +1129,10 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
     # 未迁移的复合场景（行人横穿 / 三车连环）退回旧 _gen_*。
     import scenario_engine
     if scenario_type in scenario_engine.SCENARIO_PLANS:
-        affected, synthesized, collision_pair, sim_result = scenario_engine.execute(
+        affected, synthesized, collision_pair, sim_result, natural = scenario_engine.execute(
             tm, scenario_type, roles, frames, fps, intensity, enable_physics, sampling)
+    else:
+        natural = None
     result = {
         "scenario_type": scenario_type,
         "affected_tracks": affected,
@@ -1132,6 +1143,8 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
         "sampling_params": sampling,
         "sampling_seed": sampling_seed,
     }
+    if natural is not None:
+        result["natural_conflict"] = natural
 
     # 碰撞关键帧分析：优先用物理仿真结果，否则退回基于距离的检测
     collision_info = None
@@ -1146,6 +1159,16 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
         if scenario_type in ("chain-reaction-rear-end", "cutin-brake-pileup", "occluded-pedestrian-pileup"):
             result["collision_tracks"] = [int(t) for t in affected]
         elif collision_pair:
+            result["collision_tracks"] = [int(collision_pair[0]), int(collision_pair[1])]
+    # 自然冲突：near_miss/avoid 时 compute_critical_frame 返回 None（gap 较大），
+    # 但 natural_conflict 里已经自算了"最近接近帧 + TTC"，这里也提升到顶层，保证
+    # 前端能拿到回避条件（collision_analysis / critical_frame / time_to_collision）。
+    elif natural is not None and natural.get("collision_analysis"):
+        ca = natural["collision_analysis"]
+        result["collision_analysis"] = ca
+        result["critical_frame"] = ca.get("critical_frame")
+        result["collision_frame"] = ca.get("collision_frame")
+        if collision_pair:
             result["collision_tracks"] = [int(collision_pair[0]), int(collision_pair[1])]
 
     return result
@@ -1749,6 +1772,13 @@ SCENARIO_SAMPLING_SCHEMAS = {
         "lateral_offset_m": {"type": "range", "label": "闪开横向距离", "min": 2.5, "max": 5.0, "step": 0.1, "default": [3.2, 4.5], "unit": "m"},
         "reaction_delay_s": {"type": "range", "label": "闪开开始延迟", "min": 0.0, "max": 1.2, "step": 0.1, "default": [0.2, 0.6], "unit": "s"},
         "collision_severity": {"type": "enum", "label": "风险等级", "options": ["near_miss", "minor", "severe"], "default": "near_miss"},
+    },
+    "natural-conflict": {
+        "outcome": {"type": "enum", "label": "结果", "options": ["collide", "near_miss", "avoid"], "default": "collide"},
+        "time_gap_s": {"type": "range", "label": "时间差（near_miss 时两车到达间隔）", "min": 0.2, "max": 1.5, "step": 0.1, "default": [0.3, 0.8], "unit": "s"},
+        "adjust": {"type": "enum", "label": "变速对象", "options": ["auto", "ego", "other"], "default": "auto"},
+        "ego_brake_decel_mps2": {"type": "range", "label": "主车避免制动力度", "min": 3.0, "max": 9.0, "step": 0.5, "default": [5.0, 7.0], "unit": "m/s²"},
+        "collision_severity": {"type": "enum", "label": "风险等级", "options": ["near_miss", "minor", "severe"], "default": "minor"},
     },
 }
 
