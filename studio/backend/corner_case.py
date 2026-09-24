@@ -192,6 +192,27 @@ def _pose_with_center(base_pose, center):
     return p
 
 
+def _pose_facing(base_pose, center, vel):
+    """把朝向摆正到**运动方向**（车不该横着滑），中心移到 center。
+
+    停着（速度≈0）时保持原朝向，避免车头乱转。
+    """
+    v = np.asarray(vel, dtype=np.float64).reshape(-1)
+    v = np.array([v[0], 0.0, v[2]]) if v.size >= 3 else np.array([v[0], 0.0, v[1]])
+    n = float(np.linalg.norm(v))
+    if n < 0.15:
+        return _pose_with_center(base_pose, center)
+    fx, fz = v[0] / n, v[2] / n
+    yaw = math.atan2(fx, fz)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    p = np.array(base_pose, dtype=np.float32).copy()
+    p[:3, 0] = (cy, 0.0, -sy)
+    p[:3, 1] = (0.0, 1.0, 0.0)
+    p[:3, 2] = (sy, 0.0, cy)
+    p[0, 3], p[1, 3], p[2, 3] = float(center[0]), float(center[1]), float(center[2])
+    return p
+
+
 def _get_dimensions(tm, track_id):
     """获取某 track 的包围盒尺寸 [length, width, height]，缺省给小汽车尺寸。"""
     dims = tm.get_track_dimensions(track_id)
@@ -823,11 +844,15 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                 wv = pos_v + _ground_right(head_v) * (float(victim_lateral) * s_lat)
                 wv[1] = float(pos_v[1]) if own_v else y_v
 
-        # 写入位姿（保持各自朝向，仅更新中心）
-        # 受害车跟随自己的轨迹时，用它**自己那一帧的朝向**（转弯的车保持转角）
+        # 写入位姿：肇事车始终**朝运动方向**（追击时会转向目标，头朝目标才自然，不横着滑）；
+        # 受害车跟随自己轨迹时保持它自己的朝向（转弯的车保持转角），撞后被推开时再朝
+        # 总速度方向摆正；参数化 corner case（不跟轨迹）则始终朝运动方向。
         pv_base = np.asarray(own_v[int(f)], dtype=np.float32) if own_v else pose_v_cur
-        pa = _pose_with_center(pose_a_cur, wa)
-        pv = _pose_with_center(pv_base, wv)
+        pa = _pose_facing(pose_a_cur, wa, vel_a)
+        if own_v:
+            pv = _pose_with_center(pv_base, wv) if not collided else _pose_facing(pv_base, wv, vel_v)
+        else:
+            pv = _pose_facing(pv_base, wv, vel_v)
 
         # 碰撞检测（用当前帧位姿）
         if not collided and i > 0:
@@ -840,23 +865,22 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                 nn = np.linalg.norm(normal)
                 normal = normal / nn if nn > 1e-4 else head_a
                 if enable_physics:
-                    # 非弹性碰撞：动量守恒分配速度，受害车被撞飞
+                    # 非弹性碰撞：动量守恒分配速度，但**严格限幅**——真实追尾不是"把车弹飞"，
+                    # 而是推一下、双方减速停下。这里 restitution≈0（几乎完全不弹），
+                    # 冲量带来的速度增量也压得很低（肇事车 ≤2.5m/s、受害车 ≤4m/s）。
                     rel = np.dot(vel_a - vel_v, normal)
-                    restitution = 0.15  # 接近完全非弹性
+                    restitution = 0.05
                     if rel > 0:  # 正在接近才有冲量
                         j = -(1 + restitution) * rel / (1 / mass_a + 1 / mass_v)
                         impulse = j * normal
                         dva = impulse / mass_a
                         dvv = impulse / mass_v
-                        # 冲量限幅：真实轨迹有噪声/极端几何时，动量守恒会算出"把车弹飞"
-                        # 的速度（实测肇事车被推到 14m/s 后一直飞）。这里限制单次撞击的
-                        # 速度增量：肇事车 ≤8m/s、受害车 ≤12m/s。
                         na = float(np.linalg.norm(dva))
-                        if na > 8.0:
-                            dva = dva * (8.0 / na)
+                        if na > 2.5:
+                            dva = dva * (2.5 / na)
                         nv_ = float(np.linalg.norm(dvv))
-                        if nv_ > 12.0:
-                            dvv = dvv * (12.0 / nv_)
+                        if nv_ > 4.0:
+                            dvv = dvv * (4.0 / nv_)
                         vel_a = vel_a + dva
                         vel_v = vel_v - dvv
                 else:
@@ -877,7 +901,7 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                     push_v = np.asarray(pos_v, dtype=np.float64) - own_c
                     push_v[1] = 0.0
                 pos_v[1] = float(own_c[1]) if own_v else y_v
-                pv = _pose_with_center(pv_base, pos_v)
+                pv = _pose_facing(pv_base, pos_v, vel_v)
                 # 防穿模后再把横向偏移补回去（否则该帧会丢掉变道偏移）
                 if victim_lateral:
                     wv2 = pos_v + _ground_right(head_v) * (float(victim_lateral) * s_lat)
