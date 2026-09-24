@@ -83,7 +83,7 @@ vs_ego=相对主车是同向还是对向（没有 yaw 表示该帧静止或测�
 {{"ops": [
  {{"op":"speed","track":<id>,"speed_mps":<数>,"start_frame":<帧>,"end_frame":<帧>}},
  {{"op":"lane_change","track":<id 或 null>,"lateral":<米，车体右侧为正>,"start_frame":<帧>,"duration":<帧数>}},
- {{"op":"turn","track":<id>,"direction":"left|right|straight","at":"intersection"(可选),"yaw_deg":<相对角度，正=左转>,"start_frame":<帧>,"duration":<帧数>,"forward_m":<可选，拐多远>}},
+ {{"op":"turn","track":<id>,"direction":"left|right|straight|uturn","at":"intersection"(可选),"yaw_deg":<相对角度，正=左转>,"start_frame":<帧>,"duration":<帧数>,"forward_m":<可选，拐多远>}},
  {{"op":"remove","track":<id>}},
  {{"op":"scale","track":<id>,"factor":<倍数，1=原样>}},
  {{"op":"shadow","track":<id>,"enabled":<true/false>}},
@@ -1297,8 +1297,11 @@ def _op_turn(tm, op):
     f0 = int(op.get("start_frame") or 0)
     dur = max(1, int(op.get("duration") or 10))
     direction = str(op.get("direction") or "").strip().lower()
-    if direction not in ("left", "right", "straight"):
+    if direction in ("掉头", "uturn", "u-turn", "掉头行驶"):
+        direction = "uturn"
+    elif direction not in ("left", "right", "straight"):
         direction = "left" if yaw > 0 else ("right" if yaw < 0 else "straight")
+    _DIR_CN = {"left": "左转", "right": "右转", "straight": "直行", "uturn": "掉头"}
     frames, poses = _path_frames(tm, tid)
     if not frames:
         return {"op": "turn", "ok": False, "error": "没有轨迹"}
@@ -1336,12 +1339,14 @@ def _op_turn(tm, op):
                    "speed_cap_mps": round(float(cap), 2), **info}
             warns = []
             if route.get('short_turn'):
-                warns.append(
-                    "这个位置/方向上没有可用的%s转支路（地图里搜到的路线航向只变了 %.0f°，目标 %.0f°）："
-                    "车只是沿当前车道往前开了一段，没有真的转过去。"
-                    "换一个更靠近路口的起始帧，或直接说'沿当前车道行驶'。"
-                    % ({'left': '左', 'right': '右'}.get(direction, direction),
-                       float(route.get('turn_deg') or 0.0), float(route.get('target_turn_deg') or 0.0)))
+                # 搜到一条路线但它并不朝用户要的方向转 —— 不执行，也不能原地打转
+                # （那等于"随便哪都能拐"）。直接拒绝并说清原因。
+                return {"op": "turn", "track": tid, "ok": False, "direction": direction,
+                        "error": ("这里没有可用的%s支路（车道图里搜到的路线航向只变了 %.0f°，"
+                                  "目标 %.0f°），未执行；换一个更靠近路口的起始帧"
+                                  % (_DIR_CN.get(direction, direction),
+                                     float(route.get('turn_deg') or 0.0),
+                                     float(route.get('target_turn_deg') or 0.0)))}
             # 转弯点可能在几十米外，而这批帧根本走不到 —— 那样画面上看不到拐弯，
             # 必须告诉用户"要加多少帧 / 起始帧往后挪多少"，而不是让他以为功能坏了。
             turn_at = float(route.get('turn_at_m') or 0.0)
@@ -1356,12 +1361,31 @@ def _op_turn(tm, op):
                 out["warn"] = " ".join(warns)
             return out
 
-    # ---- 兜底：没有地图（或地图里找不到路口）时，绕弧线原地转 ----
+    # ---- 没有合法转弯路径时的兜底 ----
+    # 有高精地图但找不到合法支路 → **拒绝执行**（不能原地打转，那等于"随便哪都能拐"）。
+    # 只有"没有地图"时才退回"原地改朝向"（没地图无从谈规则），并明确标注。
+    if rm is not None:
+        has_at_f0 = False
+        try:
+            has_at_f0 = tm.get_track_pose(tid, int(f0)) is not None
+        except Exception:  # noqa: BLE001
+            has_at_f0 = False
+        f_after = [f for f in frames if f >= f0]
+        if not has_at_f0:
+            why = ("T:%d 在第 %d 帧没有轨迹（它的轨迹是第 %s~%s 帧），start_frame 要落在轨迹范围内"
+                   % (tid, f0, frames[0] if frames else '?', frames[-1] if frames else '?'))
+        elif not f_after:
+            why = "T:%d 在第 %d 帧之后就没有轨迹了" % (tid, f0)
+        else:
+            why = ("这里没有可用的%s路径：T:%d 第 %d 帧所在位置不在车道上，或这一带的车道图是断的"
+                   % (_DIR_CN.get(direction, direction), tid, f0))
+        return {"op": "turn", "track": tid, "ok": False, "direction": direction, "error": why}
+
+    # rm is None：没有地图，只能原地改朝向（规则无从谈起）
     def Ry(a):
         c, s = math.cos(a), math.sin(a)
         return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
 
-    c0 = np.asarray(poses.get(f0, poses[frames[0]]), dtype=np.float32)[:3, 3].copy()
     for f in frames:
         if f < f0:
             continue
@@ -1371,28 +1395,10 @@ def _op_turn(tm, op):
         P = poses[f].copy()
         P[:3, :3] = Ry(a) @ P[:3, :3]
         tm.set_track_pose(tid, f, P)
-    # 兜底原因要分清，别一律说"没有地图"
-    f_after = [f for f in frames if f >= f0]
-    has_at_f0 = False
-    try:
-        has_at_f0 = tm.get_track_pose(tid, int(f0)) is not None
-    except Exception:  # noqa: BLE001
-        has_at_f0 = False
-    if rm is None:
-        why = "本场景没有高精地图，只能原地改朝向"
-    elif not has_at_f0:
-        why = ("T:%d 在第 %d 帧没有轨迹（它的轨迹是第 %s~%s 帧），"
-               "start_frame 要落在它的轨迹范围内"
-               % (tid, f0, frames[0] if frames else '?', frames[-1] if frames else '?'))
-    elif not f_after:
-        why = "T:%d 在第 %d 帧之后就没有轨迹了" % (tid, f0)
-    else:
-        why = ("地图里从 T:%d 第 %d 帧的位置找不到可走的车道/路线"
-               "（可能它当时不在车道上，或这一带的车道图是断的）" % (tid, f0))
     return {"op": "turn", "track": tid, "ok": True, "mode": "in_place_fallback",
             "direction": direction,
             "yaw_deg": round(math.degrees(yaw), 1), "start_frame": f0, "duration": dur,
-            "note": why}
+            "note": "本场景没有高精地图，无法判定合法转弯，只能原地改朝向（建议用带地图的场景）"}
 
 
 def _yaw_of(P) -> float:

@@ -515,7 +515,14 @@ class RoadModel:
             return None
 
         target = {'left': math.radians(88.0), 'right': math.radians(-88.0),
-                  'straight': 0.0}.get(direction, 0.0)
+                  'straight': 0.0, 'uturn': math.radians(180.0)}.get(direction, 0.0)
+
+        def _score(ang):
+            # 掉头按"角度的绝对大小"匹配（±180 都是合法掉头）；其余按带符号方向匹配。
+            if direction == 'uturn':
+                return -abs(abs(ang) - math.radians(180.0))
+            return -abs(ang - target)
+
         best, best_score, best_ang, best_probe = None, None, 0.0, 0.0
         for p in results:
             route = _dedup_polyline(np.concatenate(p['segs'], axis=0))
@@ -535,8 +542,8 @@ class RoadModel:
                 cands_ang.append((turn_side(h_start, hh, self.up_sign), float(min(total, s_probe))))
             if not cands_ang:
                 continue
-            ang, probe = max(cands_ang, key=lambda t: -abs(t[0] - target))
-            score = -abs(ang - target)
+            ang, probe = max(cands_ang, key=lambda t: _score(t[0]))
+            score = _score(ang)
             if direction == 'straight' and len(p['lanes']) == 2:
                 score += 0.25      # 直行时优先用真正连着的下一跳，别绕环岛一整圈
             if best_score is None or score > best_score:
@@ -546,9 +553,11 @@ class RoadModel:
         route = _dedup_polyline(np.concatenate(best['segs'], axis=0))
         want_deg = math.degrees(target)
         got_deg = math.degrees(best_ang)
-        # 诚实回报：真正匹配的支路可能根本不存在（这一侧没有左转口），
+        # 诚实回报：真正匹配的支路可能根本不存在（这一侧没有左转口/掉头口），
         # 那就只是"沿本车道往前开"，必须显式告诉调用方，不能假装转过去了。
-        short = abs(got_deg - want_deg) > 40.0 and direction != 'straight'
+        def _ang_dist(a, b):
+            return abs((a - b + 180.0) % 360.0 - 180.0)
+        short = _ang_dist(got_deg, want_deg) > 40.0 and direction != 'straight'
         return {'pts': route, 'lane_ids': best['lanes'], 'direction': direction,
                 'turn_deg': float(got_deg), 'target_turn_deg': float(want_deg),
                 'turn_at_m': round(float(best_probe - s0), 1),
