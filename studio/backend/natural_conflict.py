@@ -81,6 +81,23 @@ def _sample(pts: np.ndarray, arc: np.ndarray, s: float) -> Tuple[np.ndarray, np.
     return p, v
 
 
+def _smooth_pts(pts: np.ndarray, passes: int = 2) -> np.ndarray:
+    """对逐帧中心点做 [1,2,1]/4 的轻度平滑（端点固定），去掉检测噪声。
+
+    不做平滑的话，`retime_track` 沿带噪折线重采样会在每个顶点处方向突变——
+    实测 accel 22 m/s²、jerk 62 m/s³（质量门直接判废）。
+    """
+    p = np.asarray(pts, dtype=np.float64).copy()
+    n = len(p)
+    if n < 3:
+        return p
+    for _ in range(max(0, int(passes))):
+        q = p.copy()
+        q[1:-1] = (p[:-2] + 2.0 * p[1:-1] + p[2:]) / 4.0
+        p = q
+    return p
+
+
 def extract_path(tm, track_id, frames, fps: float) -> Dict[str, Any]:
     """把某 track 在窗口内的位姿抽成一条"路径"（折线 + 弧长参数化）。
 
@@ -123,15 +140,13 @@ def extract_path(tm, track_id, frames, fps: float) -> Dict[str, Any]:
             else:
                 frame_pts.append(hi[1].copy())
     pts = _dedup_polyline(np.asarray(frame_pts, dtype=np.float64))
+    # 平滑后再参数化：直接把"逐帧累积弧长"作为 frame_arc，而不是"最近顶点弧长"。
+    # 后者是量化台阶（相邻帧可能落在同一顶点、再整段跳一次），重定时后就是一顿一顿的。
+    sm = _smooth_pts(np.asarray(frame_pts, dtype=np.float64))
+    fa = _cum_arc(sm)
     arc = _cum_arc(pts)
-    # frame_arc：每个输出帧在自然时序下对应的弧长（沿整条路径）
-    fa = []
-    for c in frame_pts:
-        # 找 c 在 pts 上最近点的弧长
-        d = np.linalg.norm(pts - np.asarray(c, dtype=np.float64), axis=1)
-        j = int(np.argmin(d))
-        fa.append(float(arc[j]))
-    fa = np.asarray(fa, dtype=np.float64)
+    if len(fa) >= 2 and float(fa[-1]) > 1e-6 and float(arc[-1]) > 1e-6:
+        fa = fa * (float(arc[-1]) / float(fa[-1]))     # 与折线弧长对齐
     speed = 0.0
     if len(fa) >= 2:
         speed = float((fa[-1] - fa[0]) / max(1e-6, (len(fa) - 1) / float(fps)))
@@ -216,6 +231,31 @@ def retime_track(tm, track_id, frames, path: Dict[str, Any], speed_factor: float
     return True
 
 
+def _brake_along_path(tm, track_id, frames, path: Dict[str, Any], stop_arc: float,
+                      decel_mps2: float, fps: float) -> bool:
+    """沿自身路径按减速度刹停（停在弧长 stop_arc 之前），**保持路径形状**。
+
+    比 `corner_case._apply_brake_decel`（沿起始航向拉直线）更贴合真实轨迹。
+    """
+    if not path.get("valid"):
+        return False
+    pts, arc, fa = path["pts"], path["arc"], path["frame_arc"]
+    dt = 1.0 / float(fps)
+    s = float(fa[0])
+    v = float(path.get("speed_mps") or 0.0)
+    writes = []
+    for i, f in enumerate(frames):
+        if i > 0:
+            v = max(0.0, v - float(decel_mps2) * dt)
+            s = min(s + v * dt, float(stop_arc))
+        xyz, tang = _sample(pts, arc, s)
+        yaw = math.atan2(float(tang[0]), float(tang[2]))
+        writes.append((int(f), _pose_at(xyz, yaw)))
+    for f, wp in writes:
+        _write_pose(tm, int(track_id), f, wp)
+    return True
+
+
 def _collision_analysis(tm, a, b, frames, fps):
     """基于当前已写入的位姿做碰撞 + 关键帧/最晚反应点分析。"""
     dims_a = _get_dimensions(tm, a)
@@ -289,15 +329,10 @@ def generate_natural_conflict(tm, ego, other, frames, fps, outcome="collide",
     if outcome == "avoid":
         # 不重定时，让 ego 制动到冲突点之前停下（"可避免"场景，critical frame 有意义）
         stop_before = max(0.5, approach["s_a"] - 2.0)
-        stop_frame = None
-        fa = path_a["frame_arc"]
-        for i, s in enumerate(fa):
-            if s >= stop_before:
-                stop_frame = frames[i]
-                break
-        if stop_frame is None:
-            stop_frame = frames[0]
-        _apply_brake_decel(tm, ego, frames, fps, stop_frame, float(ego_brake_decel))
+        # 先把两车都写回各自**去噪后的原路径**（形状不变），再沿路径减速
+        retime_track(tm, ego, frames, path_a, 1.0)
+        retime_track(tm, other, frames, path_b, 1.0)
+        _brake_along_path(tm, ego, frames, path_a, stop_before, float(ego_brake_decel), fps)
         result = {
             "ok": True, "outcome": "avoid", "conflict_type": ctype,
             "approach_dist_m": round(approach["dist"], 2), "conflict_angle_deg": round(ang, 1),
@@ -318,13 +353,16 @@ def generate_natural_conflict(tm, ego, other, frames, fps, outcome="collide",
             do_ego = False
         else:
             do_ego = dev_ego <= dev_other
-        # 限幅：别把速度改得太离谱（0.35~2.8 倍）
+        # 限幅：别把速度改得太离谱（0.2~3.0 倍）。夹得太紧会导致"到不了冲突点"，
+        # 明明该撞却没撞（实测 0.35 下限时最近距离 3.1m、TTC 0.27s 的假近失）。
         if do_ego:
-            k = float(np.clip(k_ego, 0.35, 2.8))
+            k = float(np.clip(k_ego, 0.2, 3.0))
             retime_track(tm, ego, frames, path_a, k)
+            retime_track(tm, other, frames, path_b, 1.0)   # 去噪但不改时序
         else:
-            k = float(np.clip(k_other, 0.35, 2.8))
+            k = float(np.clip(k_other, 0.2, 3.0))
             retime_track(tm, other, frames, path_b, k)
+            retime_track(tm, ego, frames, path_a, 1.0)
         result = {
             "ok": True, "outcome": outcome, "conflict_type": ctype,
             "approach_dist_m": round(approach["dist"], 2), "conflict_angle_deg": round(ang, 1),

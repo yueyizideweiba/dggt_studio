@@ -28,6 +28,9 @@ DEFAULT_THRESHOLDS = {
 SUDDEN_APPEARANCE_SCENARIOS = {"pedestrian-crossing", "cut-out-reveal"}
 # 这些场景本身不产生"碰撞事件"（急刹是单车风险；前车闪开是露出障碍，不撞）
 NO_COLLISION_EVENT_SCENARIOS = {"hard-brake", "cut-out-reveal"}
+# 这些场景的"事件"定义就是"两条**真实**轨迹交汇到很近"（自然冲突），而不是必须发生接触：
+# 纯时序重定时受物理限幅约束，未必能把两车压到 2m 以内，但最近接近帧 + TTC 仍有意义。
+SCENARIO_NEAR_MISS_DISTANCE = {"natural-conflict": 4.5}
 
 
 def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10.0,
@@ -124,8 +127,10 @@ def build_quality_report(tm, corner_case_result: Dict[str, Any], fps: float = 10
     if scene_type in NO_COLLISION_EVENT_SCENARIOS:
         event_present = None      # 该类场景按定义没有碰撞事件，不适用
     elif has_pair:
+        near_miss_dist = max(float(cfg["near_miss_distance_m"]),
+                             float(SCENARIO_NEAR_MISS_DISTANCE.get(scene_type, 0.0)))
         event_present = bool(collision_frame is not None
-                             or (min_dist is not None and min_dist <= cfg["near_miss_distance_m"]))
+                             or (min_dist is not None and min_dist <= near_miss_dist))
     else:
         # 单物体场景（如紧急刹车）本身没有"碰撞事件"，该项不适用
         event_present = None

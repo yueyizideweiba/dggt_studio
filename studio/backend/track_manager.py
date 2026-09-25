@@ -1937,6 +1937,41 @@ class TrackManager:
 
         return overrides
 
+    def prewarm_render_appearance(self, max_frames: int = 40):
+        """渲染前预热 donor 外观缓存，避免合成参与者"整段消失"。
+
+        渲染器按帧顺序加载 PLY 并顺手缓存每个物体的外观（`_obj_appearance`）。合成参与者
+        是"克隆 donor 高斯"渲染的，若它的 donor 在该帧还没出现过（或该帧的逐帧 PLY 里没有
+        donor），就会去查外观缓存；**缓存还没有 → 直接把该物体整帧跳过**（画面里就是
+        "参与者消失"）。事故生成经常让参与者出现在窗口最开头，而 donor 可能到窗口中部才被
+        检测到，所以这里先按"每个 donor 首次出现的帧"把缓存预热一遍。
+        """
+        needed = set()
+        for s in self.synthetic_tracks.values():
+            if s.get("ply_path"):
+                continue                       # SAM3D 物体自带高斯，不需要 donor 缓存
+            donor = s.get("donor_track_id")
+            if donor is None:
+                continue
+            fm = self.track_to_frames.get(int(donor)) or {}
+            if fm:
+                needed.add(int(min(fm.keys())))
+        # 真实 track 被编辑（事故生成）后也可能需要"补帧"渲染，用它们的首个检测帧预热
+        for tid in set(self.track_edits) | set(self.track_rotations):
+            if int(tid) in self.synthetic_tracks:
+                continue
+            fm = self.track_to_frames.get(int(tid)) or {}
+            if fm:
+                needed.add(int(min(fm.keys())))
+        ok = 0
+        for f in sorted(needed)[:max(1, int(max_frames))]:
+            try:
+                self.renderer._appearance_objects(int(f), 0)
+                ok += 1
+            except Exception:  # noqa: BLE001
+                continue
+        return ok
+
     def build_extra_objects(self, frame_idx, include_ego=True):
         """构建该帧需要额外渲染的合成参与者列表（克隆 donor 高斯）。
 
@@ -2000,7 +2035,10 @@ class TrackManager:
             if not frames_map:
                 continue
             fmin, fmax = min(frames_map.keys()), max(frames_map.keys())
-            if not (fmin <= frame_idx <= fmax):
+            # 编辑帧即使落在该 track 的检测跨度之外也要补：事故生成会给参与者写满整个窗口，
+            # 只按 fmin..fmax 判断的话，跨度不足的参与者会在窗口两端整段消失。
+            edited_at = int(frame_idx) in (self.track_edits.get(int(tid)) or {})
+            if not (fmin <= frame_idx <= fmax or edited_at):
                 continue
             rid_this = frames_map.get(frame_idx)
             if rid_this is not None and int(rid_this) in present:

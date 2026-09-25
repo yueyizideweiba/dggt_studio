@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -294,6 +295,7 @@ class SceneGraph:
         "lane-change-cutin": ("cutter", "target"),
         "pedestrian-crossing": ("pedestrian", "vehicle"),
         "hard-brake": ("braker",),
+        "natural-conflict": ("ego", "other"),
     }
 
     # 该类型"必须指定"的主角色（其余角色可自动合成）
@@ -308,11 +310,13 @@ class SceneGraph:
         "chain-reaction-rear-end": "rear",
         "cutin-brake-pileup": "cutter",
         "occluded-pedestrian-pileup": "vehicle",
+        "natural-conflict": "ego",
     }
 
     # 这些角色必须是"车辆"类物体（不能拿行人/锥桶/杆当车）
     VEHICLE_ROLES = {"attacker", "victim", "cutter", "target", "blocker", "obstacle",
-                     "lead", "middle", "rear", "follower", "braker", "vehicle"}
+                     "lead", "middle", "rear", "follower", "braker", "vehicle",
+                     "ego", "other"}
 
     def _roles_class_ok(self, roles: Dict[str, int]) -> bool:
         for rk, tid in roles.items():
@@ -354,6 +358,9 @@ class SceneGraph:
         只使用 `usable`（起始帧有位姿 + 尺寸/速度合理）的物体；若没有可用的**成对**组合，
         自动退回 `propose_anchors`（1 个可用锚点 + 其余自动合成），保证批量仍有产出。
         """
+        if scenario_type == "natural-conflict":
+            # 自然冲突必须"两车轨迹本来就会交汇"，是个纯几何问题 → 走专门的几何筛选
+            return self._natural_conflict_candidates(max_candidates)
         if scenario_type == "rear-end":
             raw = self._pairs_for(REL_FOLLOWING, order="front_back")   # 0=front, 1=back
             raw = [{t: 1 if v == 0 else 0 for t, v in d.items()} for d in raw]  # 0=attacker(后车), 1=victim(前车)
@@ -369,6 +376,11 @@ class SceneGraph:
                     for d in self._pairs_for(REL_ADJACENT, order="front_back")]
         elif scenario_type == "pedestrian-crossing":
             raw = self._pairs_for(REL_CROSSING, order="ped_veh")       # 0=ped, 1=veh
+        elif scenario_type == "natural-conflict":
+            # 自然冲突的前提是"两车轨迹本来就会交汇"。关系图里的对向/横穿会漏掉很多真实
+            # 交汇对，跟随/相邻又根本不相交（强行生成只会得到"没事件 + 轨迹乱"的废场景）。
+            # 所以直接按轨迹几何穷举筛选，见 _natural_conflict_candidates。
+            raw = []
         elif scenario_type == "hard-brake":
             raw = []
             for nd in sorted(self.nodes, key=lambda x: -x["speed"]):
@@ -401,6 +413,57 @@ class SceneGraph:
         if not dedup:
             dedup = self.propose_anchors(scenario_type, max_candidates=max_candidates)
         return dedup
+
+    def _natural_conflict_candidates(self, max_candidates: int = 8) -> List[Dict[str, int]]:
+        """自然冲突候选：穷举真实车辆两两配对，按**真实最近距离**筛选必须会交汇的组合。
+
+        关系图里的对向/横穿会漏掉很多真实交汇对，跟随/相邻又根本不相交；而且同一物体
+        常被跟踪成两个 id（最近距离恒 ~0），直接配出来就是"两辆叠在一起的车"。
+        因此这里直接看轨迹几何：最近距离 ≤ CONFLICT_MAX_DIST（真的会交汇），且两者的
+        最大间距 ≥ 6m（排除重复 id / 始终贴在一起的对）。
+        """
+        try:
+            import natural_conflict as nc
+        except Exception:  # noqa: BLE001
+            return []
+        frames = list(range(int(self.frame_idx), int(self.frame_idx) + int(self.window) + 1))
+        usable = self.usable_node_ids()
+        paths: Dict[int, Dict[str, Any]] = {}
+        for nd in self.nodes:
+            tid = int(nd["track_id"])
+            if tid not in usable or nd.get("synthetic"):
+                continue
+            if nd.get("class") not in ("vehicle", "large_vehicle"):
+                continue
+            try:
+                p = nc.extract_path(self.tm, tid, frames, self.fps)
+            except Exception:  # noqa: BLE001
+                continue
+            if p.get("valid"):
+                paths[tid] = p
+        scored: List[Tuple[float, Dict[str, int]]] = []
+        for a, b in itertools.combinations(sorted(paths), 2):
+            pa, pb = paths[a], paths[b]
+            try:
+                ap = nc._closest_approach(pa, pb)
+            except Exception:  # noqa: BLE001
+                continue
+            if ap is None or ap["dist"] > nc.CONFLICT_MAX_DIST:
+                continue
+            m = min(len(pa.get("pts", [])), len(pb.get("pts", [])))
+            if m < 2:
+                continue
+            max_sep = max(float(np.linalg.norm(np.asarray(pa["pts"][i], dtype=np.float64)
+                                               - np.asarray(pb["pts"][i], dtype=np.float64)))
+                          for i in range(m))
+            if max_sep < 6.0:
+                continue          # 始终贴在一起 → 几乎肯定是同一物体的两个跟踪 id
+            sa = float(self.nodes[self._node_by_tid[a]]["speed"])
+            sb = float(self.nodes[self._node_by_tid[b]]["speed"])
+            ego, other = (a, b) if sa >= sb else (b, a)
+            scored.append((float(ap["dist"]), {"ego": int(ego), "other": int(other)}))
+        scored.sort(key=lambda x: x[0])
+        return [r for _, r in scored[:max(1, int(max_candidates))]]
 
     def _pairs_for(self, relation: str, order: str) -> List[Dict[int, int]]:
         usable = self.usable_node_ids()

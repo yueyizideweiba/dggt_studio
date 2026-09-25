@@ -632,6 +632,11 @@ def render_sequence_video(renderer, tm, start_frame: int, num_frames: int, fps: 
     优先 H.264(libx264)（浏览器直接可播），失败退回 mp4v。
     """
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    if tm is not None:
+        try:
+            tm.prewarm_render_appearance()
+        except Exception as e:  # noqa: BLE001
+            print(f"[video] 外观缓存预热失败（不影响出片，可能个别合成物体缺帧）: {e}")
     frames = []
     follow_ego = bool(use_edited_ego and tm is not None
                       and getattr(tm, "ego_track_id", None) is not None
@@ -2869,6 +2874,48 @@ class CornerCaseBatchRequest(BaseModel):
     trust_min: float = 0.55                 # 可信阈值：pred_ssim 低于它即记为首个不可信帧
 
 
+def _first_usable_anchor_frame(tm, start_frame: int, num_frames: int, need: int = 2,
+                               lookahead: int = 8) -> int:
+    """批量生成前，在窗口开头附近找一个"真的有可用动态物体"的起始帧。
+
+    有些场景（例如 016）的**逻辑首帧没有任何检测**——所有 track 的首帧都 ≥1，甚至车辆要到
+    第 6 帧才出现（前几帧只有行人）。此时 `SceneGraph` 会把相关物体判成 unusable
+    （"起始帧没有位姿"），车辆类事故就挑不到候选，批量静默产出 0 条。
+    这里在窗口开头附近找：优先取"有 ≥need 辆车的**最早**帧"，没有车再退回"物体最多的帧"。
+    """
+    def _is_veh(tid: int) -> bool:
+        try:
+            d = tm.get_track_dimensions(tid)
+            return abs(float(d[0]) * float(d[1]) * float(d[2])) >= 2.0
+        except Exception:  # noqa: BLE001
+            return False
+
+    start = int(start_frame)
+    last = start + max(0, min(int(num_frames), int(lookahead)))
+    best_veh = None
+    best_any = None
+    for f in range(start, last + 1):
+        n_all = n_veh = 0
+        for tid in list(getattr(tm, "track_to_frames", {}) or {}):
+            try:
+                if tm.get_track_pose(int(tid), f) is None:
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            n_all += 1
+            if _is_veh(int(tid)):
+                n_veh += 1
+        if n_veh >= int(need) and (best_veh is None):
+            best_veh = (f, n_veh)
+        if best_any is None or n_all > best_any[1]:
+            best_any = (f, n_all)
+    if best_veh is not None:
+        return best_veh[0]
+    if best_any is not None and best_any[1] >= int(need):
+        return best_any[0]
+    return start
+
+
 @app.post("/api/corner_case/batch")
 async def generate_corner_case_batch(request: CornerCaseBatchRequest):
     """批量生成多样化 Corner Case。
@@ -2895,7 +2942,17 @@ async def generate_corner_case_batch(request: CornerCaseBatchRequest):
         studio_state["track_managers"][request.scene_id] = tm
         print("[batch] 场景里有未清除的生成/编辑结果，已重置为干净场景后再批量生成")
     graph = scene_graph.SceneGraph(tm, fps=fps)
-    graph.build(frame_idx=request.start_frame, window=request.frame_window)
+    # 起始帧若没有任何可用动态物体（检测从第 1 帧才开始），所有类型都挑不到候选 →
+    # 这里把生成起点前移到窗口内第一个"真的有物体"的帧，并把结果写回 request，
+    # 后续生成/快照/渲染全部使用同一个起点（响应里也会给出实际 start_frame）。
+    _eff_start = _first_usable_anchor_frame(tm, request.start_frame, request.num_frames)
+    if int(_eff_start) != int(request.start_frame):
+        print(f"[batch] 起始帧 {request.start_frame} 无可用动态物体，自动前移到 {_eff_start}")
+        request.start_frame = int(_eff_start)
+    # 候选必须按**生成窗口**来挑：只按 frame_window（默认 10 帧）挑的话，像"自然冲突"这种
+    # 需要"两条轨迹真的交汇"的类型会因为在窄窗口里还没交汇而找不到候选（批量里直接 0 条）。
+    graph.build(frame_idx=request.start_frame,
+                window=max(int(request.frame_window), int(request.num_frames)))
 
     rng = _random.Random(request.seed)
     manifest: List[Dict[str, Any]] = []

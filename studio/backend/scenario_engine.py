@@ -102,10 +102,19 @@ def prim_regularize(ctx, track, speed=None, heading=None):
     if speed is None:
         speed = max(_speed_mps(ctx.tm, track, f0, ctx.fps), 0.0)
     dt = 1.0 / ctx.fps
+    # 先把目标位姿全部算好再写：逐帧读-改-写会让 `_apply_auto_heading` 读到
+    # "半改轨迹"并推出反向朝向（车头 180° 翻转、yaw_rate 爆表）。
+    pose0_rot = pose0[:3, :3].copy()
+    writes = []
     for i, f in enumerate(ctx.frames):
         c = c0 + heading * (float(speed) * dt * i)
         c[1] = c0[1]
-        _write_pose(ctx.tm, track, f, _pose_with_center(pose0, c))
+        wp = _pose_with_center(pose0, c)
+        if speed < 0.5:
+            wp[:3, :3] = pose0_rot      # 静止：朝向锁定，避免原始噪声让车头乱转
+        writes.append((f, wp))
+    for f, wp in writes:
+        _write_pose(ctx.tm, track, f, wp)
     return True
 
 
@@ -142,8 +151,11 @@ def prim_lateral_sweep(ctx, track, lat_from, lat_to, delay_s=0.0, duration=1.0,
         direction = _ground_right(_heading(ctx.tm, track, ctx.frames[0]))
     direction = np.asarray(direction, dtype=np.float32)
     direction[1] = 0.0
+    # 批量读 → 批量写（逐帧读-改-写会触发自动朝向误判，见 prim_regularize 注释）
+    bases = [ctx.tm.get_track_pose(track, f) for f in ctx.frames]
+    writes = []
     for i, f in enumerate(ctx.frames):
-        base_pose = ctx.tm.get_track_pose(track, f)
+        base_pose = bases[i]
         if base_pose is None:
             continue
         base_c = np.asarray(base_pose, dtype=np.float32)[:3, 3].copy()
@@ -153,7 +165,9 @@ def prim_lateral_sweep(ctx, track, lat_from, lat_to, delay_s=0.0, duration=1.0,
         off = float(lat_from) + (float(lat_to) - float(lat_from)) * sm
         new_c = base_c + direction * off
         new_c[1] = base_c[1]
-        _write_pose(ctx.tm, track, f, _pose_with_center(base_pose, new_c))
+        writes.append((f, _pose_with_center(base_pose, new_c)))
+    for f, wp in writes:
+        _write_pose(ctx.tm, track, f, wp)
 
 
 def prim_lateral_shift(ctx, track, lateral, delay_s=0.0, duration=1.0):
@@ -177,10 +191,18 @@ def prim_hold_still(ctx, track):
     if pose0 is None:
         return
     c0 = np.array(pose0, dtype=np.float32)[:3, 3].copy()
-    for f in ctx.frames:
-        p = ctx.tm.get_track_pose(track, f)
-        if p is not None:
-            _write_pose(ctx.tm, track, f, _pose_with_center(p, c0))
+    rot0 = np.asarray(pose0, dtype=np.float32)[:3, :3].copy()
+    # 批量读 → 批量写，并把朝向锁定到首帧（静止物体不该有 yaw_rate）
+    bases = [ctx.tm.get_track_pose(track, f) for f in ctx.frames]
+    writes = []
+    for f, p in zip(ctx.frames, bases):
+        if p is None:
+            continue
+        wp = _pose_with_center(p, c0)
+        wp[:3, :3] = rot0
+        writes.append((f, wp))
+    for f, wp in writes:
+        _write_pose(ctx.tm, track, f, wp)
 
 
 # ==================== 场景计划 ====================
@@ -335,19 +357,45 @@ def plan_hard_brake(ctx: _Ctx):
 
 
 def plan_cut_out(ctx: _Ctx):
+    """前车闪开露出前方静止障碍车。
+
+    几何必须是"障碍车在**遮挡车正前方同车道**、遮挡车横向闪开"—— 否则遮挡车一闪开就会
+    直接压到障碍车上（实测 bbox_penetration 不通过）。所以不再各自 `prim_regularize`
+    保留原地位置，而是用 `prim_layout_pair` 把障碍车摆到遮挡车前方同车道、速度 0。
+    """
     s = ctx.sampling
     if ctx.roles.get("blocker") is None:
         raise ValueError("该场景需要指定前方遮挡车")
     ctx.roles["blocker"] = int(ctx.roles["blocker"])
     ctx.roles["obstacle"] = ctx.ensure("obstacle", "blocker")
     blocker, obstacle = int(ctx.roles["blocker"]), int(ctx.roles["obstacle"])
+    if blocker == obstacle:
+        ctx.affected = [blocker]
+        return
 
-    lateral = _sample_float(s, "lateral_offset_m", 3.5 * ctx.intensity)
-    delay = _sample_float(s, "reaction_delay_s", 0.4)
+    lateral = max(2.5, _sample_float(s, "lateral_offset_m", 3.5 * ctx.intensity))
+    delay = _sample_float(s, "reaction_delay_s", 0.3)
+    shift_dur = 1.0
+    gap = max(6.0, _sample_float(s, "initial_gap_m", 14.0))
+    # 遮挡车：干净基轨迹；障碍车：摆在遮挡车**正前方同车道**、静止（速度 0）
     prim_regularize(ctx, blocker)
-    prim_regularize(ctx, obstacle)
-    prim_lateral_shift(ctx, blocker, lateral, delay_s=delay, duration=1.2)
-    prim_hold_still(ctx, obstacle)
+    blocker_speed = max(2.0, _speed_mps(ctx.tm, blocker, ctx.frames[0], ctx.fps))
+    # 几何关键约束：闪开必须在"纵向追上障碍车"之前完成，否则遮挡车会直接压过障碍车
+    # （实测 bbox_penetration 不通过）。所需纵向距离 = v * (延迟 + 横移时长) + 余量。
+    need_gap = blocker_speed * (max(0.0, delay) + shift_dur) + 4.0
+    gap = max(gap, need_gap)
+    prim_layout_pair(ctx, blocker, obstacle, gap, 0.0, blocker_speed, 0.0)
+    # 遮挡车横向闪开到相邻车道（沿它自己的右向量），露出前方障碍车
+    prim_lateral_shift(ctx, blocker, lateral, delay_s=delay, duration=shift_dur)
+    # 兜底：无论采样怎么组合，最终都保证两车包围盒不互穿（避免"压过去"的穿模画面）
+    try:
+        import corner_case as _cc
+        _cc.separate_pair(ctx.tm, blocker, obstacle, ctx.frames,
+                          dims_a=_get_dimensions(ctx.tm, blocker),
+                          dims_v=_get_dimensions(ctx.tm, obstacle),
+                          max_shift_per_frame=0.2, rounds=4)
+    except Exception:  # noqa: BLE001
+        pass
     ctx.affected = [blocker, obstacle]
     ctx.collision_pair = (blocker, obstacle)
 
@@ -447,6 +495,9 @@ def plan_natural_conflict(ctx: _Ctx):
     res = nc.generate_natural_conflict(
         ctx.tm, ego, other, ctx.frames, ctx.fps,
         outcome=outcome, time_gap_s=time_gap, adjust=adjust, ego_brake_decel=brake)
+    if not res.get("ok"):
+        # 造不出冲突时直接失败，交给批量记为"该场景无法生成"，绝不输出"没事件 + 轨迹乱"的废场景
+        raise ValueError("自然冲突生成失败：%s" % res.get("reason", "未知原因"))
 
     ctx.affected = [ego, other]
     ctx.collision_pair = (ego, other)

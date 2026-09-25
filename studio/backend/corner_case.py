@@ -362,14 +362,23 @@ def _make_synthetic_relative(tm, anchor_track, frames, fps, offset_world, headin
 
 
 def _synth_initial_poses(tm, ref_pose, offset_world, heading, speed_mps, frames, fps):
-    """生成合成参与者的初始（未碰撞）逐帧位姿：从 ref_pose 平移 offset，沿 heading 匀速。"""
+    """生成合成参与者的初始（未碰撞）逐帧位姿：从 ref_pose 平移 offset，沿 heading 匀速。
+
+    朝向必须**直接对齐运动方向**（heading），不能沿用锚点的旋转：对向车（heading = -锚点航向）
+    沿用锚点朝向后，`_apply_auto_heading` 会在头几帧把车头硬转 180°，yaw_rate 直接爆表
+    （实测 14 rad/s，质量门判废）。
+    """
     base = np.asarray(ref_pose, dtype=np.float32).copy()
     start_c = base[:3, 3] + np.asarray(offset_world, dtype=np.float32)
     dt = 1.0 / fps
+    heading = np.asarray(heading, dtype=np.float32)
     poses = {}
     for i, f in enumerate(frames):
         c = start_c + heading * (speed_mps * dt * i)
-        poses[f] = _pose_with_center(base, c)
+        if abs(float(speed_mps)) < 0.5:
+            poses[f] = _pose_with_center(base, c)      # 静止：朝向锁定在锚点朝向
+        else:
+            poses[f] = _pose_facing(base, c, heading * float(speed_mps))
     return poses
 
 
@@ -501,7 +510,7 @@ def _horizontal_normal(pa, pv, axis=None):
 
 
 def separate_pair(tm, a, b, frames, dims_a=None, dims_v=None, eps=0.02,
-                  from_frame=None, max_shift_per_frame=0.8, rounds=6):
+                  from_frame=None, max_shift_per_frame=0.25, rounds=6):
     """【corner case / 语言轨迹编辑 共用】逐帧消除两车 OBB 重叠（防穿模）。
 
     只做两件事：沿 SAT 的**最小平移轴**把两车推开、推到"刚好接触"为止。
@@ -530,6 +539,9 @@ def separate_pair(tm, a, b, frames, dims_a=None, dims_v=None, eps=0.02,
     fixed_frames = 0
     worst_before = 0.0
     worst_after = 0.0
+    # 先一次性读入全部原始位姿，最后统一写回。逐帧"读-改-写"会让 `_apply_auto_heading`
+    # 基于"前几帧已改、后面未改"的半成品轨迹误判运动方向（车头翻转、yaw_rate 爆表）。
+    snaps = []
     for f in frames:
         if from_frame is not None and f < from_frame:
             continue
@@ -537,8 +549,10 @@ def separate_pair(tm, a, b, frames, dims_a=None, dims_v=None, eps=0.02,
         pv = tm.get_track_pose(b, f)
         if pa is None or pv is None:
             continue
-        pa = np.asarray(pa, dtype=np.float32).copy()
-        pv = np.asarray(pv, dtype=np.float32).copy()
+        snaps.append((int(f), np.asarray(pa, dtype=np.float32).copy(),
+                      np.asarray(pv, dtype=np.float32).copy()))
+    pending = []
+    for f, pa, pv in snaps:
         touched = False
         for _ in range(max(1, int(rounds))):
             hit, depth, axis = separating_axis(pa, dims_a, pv, dims_v)
@@ -561,6 +575,8 @@ def separate_pair(tm, a, b, frames, dims_a=None, dims_v=None, eps=0.02,
             fixed_frames += 1
             _, d_after, _ = separating_axis(pa, dims_a, pv, dims_v)
             worst_after = max(worst_after, float(d_after))
+        pending.append((f, pa, pv))
+    for f, pa, pv in pending:
         _write_pose(tm, a, f, pa)
         _write_pose(tm, b, f, pv)
     return {"applied": bool(fixed_frames), "frames_fixed": int(fixed_frames),
@@ -640,6 +656,31 @@ def _own_pose_series(tm, victim, frames):
                     tm.renderer._interp_pose(known[f0], known[f1], a), dtype=np.float32)
                 break
     return out
+
+
+def _slew_pose_yaw(prev_pose, new_pose, max_deg: float = 5.0):
+    """把位姿的偏航角限制为"相对上一帧最多转 max_deg 度"，保留位置。
+
+    仿真里肇事车朝向是按**仿真速度方向**算的，但写入位置还叠加了横向偏移/接触约束，
+    两者可能不一致 → 某一帧朝向直接跳 37°、甚至 80°（yaw_rate 6~14 rad/s，质量门判废）。
+    真实的车不可能单帧转 80°，这里做一次物理化的限速。
+    """
+    if prev_pose is None:
+        return new_pose
+    p = np.array(new_pose, dtype=np.float32)
+    q = np.asarray(prev_pose, dtype=np.float32)
+    cy = math.atan2(float(p[0, 2]), float(p[2, 2]))
+    py = math.atan2(float(q[0, 2]), float(q[2, 2]))
+    d = math.atan2(math.sin(cy - py), math.cos(cy - py))
+    lim = math.radians(max(0.5, float(max_deg)))
+    if abs(d) <= lim:
+        return p
+    yaw = py + (lim if d > 0 else -lim)
+    c, s = math.cos(yaw), math.sin(yaw)
+    p[:3, 0] = (c, 0.0, -s)
+    p[:3, 1] = (0.0, 1.0, 0.0)
+    p[:3, 2] = (s, 0.0, c)
+    return p
 
 
 def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
@@ -775,6 +816,7 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
 
     pose_a_cur = np.array(pose_a0, dtype=np.float32).copy()
     pose_v_cur = np.array(pose_v0, dtype=np.float32).copy()
+    prev_written = {}          # track -> 上一帧写入的位姿（用于朝向限速）
 
     for i, f in enumerate(frames):
         if i > 0:
@@ -840,6 +882,30 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
             if not own_v:
                 pos_v[1] = y_v
 
+            # ---- 接触约束（碰后）----
+            # 撞后肇事车仍可能比受害车快、继续往里压；以前完全靠事后 `separate_pair`
+            # 逐帧硬推，而它是**逐帧独立**求 MTV 的：重叠深度/方向一变，推挤方向就翻，
+            # 于是轨迹出现 5m 级跳变（实测 rear-end 第 15 帧 T3 前跳 5.45m、T5 后跳 3.75m），
+            # 还会把 max_speed 抬到 54m/s 导致质量门 `motion_physical` 直接不通过。
+            # 这里在仿真内部就禁止"比接触距离更近"：沿两心连线把**肇事车**退回接触面，
+            # 并清掉它的接近速度分量 —— 于是它是"贴着推"，轨迹天然连续。
+            if collided:
+                nvec = np.asarray(pos_v, dtype=np.float64)[:3] - np.asarray(pos_a, dtype=np.float64)[:3]
+                nvec[1] = 0.0
+                nd = float(np.linalg.norm(nvec))
+                if nd > 1e-6:
+                    nunit = nvec / nd
+                    pv_sup = np.asarray(own_v[int(f)], dtype=np.float32) if own_v else pose_v_cur
+                    contact = (_obb_radius_along(pose_a_cur, dims_a, nunit)
+                               + _obb_radius_along(pv_sup, dims_v, nunit))
+                    if nd < contact - 1e-3:
+                        overlap = float(contact - nd)
+                        pos_a = np.asarray(pos_a, dtype=np.float64) - nunit * overlap
+                        vn = float(np.dot(vel_a, nunit))
+                        if vn > 0.0:
+                            vel_a = vel_a - nunit * vn
+                        pos_a[1] = y_a
+
         # 叠加横向偏移（变道用）：只影响"写入与碰撞检测"的位置，不污染纵向动力学
         wa, wv = pos_a, pos_v
         if attacker_lateral or victim_lateral:
@@ -862,6 +928,10 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
             pv = _pose_with_center(pv_base, wv) if not collided else _pose_facing(pv_base, wv, vel_v)
         else:
             pv = _pose_facing(pv_base, wv, vel_v)
+        # 朝向限速：单帧最多转 5°（见 _slew_pose_yaw），杜绝"某一帧朝向猛翻"造成的
+        # yaw_rate 爆表（实测 6~14 rad/s）。位置不变。
+        pa = _slew_pose_yaw(prev_written.get(attacker), pa)
+        pv = _slew_pose_yaw(prev_written.get(victim), pv)
 
         # 碰撞检测（用当前帧位姿）
         if not collided and i > 0:
@@ -917,11 +987,17 @@ def _simulate_pursuit_collision(tm, attacker, victim, frames, fps, intensity,
                     wv2[1] = float(pos_v[1]) if own_v else y_v
                     pv = _pose_with_center(pv_base, wv2)
 
+        # 写入前再限速一次：碰撞后 pv 会被重新赋值（_pose_facing / 横向偏移补回），
+        # 必须重新过一遍限速，否则那一帧仍可能猛转。
+        pa = _slew_pose_yaw(prev_written.get(attacker), pa)
         _write_pose(tm, attacker, f, pa)
+        prev_written[int(attacker)] = pa
         # 受害车跟随自己的轨迹时：**撞前完全不写它**（写进去也只是把原值抄一遍，还会
         # 在 track_edits 里留一堆"编辑"）；撞后（或用户显式要求它变道）才写。
         if (not own_v) or collided or victim_lateral:
+            pv = _slew_pose_yaw(prev_written.get(victim), pv)
             _write_pose(tm, victim, f, pv)
+            prev_written[int(victim)] = pv
 
     # 碰撞后逐帧防穿模：首次碰撞虽有精确分离，但之后两车可能再次贴上/压进去
     # （肇事车仍比受害车快时会二次接触），这里统一兜底——与语言轨迹编辑共享同一套逻辑。
@@ -1854,17 +1930,36 @@ def _apply_initial_pair_layout(tm, rear_track, front_track, frames, fps, gap_m,
     rear_speed = rear_speed_mps if rear_speed_mps is not None else _speed_mps(tm, rear_track, f0, fps)
     front_speed = front_speed_mps if front_speed_mps is not None else _speed_mps(tm, front_track, f0, fps)
     dt = 1.0 / fps
+    # 先全部算好、再一次性写回：绝不能"逐帧读-改-写"。否则写到第 0 帧后，
+    # `get_track_pose` 的自动朝向（_apply_auto_heading）会基于"f0 已改、其余未改"的
+    # 半成品轨迹重算运动方向，得到恰好反向的朝向 → 车头 180° 翻转、yaw_rate 爆表
+    # （实测静止障碍车被翻成倒着放）。批量写回后路径形状一致，自动朝向才不会误判。
+    rear_rot0 = rear_pose0[:3, :3].copy()
+    front_rot0 = front_pose0[:3, :3].copy()
+    writes = []
     for i, f in enumerate(frames):
         rp = tm.get_track_pose(rear_track, f)
         fp = tm.get_track_pose(front_track, f)
         if rp is not None:
             rc = rear_start + head * (float(rear_speed) * dt * i)
             rc[1] = rear_y
-            _write_pose(tm, rear_track, f, _pose_with_center(rp, rc))
+            if abs(float(rear_speed)) < 0.5:
+                wp = _pose_with_center(rp, rc)
+                wp[:3, :3] = rear_rot0
+            else:
+                wp = _pose_facing(rp, rc, head * float(rear_speed))
+            writes.append((rear_track, f, wp))
         if fp is not None:
             fc = front_start + head * float(front_heading_sign) * (float(front_speed) * dt * i)
             fc[1] = front_y
-            _write_pose(tm, front_track, f, _pose_with_center(fp, fc))
+            if abs(float(front_speed)) < 0.5:
+                wp = _pose_with_center(fp, fc)
+                wp[:3, :3] = front_rot0
+            else:
+                wp = _pose_facing(fp, fc, head * float(front_heading_sign) * float(front_speed))
+            writes.append((front_track, f, wp))
+    for tid, f, wp in writes:
+        _write_pose(tm, tid, f, wp)
 
 
 def _apply_brake_decel(tm, track_id, frames, fps, begin_frame, decel_mps2):
@@ -1877,6 +1972,10 @@ def _apply_brake_decel(tm, track_id, frames, fps, begin_frame, decel_mps2):
     speed = max(_speed_mps(tm, track_id, begin_frame, fps), 0.0)
     dist = 0.0
     prev_f = begin_frame
+    # 先读入原姿、算好目标位姿，最后统一写回（逐帧读-改-写会触发自动朝向误判，
+    # 让车头在减速过程中翻转）。
+    poses = {int(f): tm.get_track_pose(track_id, f) for f in frames}
+    writes = []
     for f in frames:
         if f < begin_frame:
             continue
@@ -1885,11 +1984,13 @@ def _apply_brake_decel(tm, track_id, frames, fps, begin_frame, decel_mps2):
             dt = 0.0
         speed = max(0.0, speed - float(decel_mps2) * dt)
         dist += speed * dt
-        pose = tm.get_track_pose(track_id, f)
+        pose = poses.get(int(f))
         if pose is None:
             prev_f = f
             continue
         c = start_c + head * dist
         c[1] = start_c[1]
-        _write_pose(tm, track_id, f, _pose_with_center(pose, c))
+        writes.append((f, _pose_with_center(pose, c)))
         prev_f = f
+    for f, wp in writes:
+        _write_pose(tm, track_id, f, wp)
