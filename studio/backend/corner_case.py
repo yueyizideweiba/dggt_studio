@@ -1247,6 +1247,22 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
         if collision_pair:
             result["collision_tracks"] = [int(collision_pair[0]), int(collision_pair[1])]
 
+    # —— 多阶段交互结构（预警区/危险区/发生区 + 反应建议）——
+    # 反应主体 = 肇事车（collision_pair[0]，通常是"应当反应"的那辆车）；其它参与者 = 其余受影响/合成物体。
+    try:
+        import phase_zones
+        _pair = collision_pair
+        _actor = int(_pair[0]) if (_pair and _pair[0] is not None) else (int(affected[0]) if affected else None)
+        if _actor is not None:
+            _all = list(dict.fromkeys([int(t) for t in (affected + synthesized)]))
+            _others = [t for t in _all if t != _actor]
+            _prof = phase_zones.SCENARIO_PHASE_PROFILES.get(scenario_type, {})
+            result["phase_analysis"] = phase_zones.compute_phase_timeline(
+                tm, _actor, _others, frames, fps,
+                params=_prof, collision_frame=result.get("collision_frame"))
+    except Exception as _e:  # noqa: BLE001
+        result["phase_analysis"] = {"error": str(_e)}
+
     return result
 
 

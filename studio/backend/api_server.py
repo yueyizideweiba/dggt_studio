@@ -2738,6 +2738,84 @@ async def generate_corner_case(request: CornerCaseGenRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class CornerCasePhaseRequest(BaseModel):
+    """多阶段交互分析（预警区/危险区/发生区）请求。
+
+    生成一次事故后，直接返回它的相态时程 + 各区边界 + 反应建议 + 一句"故事"。
+    额外支持覆盖相态参数（t_reaction_s / a_comfort / a_emergency）与遮挡（鬼探头）
+    起点，用来研究"参数如何决定预警区大小 / 是否被跳过"。
+    """
+    scene_id: str
+    scenario_type: str
+    roles: Dict[str, int]
+    start_frame: int = 0
+    num_frames: int = 24
+    intensity: float = 1.0
+    enable_physics: bool = True
+    fps: float = 10.0
+    sampling_params: Dict[str, Any] = Field(default_factory=dict)
+    sampling_seed: Optional[int] = None
+    # 相态参数覆盖（None 表示用默认/场景画像）
+    t_reaction_s: Optional[float] = None
+    a_comfort_mps2: Optional[float] = None
+    a_emergency_mps2: Optional[float] = None
+    # 反应主体覆盖：默认取肇事车；可显式指定"应当反应的那辆车"
+    actor_track_id: Optional[int] = None
+    # 遮挡（鬼探头）：{other_track_id: first_visible_frame}，该帧前该参与者不可见
+    occlusion: Dict[int, int] = Field(default_factory=dict)
+
+
+@app.post("/api/corner_case/phases")
+async def analyze_corner_case_phases(request: CornerCasePhaseRequest):
+    """生成一次事故并计算其多阶段交互结构（预警区/危险区/发生区 + 反应建议）。"""
+    import phase_zones
+    tm = get_track_manager_or_404(request.scene_id)
+    tm.fps = float(request.fps or 10.0)
+    _ensure_timeline(tm, frame_idx=int(request.start_frame) + int(request.num_frames) - 1)
+    try:
+        tm.push_history()
+        tm.snapshot_synthetic_poses()
+        result = corner_case.generate(
+            tm, request.scenario_type, request.roles, request.start_frame, request.num_frames,
+            request.intensity, enable_physics=request.enable_physics, fps=request.fps,
+            sampling_params=request.sampling_params, sampling_seed=request.sampling_seed)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    prof = dict(phase_zones.SCENARIO_PHASE_PROFILES.get(request.scenario_type, {}))
+    for k, v in (("t_reaction_s", request.t_reaction_s),
+                 ("a_comfort_mps2", request.a_comfort_mps2),
+                 ("a_emergency_mps2", request.a_emergency_mps2)):
+        if v is not None:
+            prof[k] = v
+    pair = result.get("collision_tracks") or result.get("collision_pair") or []
+    actor = int(request.actor_track_id) if request.actor_track_id is not None else (
+        int(pair[0]) if len(pair) else None)
+    if actor is None and result.get("affected_tracks"):
+        actor = int(result["affected_tracks"][0])
+    others = [int(t) for t in (result.get("affected_tracks") or []) if int(t) != actor]
+    others += [int(t) for t in (result.get("synthesized_tracks") or []) if int(t) != actor]
+    others = list(dict.fromkeys(others))
+
+    frames = list(range(int(request.start_frame), int(request.start_frame) + int(request.num_frames) + 1))
+    try:
+        phase = phase_zones.compute_phase_timeline(
+            tm, actor, others, frames, request.fps, params=prof,
+            occlusion=request.occlusion, collision_frame=result.get("collision_frame"))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"相态分析失败: {e}")
+
+    return {
+        "success": True,
+        "scenario_type": request.scenario_type,
+        "roles": request.roles,
+        "actor": actor,
+        "collision_frame": result.get("collision_frame"),
+        "collision_analysis": result.get("collision_analysis"),
+        "phase_analysis": phase,
+    }
+
+
 class CornerCaseClearRequest(BaseModel):
     scene_id: str
     track_ids: List[int]
@@ -3156,6 +3234,7 @@ async def generate_corner_case_batch(request: CornerCaseBatchRequest):
                 "sampling_params": result.get("sampling_params") or {},
                 "collision_frame": result.get("collision_frame"),
                 "critical_frame": result.get("critical_frame"),
+                "phase_analysis": result.get("phase_analysis"),
                 "valid": bool(q.get("valid")),
                 "quality": {
                     "min_distance": q.get("min_distance"),
