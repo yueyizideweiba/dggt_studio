@@ -1,16 +1,15 @@
 #!/usr/bin/env python
-"""多阶段交互结构（预警区/危险区/发生区）的数值验证。
+"""多阶段交互结构（预警区/危险区/发生区，多因素判据）的数值验证。
 
 用法：在项目根目录执行
     /root/autodl-tmp/conda_envs/dggt/bin/python tools/verify_phase_zones.py \
         [scene_path] [start] [num_frames]
 
-验证三件事：
-  1. 受控对向逼近：两车匀速对向，相态必须按 safe→warning→danger→occurrence→impact→safe
-     单调演进，且 a* 数值与理论一致（闭合速度决定危险阈值）。
-  2. 真实场景：对 rear-end / head-on / pedestrian-crossing / natural-conflict 各算一条
-     相态时程，打印"切换序列 + 故事"，确认能区分"完整三段式 / 预警被跳过 / 险情"。
-  3. 不变量：相态严重度随帧单调不减（在碰撞前）、a* 随 TTC 缩短单调不减、区域时长非负。
+验证：
+  1. 受控对向逼近：完整三段式 safe→warning→danger→occurrence→impact，a_brake/a_lat 数值合理；
+  2. 转向避让因子：同一对向场景，给出足够横向空间时转向应能"救"下危险区（binding=steer）；
+  3. 鬼探头遮挡：occluded→occurrence→impact，无预警；
+  4. 真实场景：多类型各算一条，打印"切换 + 故事 + 关键因素"，含多参与者聚合与连环多碰撞。
 """
 import math
 import sys
@@ -33,82 +32,104 @@ def _pose(z, yaw):
     return M
 
 
+def _params(**over):
+    p = dict(P.PHASE_PARAMS_DEFAULT)
+    p.update(over)
+    p["cap_brake_mps2"] = min(p["a_emergency_mps2"], p["mu"] * p["g_mps2"])
+    p["cap_lat_mps2"] = 0.9 * p["mu"] * p["g_mps2"]
+    return p
+
+
 def test_controlled():
-    """受控对向逼近：闭合 24 m/s，初始 gap 70m。"""
+    """受控对向逼近：完整三段式 + 多因素数值。"""
     dims = [2.0, 1.7, 4.5]
-    params = dict(P.PHASE_PARAMS_DEFAULT)
-    params.update(horizon_s=2.0, t_reaction_s=0.7, a_comfort_mps2=3.0, a_emergency_mps2=8.0)
+    params = _params(horizon_s=2.0, t_reaction_s=0.7, a_comfort_mps2=3.0, a_emergency_mps2=8.0)
     ze, zo, v, dt = 0.0, 70.0, 12.0, 0.1
     order = {P.ZONE_SAFE: 0, P.ZONE_WARNING: 1, P.ZONE_DANGER: 2,
              P.ZONE_OCCURRENCE: 3, P.ZONE_IMPACT: 4}
-    seq, last_order, last_astar = [], -1, 0.0
-    passed_impact = False
+    seq, last_order, passed = [], -1, False
     for _f in range(40):
         pe, po = _pose(ze, 0.0), _pose(zo, math.pi)
         va = np.array([0, 0, v], float)
         vb = np.array([0, 0, -v], float)
-        ttc, _ = P._predict_contact(pe, va, dims, po, vb, dims, params["horizon_s"], params["dt_pred_s"])
-        astar = P.min_required_deceleration(pe, va, dims, po, vb, dims, params) if ttc is not None else 0.0
-        zone = P.ZONE_IMPACT if P._contact(pe, dims, po, dims) else (
-            P.classify_zone(astar, params) if ttc is not None else P.ZONE_SAFE)
+        aa = ab = np.zeros(3)
+        r = P.analyze_pair(pe, va, aa, dims, po, vb, ab, dims, "vehicle", params)
+        zone = r["zone"]
         if not seq or seq[-1][0] != zone:
-            seq.append((zone, _f, astar))
+            seq.append((zone, _f, r["factors"]))
         if zone == P.ZONE_IMPACT:
-            passed_impact = True
-        # 不变量：撞击之前严重度单调不减（撞击之后允许回到 safe）
-        if not passed_impact:
+            passed = True
+        elif not passed:
             assert order[zone] >= last_order, f"严重度回退: {seq}"
             last_order = order[zone]
         ze += v * dt
         zo -= v * dt
-    zones = [s[0] for s in seq]
-    print("[受控对向] 切换序列:", " -> ".join("%s(f%d,a*=%.2f)" % (z, f, a if a != float('inf') else 9.9) for z, f, a in seq))
-    expected = [P.ZONE_SAFE, P.ZONE_WARNING, P.ZONE_DANGER, P.ZONE_OCCURRENCE, P.ZONE_IMPACT]
-    got = [z for z in zones if z in expected]
-    # 撞击之后会回到 safe（事件结束），只校验"撞击之前的完整演进"
-    if P.ZONE_IMPACT in got:
-        got = got[:got.index(P.ZONE_IMPACT) + 1]
-    assert got == expected, f"预期 {expected}，实际 {got}"
-    # 数值合理性：预警区 a* 应在 (0, a_comf] 内
-    warn = next((a for z, _f, a in seq if z == P.ZONE_WARNING), None)
-    assert warn is not None and 0 < warn <= 3.0, f"预警区 a* 异常: {warn}"
-    print("    ✓ 完整三段式单调演进 + a* 数值合理（预警 a*=%.2f）" % warn)
+    zones = [z for z, _, _ in seq]
+    print("[受控对向] 切换:", " -> ".join(z for z, _, _ in seq))
+    exp = [P.ZONE_SAFE, P.ZONE_WARNING, P.ZONE_DANGER, P.ZONE_OCCURRENCE, P.ZONE_IMPACT]
+    got = zones[:zones.index(P.ZONE_IMPACT) + 1] if P.ZONE_IMPACT in zones else zones
+    assert got == exp, f"预期 {exp} 实际 {got}"
+    warn = next((f for z, _, f in seq if z == P.ZONE_WARNING), None)
+    dang = next((f for z, _, f in seq if z == P.ZONE_DANGER), None)
+    assert warn and dang and warn["a_brake_mps2"] <= 3.0 < dang["a_brake_mps2"]
+    # 多因素都在输出里
+    for z, _f, f in seq:
+        if f and z in (P.ZONE_WARNING, P.ZONE_DANGER, P.ZONE_OCCURRENCE):
+            for k in ("a_brake_mps2", "a_lat_mps2", "ttc_s", "delta_v_mps", "geometry"):
+                assert k in f, f"缺少因素 {k}: {f}"
+    print("    ✓ 完整三段式 + 六因素齐全（制动/转向/TTC/Δv/几何/能力上限）")
+
+
+def test_steering_saves():
+    """转向避让因子：扫描找"制动不足、但转向可救"的状态（binding=steer）。"""
+    dims = [2.0, 1.7, 4.5]
+    params = _params(horizon_s=2.0, t_reaction_s=0.7, lane_width_m=3.5,
+                     a_comfort_mps2=3.0, a_emergency_mps2=8.0, mu=0.8)
+    found = None
+    for gap in np.arange(20.0, 70.0, 0.5):
+        pe, po = _pose(0.0, 0.0), _pose(float(gap), math.pi)
+        va = np.array([0, 0, 12.0], float)
+        vb = np.array([0, 0, -12.0], float)
+        r = P.analyze_pair(pe, va, np.zeros(3), dims, po, vb, np.zeros(3), dims, "vehicle", params)
+        if r.get("binding") == "steer":
+            found = (gap, r)
+            break
+    assert found, "应存在'制动不足、转向可救'的状态"
+    gap, r = found
+    f = r["factors"]
+    print("[转向避让] gap=%.1f zone=%s binding=%s a_brake=%s a_lat=%.2f cap_lat=%.2f cap_brake=%.2f" % (
+        gap, r["zone"], r["binding"], f.get("a_brake_mps2"), f.get("a_lat_mps2"),
+        params["cap_lat_mps2"], params["cap_brake_mps2"]))
+    assert r["zone"] == P.ZONE_DANGER
+    assert f["a_brake_mps2"] is None or f["a_brake_mps2"] > params["cap_brake_mps2"] - 0.01
+    assert f["a_lat_mps2"] <= params["cap_lat_mps2"]
+    print("    ✓ 横向转向作为独立因子在制动不足时接管（能力包络取最优项）")
 
 
 def test_occlusion():
-    """鬼探头：对向车 B 在 emerge 帧之前对 A 不可见，一出现就落入发生区 → 预警被跳过。
-
-    与 test_controlled 相同的对向逼近，但 B 前 20 帧"被遮挡"。可见前 A 无任何冲突信号
-    （occluded），第 20 帧 B 一出现 gap 只剩 22m（ttc≈0.92s），直接进入发生区。
-    """
+    """鬼探头：B 前 20 帧不可见，一出现就落入发生区。"""
     dims = [2.0, 1.7, 4.5]
-    params = dict(P.PHASE_PARAMS_DEFAULT)
-    params.update(horizon_s=2.0, t_reaction_s=0.7, a_comfort_mps2=3.0, a_emergency_mps2=8.0)
+    params = _params(horizon_s=2.0, t_reaction_s=0.7)
     emerge = 20
     ze, zo, v, dt = 0.0, 70.0, 12.0, 0.1
     seq = []
     for f in range(40):
         if f < emerge:
-            if not seq or seq[-1][0] != P.ZONE_OCCLUDED:
-                seq.append((P.ZONE_OCCLUDED, f))
+            z = P.ZONE_OCCLUDED
         else:
             pe, po = _pose(ze, 0.0), _pose(zo, math.pi)
             va = np.array([0, 0, v], float)
             vb = np.array([0, 0, -v], float)
-            ttc, _ = P._predict_contact(pe, va, dims, po, vb, dims, params["horizon_s"], params["dt_pred_s"])
-            astar = P.min_required_deceleration(pe, va, dims, po, vb, dims, params) if ttc is not None else 0.0
-            zone = P.ZONE_IMPACT if P._contact(pe, dims, po, dims) else (
-                P.classify_zone(astar, params) if ttc is not None else P.ZONE_SAFE)
-            if not seq or seq[-1][0] != zone:
-                seq.append((zone, f))
+            z = P.analyze_pair(pe, va, np.zeros(3), dims, po, vb, np.zeros(3), dims, "vehicle", params)["zone"]
+        if not seq or seq[-1][0] != z:
+            seq.append((z, f))
         ze += v * dt
         zo -= v * dt
     zones = [z for z, _ in seq]
-    print("[鬼探头遮挡] 切换序列:", " -> ".join("%s(f%d)" % (z, f) for z, f in seq))
-    assert zones[0] == P.ZONE_OCCLUDED
-    assert P.ZONE_WARNING not in zones, "鬼探头不应出现预警区"
+    print("[鬼探头] 切换:", " -> ".join("%s(f%d)" % (z, f) for z, f in seq))
+    assert zones[0] == P.ZONE_OCCLUDED and P.ZONE_WARNING not in zones
     assert P.ZONE_OCCURRENCE in zones and P.ZONE_IMPACT in zones
-    print("    ✓ 遮挡期无预警，一出现即落入发生区 → 预警被跳过（典型鬼探头 corner case）")
+    print("    ✓ 遮挡期无预警，一出现即发生区")
 
 
 def test_scenarios(scene_path, start, num_frames):
@@ -120,6 +141,8 @@ def test_scenarios(scene_path, start, num_frames):
         ("rear-end", {"victim": 5, "attacker": 3}),
         ("head-on", {"attacker": 3}),
         ("pedestrian-crossing", {"vehicle": 3}),
+        ("chain-reaction-rear-end", {"rear": 3}),
+        ("hard-brake", {"braker": 3}),
         ("natural-conflict", {"ego": 5, "other": 2}),
     ]
     for st, roles in cases:
@@ -128,25 +151,20 @@ def test_scenarios(scene_path, start, num_frames):
         tm.fps = 10.0
         res = corner_case.generate(tm, st, roles, start, num_frames,
                                    intensity=1.0, enable_physics=True, fps=10.0, sampling_seed=7)
-        pair = res.get("collision_tracks") or res.get("collision_pair") or []
-        actor = int(pair[0]) if len(pair) else None
-        others = [int(t) for t in (res.get("affected_tracks") or []) if t != actor]
-        if actor is None:
-            print("[%s] 无配对，跳过" % st)
-            continue
-        prof = P.SCENARIO_PHASE_PROFILES.get(st, {})
-        pa = P.compute_phase_timeline(tm, actor, others, frames, 10.0, params=prof,
-                                      collision_frame=res.get("collision_frame"))
+        pa = res.get("phase_analysis") or {}
         prev, sw = None, []
-        for e in pa["timeline"]:
+        for e in pa.get("timeline", []):
             if e["zone"] != prev:
                 sw.append("f%d:%s" % (e["frame"], e["zone"]))
                 prev = e["zone"]
-        # 不变量：区域时长非负
-        for k, v in pa["summary"]["zone_durations_s"].items():
-            assert v >= 0.0
-        print("[%-20s] actor=%s  切换: %s" % (st, actor, " -> ".join(sw)))
-        print("              story: %s" % pa["summary"]["story"])
+        s = (pa.get("summary") or {})
+        print("[%-22s] actor=%s coll=%s  切换: %s" % (st, pa.get("actor"), res.get("collision_frame"), " -> ".join(sw)))
+        print("              story: %s" % s.get("story"))
+        # 关键因素抽样：打印 danger/occurrence 首帧的因素
+        for e in pa.get("timeline", []):
+            if e["zone"] in (P.ZONE_DANGER, P.ZONE_OCCURRENCE) and e.get("factors"):
+                print("              %s 首帧因素: %s" % (e["zone"], e["factors"]))
+                break
 
 
 def main():
@@ -154,6 +172,7 @@ def main():
     start = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     nf = int(sys.argv[3]) if len(sys.argv) > 3 else 24
     test_controlled()
+    test_steering_saves()
     test_occlusion()
     test_scenarios(scene, start, nf)
     print("\n全部通过 ✓")

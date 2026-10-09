@@ -58,6 +58,7 @@ class _Ctx:
         self.collision_pair = None
         self.sim = None
         self.natural = None   # 自然冲突生成的附加结果（冲突类型/速度因子等）
+        self.collision_frames: list = []   # 所有碰撞帧（连环事故可能有多处撞击）
 
     def ensure(self, key, anchor_key=None):
         """若角色未指定则自动合成；返回 track_id。"""
@@ -75,6 +76,9 @@ class _Ctx:
         return int(tid)
 
     def finish(self):
+        if isinstance(self.sim, dict) and self.collision_frames:
+            self.sim = dict(self.sim)
+            self.sim["collision_frames"] = sorted(set(int(c) for c in self.collision_frames))
         return (self.affected, self.synth, self.collision_pair, self.sim, self.natural)
 
 
@@ -131,7 +135,7 @@ def prim_pursue(ctx, attacker, victim, severity_scale=1.0, victim_brake_decel=0.
                 victim_brake_frame=None, attacker_lateral=0.0, victim_lateral=0.0,
                 lateral_ramp=(0.0, 1.0)):
     """限加速度追击碰撞（含可选前车制动 + 可选横向偏移）。返回 sim dict。"""
-    return _simulate_pursuit_collision(
+    sim = _simulate_pursuit_collision(
         ctx.tm, attacker, victim, ctx.frames, ctx.fps, ctx.intensity * severity_scale,
         enable_physics=ctx.enable_physics,
         victim_brake_decel=victim_brake_decel,
@@ -140,6 +144,9 @@ def prim_pursue(ctx, attacker, victim, severity_scale=1.0, victim_brake_decel=0.
         victim_lateral=victim_lateral,
         lateral_ramp=lateral_ramp,
     )
+    if sim and sim.get("collision_frame") is not None:
+        ctx.collision_frames.append(int(sim["collision_frame"]))
+    return sim
 
 
 def prim_lateral_sweep(ctx, track, lat_from, lat_to, delay_s=0.0, duration=1.0,

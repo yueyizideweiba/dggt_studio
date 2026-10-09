@@ -1928,6 +1928,7 @@ class DGGTStudio {
                     statusEl.innerHTML = msg;
                 }
                 this.updateStatus(`已生成 Corner Case: ${scenario.name}`);
+                this._renderPhaseAnalysis(data.phase_analysis);
             } else {
                 alert('生成失败: ' + (data.detail || '未知错误'));
             }
@@ -1935,6 +1936,58 @@ class DGGTStudio {
             console.error('生成Corner Case失败:', error);
             alert('生成失败: ' + error.message);
         }
+    }
+
+    _renderPhaseAnalysis(pa) {
+        const el = document.getElementById('cornerPhasePanel');
+        if (!el) return;
+        if (!pa || pa.error) {
+            el.innerHTML = (pa && pa.error) ? `<div class="cc-phase-error">相态分析失败: ${pa.error}</div>` : '';
+            return;
+        }
+        const tl = pa.timeline || [];
+        if (!tl.length) { el.innerHTML = ''; return; }
+        const colors = { safe: '#2ecc71', warning: '#f1c40f', danger: '#e67e22', occurrence: '#e74c3c', impact: '#8e1b1b', occluded: '#95a5a6', 'n/a': '#555' };
+        const labels = { safe: '安全', warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击', occluded: '遮挡', 'n/a': '—' };
+        // 逐帧色条 + 悬停/点击查看该帧因素
+        let cells = tl.map((e, i) => {
+            const f = e.factors ? Object.entries(e.factors).map(([k, v]) => `${k}=${v}`).join(', ') : '';
+            const title = `帧${e.frame} ${labels[e.zone] || e.zone}${f ? '\n' + f : ''}`;
+            return `<span class="cc-phase-cell" data-i="${i}" style="background:${colors[e.zone] || '#555'}" title="${title.replace(/"/g, '&quot;')}"></span>`;
+        }).join('');
+        let legend = Object.entries(labels).filter(([k]) => k !== 'n/a').map(([k, v]) =>
+            `<span class="cc-legend"><i style="background:${colors[k]}"></i>${v}</span>`).join('');
+        const s = pa.summary || {};
+        let bounds = [];
+        if (s.first_warning_frame != null) bounds.push(`预警@f${s.first_warning_frame}`);
+        if (s.first_danger_frame != null) bounds.push(`危险@f${s.first_danger_frame}`);
+        if (s.first_occurrence_frame != null) bounds.push(`发生@f${s.first_occurrence_frame}`);
+        if (s.collision_frame != null) bounds.push(`撞击@f${s.collision_frame}`);
+        const dur = s.zone_durations_s || {};
+        const flag = s.skipped_warning ? '<b style="color:#e74c3c">[预警被跳过]</b>'
+            : (s.compressed_warning ? '<b style="color:#e67e22">[预警被压缩]</b>' : '');
+        // 关键帧因素（取 danger/occurrence 首帧，便于"为什么是这个区域"）
+        let factorHtml = '';
+        const keyZone = ['occurrence', 'danger', 'warning'].map(z => tl.find(e => e.zone === z)).find(Boolean);
+        if (keyZone && keyZone.factors) {
+            factorHtml = `<div class="cc-phase-factors">关键帧 f${keyZone.frame}（${labels[keyZone.zone]}）因素：` +
+                Object.entries(keyZone.factors).map(([k, v]) => `${k}=${v}`).join('，') + `</div>`;
+        }
+        el.innerHTML = `
+            <div class="cc-phase-title">多阶段交互结构（预警 → 危险 → 发生）</div>
+            <div class="cc-phase-strip">${cells}</div>
+            <div class="cc-phase-legend">${legend}</div>
+            <div class="cc-phase-story">${s.story || ''}</div>
+            <div class="cc-phase-bounds">边界：${bounds.join('　') || '—'}　|　时长：预警${dur.warning ?? 0}s / 危险${dur.danger ?? 0}s / 发生${dur.occurrence ?? 0}s ${flag}</div>
+            ${factorHtml}`;
+        // 点击色条 → 弹该帧因素详情（简单 alert）
+        el.querySelectorAll('.cc-phase-cell').forEach(cell => {
+            cell.addEventListener('click', () => {
+                const e = tl[parseInt(cell.dataset.i)];
+                const f = e.factors ? Object.entries(e.factors).map(([k, v]) => `${k}: ${v}`).join('\n') : '(无因素)';
+                alert(`帧 ${e.frame} · ${labels[e.zone] || e.zone} · risk=${e.risk_level}\n${f}`);
+            });
+        });
     }
 
     _formatCollisionInfo(ca) {

@@ -2798,10 +2798,13 @@ async def analyze_corner_case_phases(request: CornerCasePhaseRequest):
     others = list(dict.fromkeys(others))
 
     frames = list(range(int(request.start_frame), int(request.start_frame) + int(request.num_frames) + 1))
+    _cframes = []
+    if isinstance(result.get("collision_frame"), int) and result.get("collision_frame") is not None:
+        _cframes = [int(result["collision_frame"])]
     try:
         phase = phase_zones.compute_phase_timeline(
             tm, actor, others, frames, request.fps, params=prof,
-            occlusion=request.occlusion, collision_frame=result.get("collision_frame"))
+            occlusion=request.occlusion, collision_frames=_cframes)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"相态分析失败: {e}")
 

@@ -1257,9 +1257,14 @@ def generate(tm, scenario_type, roles, start_frame, num_frames, intensity=1.0,
             _all = list(dict.fromkeys([int(t) for t in (affected + synthesized)]))
             _others = [t for t in _all if t != _actor]
             _prof = phase_zones.SCENARIO_PHASE_PROFILES.get(scenario_type, {})
+            _cframes = []
+            if isinstance(sim_result, dict):
+                _cframes = [int(c) for c in (sim_result.get("collision_frames") or [])]
+            if not _cframes and result.get("collision_frame") is not None:
+                _cframes = [int(result["collision_frame"])]
             result["phase_analysis"] = phase_zones.compute_phase_timeline(
                 tm, _actor, _others, frames, fps,
-                params=_prof, collision_frame=result.get("collision_frame"))
+                params=_prof, collision_frames=_cframes)
     except Exception as _e:  # noqa: BLE001
         result["phase_analysis"] = {"error": str(_e)}
 
