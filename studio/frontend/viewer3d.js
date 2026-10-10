@@ -4,6 +4,7 @@ class DGGTViewer3D {
         this.apiBase = options.apiBase || 'http://localhost:8000/api';
         this.onObjectSelected = options.onObjectSelected || (() => {});
         this.onObjectEdited = options.onObjectEdited || (() => {});
+        this.onMultiSelectChange = options.onMultiSelectChange || (() => {});
 
         this.renderHeight = options.renderHeight || 540;
         this.renderWidth = options.renderWidth || 960;
