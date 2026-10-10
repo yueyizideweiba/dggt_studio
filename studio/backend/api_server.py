@@ -2826,7 +2826,7 @@ class PairwisePhaseRequest(BaseModel):
     num_frames: int = 25
     fps: float = 10.0
     max_pairs_per_frame: int = 40
-    track_ids: Optional[List[int]] = None   # 显式指定哪些物体是车辆；None=默认车辆类
+    track_ids: Optional[List[int]] = None   # 显式指定哪些物体参与；None=全局所有物体
     # 相态参数覆盖（None 用默认）
     t_reaction_s: Optional[float] = None
     a_comfort_mps2: Optional[float] = None

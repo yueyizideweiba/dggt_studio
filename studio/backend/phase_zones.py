@@ -656,8 +656,7 @@ def compute_pairwise_phases(tm, frames: List[int], fps: float,
 
     Args:
         track_ids: 显式指定"哪些物体是车辆/参与者"；只在这些物体之间判定。
-                   为 None 时默认只用**车辆类**物体（vehicle / large_vehicle），排除行人、
-                   锥桶等非车辆（它们对车辆间多阶段模型是噪声）。
+                   为 None（默认）时对**场景里所有物体**全局两两判定（不按类型过滤）。
 
     返回 {frame: [ {a, b, zone, binding, factors, risk_level, r_warning_m, r_danger_m,
                    pos_a, pos_b} ... ]}，只保留非 safe 的冲突对（按严重度降序，封顶）。
@@ -673,11 +672,11 @@ def compute_pairwise_phases(tm, frames: List[int], fps: float,
         dims[tid] = _dims(tm, tid)
         cls[tid] = _class_of(dims[tid])
 
-    # 参与者集合：显式指定用 track_ids；否则默认"车辆类"物体
+    # 参与者集合：显式指定用 track_ids；否则默认全局所有物体
     if track_ids:
         allowed = {int(t) for t in track_ids}
     else:
-        allowed = {int(t) for t in tids if cls.get(t) in ("vehicle", "large_vehicle")}
+        allowed = set(tids)
 
     order = {ZONE_IMPACT: 5, ZONE_OCCURRENCE: 4, ZONE_DANGER: 3,
              ZONE_WARNING: 2, ZONE_OCCLUDED: 1}
