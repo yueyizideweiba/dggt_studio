@@ -102,6 +102,7 @@ PHASE_PARAMS_DEFAULT = {
     "d_near_miss_m": 3.0,         # 无接触但"近距离擦过"的最近距离阈值
     "vru_margin_m": 1.0,          # 行人类物体的额外安全余量
     "max_region_radius_m": 40.0,  # 区域环半径封顶（避免高速对向时环铺满整个场景）
+    "max_pair_distance_m": 50.0,  # 全局两两：超过该间距的对接"接近过程"无意义（判 safe，去噪）
     "post_impact_frames": 2,
     "severity_delta_v_high": 14.0,
     "severity_delta_v_med": 7.0,
@@ -319,6 +320,19 @@ def _risk_level(zone: str, severity: str) -> str:
 
 
 # --------------------------------------------------------------------------- 主入口
+def _prepare_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """合并默认参数并算能力包络上限（受 μ 约束的制动/转向）。"""
+    p = dict(PHASE_PARAMS_DEFAULT)
+    if params is not None:
+        for k, v in params.items():
+            if v is not None:
+                p[k] = v
+    p["cap_brake_mps2"] = min(float(p["a_emergency_mps2"]),
+                              float(p["mu"]) * float(p["g_mps2"]))
+    p["cap_lat_mps2"] = 0.9 * float(p["mu"]) * float(p["g_mps2"])
+    return p
+
+
 def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int], fps: float,
                            params: Optional[Dict[str, Any]] = None,
                            occlusion: Optional[Dict[int, int]] = None,
@@ -328,15 +342,7 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
     Args:
         collision_frames: 撞击帧列表（生成器已知的接触时刻，可多个，用于连环事故）。
     """
-    params = dict(PHASE_PARAMS_DEFAULT)
-    if params is not None:
-        for k, v in params.items():
-            if v is not None:
-                params[k] = v
-    # 能力包络：受 μ 约束的制动/转向上限
-    params["cap_brake_mps2"] = min(float(params["a_emergency_mps2"]),
-                                   float(params["mu"]) * float(params["g_mps2"]))
-    params["cap_lat_mps2"] = 0.9 * float(params["mu"]) * float(params["g_mps2"])
+    params = _prepare_params(params)
 
     others = [int(o) for o in others if int(o) != int(actor)]
     occlusion = {int(k): int(v) for k, v in (occlusion or {}).items()}
@@ -474,7 +480,9 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
 
     ttc, min_d = _predict_contact(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     if ttc is None:
-        if min_d < margin:
+        # 近距离擦过（险情）：只在"确实在接近"（闭合速度 > 0.5 m/s）时才判预警，
+        # 否则两辆静止停得很近也会被误判成"预警"（全局模型里尤其噪）。
+        if min_d < margin and closing_spd > 0.5:
             return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
                     "binding": "near_miss", "risk_level": "elevated"}
         return {"zone": ZONE_SAFE, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
@@ -621,3 +629,97 @@ def _make_story(w_f, d_f, o_f, i_f, oc_f, dw, dd, do, compressed, skipped, event
     elif compressed:
         s += " 预警区被压缩到 %.1fs 以内——典型 corner case。" % dw
     return s
+
+
+# --------------------------------------------------------------------------- 全局两两相态
+def _tracks_at_frame(tm, f: int) -> List[int]:
+    """该帧存在的所有动态物体（真实 + 合成，跳过 ego 与已删除/替换）。"""
+    tids = set()
+    deleted = set(getattr(tm, "track_deleted", set()) or set())
+    replaced = set(getattr(tm, "track_replaced", set()) or set())
+    for tid, fm in (getattr(tm, "track_to_frames", {}) or {}).items():
+        if int(f) in (fm or {}) and int(tid) not in deleted and int(tid) not in replaced:
+            tids.add(int(tid))
+    for sid, s in (getattr(tm, "synthetic_tracks", {}) or {}).items():
+        if s.get("ego"):
+            continue
+        if int(f) in (s.get("poses") or {}):
+            tids.add(int(sid))
+    return sorted(tids)
+
+
+def compute_pairwise_phases(tm, frames: List[int], fps: float,
+                            params: Optional[Dict[str, Any]] = None,
+                            max_pairs_per_frame: int = 40) -> Dict[int, List[Dict[str, Any]]]:
+    """全局两两相态：场景里**任意两个物体**之间的多阶段区域判定（不只事故参与者）。
+
+    返回 {frame: [ {a, b, zone, binding, factors, risk_level, r_warning_m, r_danger_m,
+                   pos_a, pos_b} ... ]}，只保留非 safe 的冲突对（按严重度降序，封顶）。
+
+    区域半径用"闭合速度"动态计算，反应主体 a 取速度更快的一方（更可能是"需要反应"的车）。
+    """
+    params = _prepare_params(params)
+    frames = list(frames)
+    tids = set()
+    for f in frames:
+        tids |= set(_tracks_at_frame(tm, f))
+    mot, dims, cls = {}, {}, {}
+    for tid in tids:
+        mot[tid] = _motion_series(tm, tid, frames, fps)
+        dims[tid] = _dims(tm, tid)
+        cls[tid] = _class_of(dims[tid])
+
+    order = {ZONE_IMPACT: 5, ZONE_OCCURRENCE: 4, ZONE_DANGER: 3,
+             ZONE_WARNING: 2, ZONE_OCCLUDED: 1}
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for f in frames:
+        present = [t for t in _tracks_at_frame(tm, f) if t in tids]
+        rows = []
+        for i in range(len(present)):
+            for j in range(i + 1, len(present)):
+                ta, tb = present[i], present[j]
+                pa_raw = tm.get_track_pose(ta, f)
+                pb_raw = tm.get_track_pose(tb, f)
+                if pa_raw is None or pb_raw is None:
+                    continue
+                pa = np.asarray(pa_raw, dtype=np.float64)
+                pb = np.asarray(pb_raw, dtype=np.float64)
+                # 空间距离过滤：多阶段区域是"接近过程"，超过 max_pair_distance_m 的对接 safe，
+                # 也避免远处高速噪声轨迹被误判成冲突。
+                if float(np.linalg.norm(pa[:3, 3] - pb[:3, 3])) > float(params["max_pair_distance_m"]):
+                    continue
+                va = mot[ta][1].get(int(f), np.zeros(3, dtype=np.float64))
+                vb = mot[tb][1].get(int(f), np.zeros(3, dtype=np.float64))
+                aa = mot[ta][2].get(int(f), np.zeros(3, dtype=np.float64))
+                ab = mot[tb][2].get(int(f), np.zeros(3, dtype=np.float64))
+                # 反应主体取速度更快的一方
+                if float(np.linalg.norm(va)) >= float(np.linalg.norm(vb)):
+                    a, b = ta, tb
+                    r = analyze_pair(pa, va, aa, dims[ta], pb, vb, ab, dims[tb], cls[tb], params)
+                else:
+                    a, b = tb, ta
+                    r = analyze_pair(pb, vb, ab, dims[tb], pa, va, aa, dims[ta], cls[ta], params)
+                if r["zone"] in (ZONE_SAFE, ZONE_NA, ZONE_IMPACT):
+                    # 全局模型只报"接近过程"的三区 + 险情；"已接触"（impact）由碰撞关键帧单独标，
+                    # 否则 raw 场景里行人贴着车、重复跟踪等静态重叠会被当成"撞击"（噪声极大）。
+                    continue
+                if r.get("binding") == "near_miss":
+                    # 全局概览只保留"真的会撞 / 需要制动"的冲突对；"擦过"(<3m)在密集场景里
+                    # 太多（相邻车道、行人贴着车），单条事故时程里已保留，这里去掉去噪。
+                    continue
+                fac = r.get("factors") or {}
+                vc = float(fac.get("closing_speed_mps") if fac.get("closing_speed_mps") is not None
+                           else (fac.get("relative_speed_mps") or 0.0))
+                rw, rd = _envelope_radii(vc, params)
+                ca = np.asarray(tm.get_track_pose(a, f))[:3, 3]
+                cb = np.asarray(tm.get_track_pose(b, f))[:3, 3]
+                rows.append({
+                    "a": int(a), "b": int(b), "zone": r["zone"], "binding": r["binding"],
+                    "factors": fac, "risk_level": r["risk_level"],
+                    "r_warning_m": rw, "r_danger_m": rd,
+                    "pos_a": [float(x) for x in ca],
+                    "pos_b": [float(x) for x in cb],
+                })
+        rows.sort(key=lambda x: -order.get(x["zone"], 0))
+        out[int(f)] = rows[:max_pairs_per_frame]
+    return out

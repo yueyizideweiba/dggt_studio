@@ -2819,6 +2819,46 @@ async def analyze_corner_case_phases(request: CornerCasePhaseRequest):
     }
 
 
+class PairwisePhaseRequest(BaseModel):
+    """全局两两相态：场景里任意两个物体之间的多阶段区域判定。"""
+    scene_id: str
+    start_frame: int = 0
+    num_frames: int = 25
+    fps: float = 10.0
+    max_pairs_per_frame: int = 40
+    # 相态参数覆盖（None 用默认）
+    t_reaction_s: Optional[float] = None
+    a_comfort_mps2: Optional[float] = None
+    a_emergency_mps2: Optional[float] = None
+    mu: Optional[float] = None
+
+
+@app.post("/api/corner_case/pairwise")
+async def corner_case_pairwise_phases(request: PairwisePhaseRequest):
+    """返回窗口内每帧"所有物体两两之间"的相态（预警/危险/发生 + 区域半径）。"""
+    import phase_zones
+    tm = get_track_manager_or_404(request.scene_id)
+    tm.fps = float(request.fps or 10.0)
+    prof = {k: v for k, v in (("t_reaction_s", request.t_reaction_s),
+                              ("a_comfort_mps2", request.a_comfort_mps2),
+                              ("a_emergency_mps2", request.a_emergency_mps2),
+                              ("mu", request.mu)) if v is not None}
+    frames = list(range(int(request.start_frame), int(request.start_frame) + int(request.num_frames) + 1))
+    try:
+        pairs = phase_zones.compute_pairwise_phases(
+            tm, frames, request.fps, params=prof or None,
+            max_pairs_per_frame=request.max_pairs_per_frame)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"全局两两相态计算失败: {e}")
+    return {
+        "success": True,
+        "start_frame": int(request.start_frame),
+        "num_frames": int(request.num_frames),
+        "fps": request.fps,
+        "frames": {str(k): v for k, v in pairs.items()},
+    }
+
+
 class CornerCaseClearRequest(BaseModel):
     scene_id: str
     track_ids: List[int]

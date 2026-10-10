@@ -1929,15 +1929,35 @@ class DGGTStudio {
                 }
                 this.updateStatus(`已生成 Corner Case: ${scenario.name}`);
                 this._renderPhaseAnalysis(data.phase_analysis);
-                if (this.viewer3d && data.phase_analysis) {
-                    this.viewer3d.setPhaseZones(data.phase_analysis, data.phase_analysis.actor);
-                }
+                this._loadPairwiseZones(startFrame, numFrames);
             } else {
                 alert('生成失败: ' + (data.detail || '未知错误'));
             }
         } catch (error) {
             console.error('生成Corner Case失败:', error);
             alert('生成失败: ' + error.message);
+        }
+    }
+
+    async _loadPairwiseZones(startFrame, numFrames) {
+        if (!this.state.sceneId) return;
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/pairwise`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    start_frame: startFrame, num_frames: numFrames, fps: 10.0
+                })
+            });
+            const d = await resp.json();
+            if (d.success && d.frames && this.viewer3d) {
+                const map = {};
+                Object.entries(d.frames).forEach(([f, pairs]) => { map[Number(f)] = pairs; });
+                this.viewer3d.setPairwiseZones(map);
+            }
+        } catch (e) {
+            console.warn('加载全局两两相态失败', e);
         }
     }
 
@@ -2198,7 +2218,7 @@ class DGGTStudio {
                 this.viewer3d._invalidateCache();
                 this.viewer3d.trajectory = null;
                 this.viewer3d.clearCriticalFrames();
-                this.viewer3d.clearPhaseZones();
+                this.viewer3d.clearPairwiseZones();
                 if (this.viewer3d.selectedTrackId !== null) {
                     this.viewer3d._fetchTrajectory(this.viewer3d.selectedTrackId);
                 }

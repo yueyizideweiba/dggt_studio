@@ -609,9 +609,9 @@ class DGGTViewer3D {
             }
         }
 
-        // 多阶段交互区域（预警/危险/发生 制动能力包络同心环）
-        if (this.phaseZones && this.phaseActor !== null) {
-            this._drawPhaseZones(sx, sy);
+        // 全局两两相态区域（任意两物体之间：预警/危险/发生 方向性区域 + 连接线）
+        if (this.pairwiseZones) {
+            this._drawPairwiseZones(sx, sy);
         }
 
         // 选中 track 的轨迹（可编辑点）
@@ -1128,69 +1128,85 @@ class DGGTViewer3D {
         this._drawOverlay();
     }
 
-    // 设置多阶段交互区域（预警区/危险区/发生区）并叠加到视图
-    setPhaseZones(phase, actorId) {
-        this.phaseZones = phase || null;
-        this.phaseActor = (actorId === undefined || actorId === null) ? null : Number(actorId);
+    // 设置全局两两相态（frame -> [pair]），叠加方向性区域到视图
+    setPairwiseZones(pairsByFrame) {
+        this.pairwiseZones = pairsByFrame || null;
         this._drawOverlay();
     }
 
-    clearPhaseZones() {
-        this.phaseZones = null;
-        this.phaseActor = null;
+    clearPairwiseZones() {
+        this.pairwiseZones = null;
         this._drawOverlay();
     }
 
-    // 在视图里画出主车的"制动能力包络"同心环：红=发生区(紧急制动也来不及)、黄=预警区边界
-    _drawPhaseZones(sx, sy) {
-        if (!this.phaseZones || this.phaseActor === null) return;
-        const obj = this.objects.find(o => Number(o.track_id) === this.phaseActor);
-        if (!obj || !obj.center) return;
-        const tl = this.phaseZones.timeline || [];
-        if (!tl.length) return;
-        let entry = null;
-        for (const e of tl) { if (e.frame === this.frameIdx) { entry = e; break; } }
-        if (!entry) {
-            let best = null, bd = 1e9;
-            for (const e of tl) { const d = Math.abs(e.frame - this.frameIdx); if (d < bd) { bd = d; best = e; } }
-            entry = best;
+    // 世界坐标两点连线（按区域着色）
+    _lineWorld(a, b, color, sx, sy, width) {
+        const spa = this._worldToScreen(a, this.lastC2W);
+        const spb = this._worldToScreen(b, this.lastC2W);
+        if (!spa || !spb) return;
+        this.octx.beginPath();
+        this.octx.moveTo(spa.x * sx, spa.y * sy);
+        this.octx.lineTo(spb.x * sx, spb.y * sy);
+        this.octx.strokeStyle = color;
+        this.octx.lineWidth = width;
+        this.octx.stroke();
+    }
+
+    // 世界 XZ 平面上的"方向性椭圆"：中心前移半长轴，只朝 (ux,uz) 方向延伸（teardrop）
+    _ellipseWorld(cx, cy, cz, ux, uz, a, b, sx, sy, strokeColor, fillColor) {
+        if (!a) return;
+        const ox = cx + ux * a * 0.5, oz = cz + uz * a * 0.5;
+        const px = -uz, pz = ux;   // 垂直方向（XZ 平面内旋转 90°）
+        const N = 40;
+        this.octx.beginPath();
+        let started = false;
+        for (let i = 0; i <= N; i++) {
+            const t = (i / N) * Math.PI * 2;
+            const ex = (a * 0.5) * Math.cos(t), ez = b * Math.sin(t);
+            const wx = ox + ux * ex + px * ez;
+            const wz = oz + uz * ex + pz * ez;
+            const sp = this._worldToScreen([wx, cy, wz], this.lastC2W);
+            if (!sp) { started = false; continue; }
+            const X = sp.x * sx, Y = sp.y * sy;
+            if (!started) { this.octx.moveTo(X, Y); started = true; }
+            else this.octx.lineTo(X, Y);
         }
-        if (!entry) return;
-        const rw = Number(entry.r_warning_m) || 0;
-        const rd = Number(entry.r_danger_m) || 0;
-        if (!rw && !rd) return;
-        const cx = obj.center[0], cy = obj.center[1], cz = obj.center[2];
-        const N = 48;
-        const ring = (r, strokeColor, fillColor, dash) => {
-            if (!r) return;
-            this.octx.beginPath();
-            let started = false;
-            for (let i = 0; i <= N; i++) {
-                const a = (i / N) * Math.PI * 2;
-                const sp = this._worldToScreen([cx + r * Math.cos(a), cy, cz + r * Math.sin(a)], this.lastC2W);
-                if (!sp) { started = false; continue; }
-                const x = sp.x * sx, y = sp.y * sy;
-                if (!started) { this.octx.moveTo(x, y); started = true; }
-                else this.octx.lineTo(x, y);
+        this.octx.closePath();
+        if (fillColor) { this.octx.fillStyle = fillColor; this.octx.fill(); }
+        if (strokeColor) { this.octx.strokeStyle = strokeColor; this.octx.lineWidth = 2; this.octx.stroke(); }
+    }
+
+    // 画当前帧所有冲突对的"方向性区域 + 连接线"（不再画 360° 圆）
+    _drawPairwiseZones(sx, sy) {
+        if (!this.pairwiseZones) return;
+        const pairs = this.pairwiseZones[this.frameIdx] || [];
+        if (!pairs.length) return;
+        const stroke = { warning: 'rgba(241,196,15,0.85)', danger: 'rgba(230,126,34,0.9)',
+                         occurrence: 'rgba(231,76,60,0.95)', impact: 'rgba(142,27,27,0.95)' };
+        const fill = { warning: 'rgba(241,196,15,0.08)', danger: 'rgba(230,126,34,0.10)',
+                       occurrence: 'rgba(231,76,60,0.12)', impact: 'rgba(142,27,27,0.16)' };
+        const zl = { warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击' };
+        for (const p of pairs) {
+            const ca = p.pos_a, cb = p.pos_b;
+            const dx = cb[0] - ca[0], dz = cb[2] - ca[2];
+            const dd = Math.hypot(dx, dz);
+            if (dd < 1e-3) continue;
+            const ux = dx / dd, uz = dz / dd;
+            const col = stroke[p.zone] || 'rgba(255,255,255,0.6)';
+            // 连接线（按区域着色，宽度随严重度）
+            this._lineWorld(ca, cb, col, sx, sy, p.zone === 'occurrence' || p.zone === 'impact' ? 4 : 2.5);
+            // 方向性危险区椭圆（围绕反应主体 a，长轴指向 b）
+            this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, Number(p.r_danger_m) || 0, 1.6, sx, sy, col, fill[p.zone]);
+            if (Number(p.r_warning_m) > Number(p.r_danger_m)) {
+                this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, Number(p.r_warning_m) || 0, 2.0, sx, sy, 'rgba(241,196,15,0.45)', null);
             }
-            this.octx.closePath();
-            if (fillColor) { this.octx.fillStyle = fillColor; this.octx.fill(); }
-            this.octx.strokeStyle = strokeColor;
-            this.octx.lineWidth = 2;
-            this.octx.setLineDash(dash || []);
-            this.octx.stroke();
-            this.octx.setLineDash([]);
-        };
-        // 发生区（紧急制动也来不及）：红环 + 淡红填充；预警区外边界：黄环
-        ring(rd, 'rgba(231,76,60,0.85)', 'rgba(231,76,60,0.08)', [6, 4]);
-        ring(rw, 'rgba(241,196,15,0.85)', null, []);
-        // 当前区域标签
-        const sp = this._worldToScreen([cx, cy, cz], this.lastC2W);
-        if (sp) {
-            const zl = { safe: '安全', warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击', occluded: '遮挡' };
-            this.octx.fillStyle = 'rgba(255,255,255,0.95)';
-            this.octx.font = 'bold 13px sans-serif';
-            this.octx.fillText(zl[entry.zone] || entry.zone, sp.x * sx + 12, sp.y * sy - 12);
+            // 区域标签（在 a 位置上方）
+            const sp = this._worldToScreen(ca, this.lastC2W);
+            if (sp) {
+                this.octx.fillStyle = 'rgba(255,255,255,0.95)';
+                this.octx.font = 'bold 12px sans-serif';
+                this.octx.fillText(zl[p.zone] || p.zone, sp.x * sx + 8, sp.y * sy - 8);
+            }
         }
     }
 
