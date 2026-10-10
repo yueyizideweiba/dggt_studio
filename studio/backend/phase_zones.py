@@ -103,6 +103,8 @@ PHASE_PARAMS_DEFAULT = {
     "vru_margin_m": 1.0,          # 行人类物体的额外安全余量
     "max_region_radius_m": 40.0,  # 区域环半径封顶（避免高速对向时环铺满整个场景）
     "max_pair_distance_m": 50.0,  # 全局两两：超过该间距的对接"接近过程"无意义（判 safe，去噪）
+    "thw_warning_s": 1.5,         # 车头时距阈值：低于它且无预测接触时判"预警"（跟车过近）
+    "thw_danger_s": 0.8,          # 车头时距阈值：低于它判"危险"
     "post_impact_frames": 2,
     "severity_delta_v_high": 14.0,
     "severity_delta_v_med": 7.0,
@@ -480,6 +482,15 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
 
     ttc, min_d = _predict_contact(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     if ttc is None:
+        # 无预测接触，但"车头时距"过近（跟车过近）→ 也应有预警/危险（贴车不一定要撞才警告）
+        thw = _time_headway(pa, va, pb)
+        if thw is not None:
+            if thw < float(params["thw_danger_s"]):
+                return {"zone": ZONE_DANGER, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
+                        "binding": "headway", "risk_level": "high"}
+            if thw < float(params["thw_warning_s"]):
+                return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
+                        "binding": "headway", "risk_level": "elevated"}
         # 近距离擦过（险情）：只在"确实在接近"（闭合速度 > 0.5 m/s）时才判预警，
         # 否则两辆静止停得很近也会被误判成"预警"（全局模型里尤其噪）。
         if min_d < margin and closing_spd > 0.5:
@@ -540,7 +551,27 @@ def _closing_speed(pa, pb, va, vb) -> float:
     return max(0.0, float(np.dot(np.asarray(va, dtype=np.float64) - np.asarray(vb, dtype=np.float64), u)))
 
 
-def _factors(kin, rel_spd, closing_spd, va, vb, vru, params):
+def _time_headway(pa, va, pb, max_lateral: float = 2.5) -> Optional[float]:
+    """车头时距 THW = 沿主车航向的纵向间距 / 主车速度。
+
+    只对"对方在主车**同车道前方**"有效（横向偏移 ≤ max_lateral，否则相邻车道的车不算），
+    返回 None。用于"跟车过近但无预测接触"时的预警判据。
+    """
+    head = _heading_unit(va)
+    rel = np.asarray(pb[:3, 3], dtype=np.float64) - np.asarray(pa[:3, 3], dtype=np.float64)
+    long_gap = float(np.dot(rel, head))
+    if long_gap <= 0.0:
+        return None
+    lateral = float(np.linalg.norm(rel - head * long_gap))
+    if lateral > float(max_lateral):
+        return None
+    spd = float(np.linalg.norm(va))
+    if spd < 0.5:
+        return None
+    return long_gap / spd
+
+
+def _factors(kin, rel_spd, closing_spd, va, vb, vru, params, thw=None):
     """拼一个可追溯的因素字典。kin = (a_brake, a_lat, ttc) 或 None。"""
     f = {
         "relative_speed_mps": round(rel_spd, 3),
@@ -552,6 +583,8 @@ def _factors(kin, rel_spd, closing_spd, va, vb, vru, params):
         "cap_brake_mps2": round(float(params["cap_brake_mps2"]), 2),
         "cap_lat_mps2": round(float(params["cap_lat_mps2"]), 2),
     }
+    if thw is not None:
+        f["thw_s"] = round(float(thw), 2)
     if kin is not None:
         a_brake, a_lat, ttc = kin
         f["ttc_s"] = round(float(ttc), 3)
