@@ -101,6 +101,7 @@ PHASE_PARAMS_DEFAULT = {
     "a_scan_step_mps2": 0.25,
     "d_near_miss_m": 3.0,         # 无接触但"近距离擦过"的最近距离阈值
     "vru_margin_m": 1.0,          # 行人类物体的额外安全余量
+    "max_region_radius_m": 40.0,  # 区域环半径封顶（避免高速对向时环铺满整个场景）
     "post_impact_frames": 2,
     "severity_delta_v_high": 14.0,
     "severity_delta_v_med": 7.0,
@@ -358,22 +359,28 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
         pa = np.asarray(pa, dtype=np.float64)
         va = vel_actor.get(int(f), np.zeros(3, dtype=np.float64))
         aa = acc_actor.get(int(f), np.zeros(3, dtype=np.float64))
-        rw, rd = _envelope_radii(va, params)
+        v_abs = float(np.linalg.norm(va))
+        rw0, rd0 = _envelope_radii(v_abs, params)   # 无配对/撞击帧兜底：用主车绝对车速
 
         if cfrs and any(c <= int(f) <= c + post for c in cfrs):
-            timeline.append(_impact_entry(f, va, aa, rw, rd))
+            timeline.append(_impact_entry(f, va, aa, rw0, rd0))
             continue
         if cfrs and int(f) > max(cfrs) + post:
-            timeline.append(_concluded_entry(f, va, aa, rw, rd))
+            timeline.append(_concluded_entry(f, va, aa, rw0, rd0))
             continue
 
         # 无其它参与者 → 单参与者急刹（hard-brake 类）：按主车自身制动强度给相态
         if not others:
-            timeline.append(_single_vehicle_entry(f, va, aa, params, rw, rd))
+            timeline.append(_single_vehicle_entry(f, va, aa, params, rw0, rd0))
             continue
 
         best = _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params,
                                occlusion, int(f))
+        # 区域半径用"闭合速度"（实际接近速度），而不是主车绝对车速——否则会大得离谱
+        _fac = best.get("factors") or {}
+        _vc = float(_fac.get("closing_speed_mps") if _fac.get("closing_speed_mps") is not None
+                    else (_fac.get("relative_speed_mps") or v_abs))
+        rw, rd = _envelope_radii(_vc, params)
         advice = _ZONE_ADVICE.get(best["zone"], _ZONE_ADVICE[ZONE_NA])
         timeline.append({
             "frame": int(f), "zone": best["zone"],
@@ -388,19 +395,24 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
     return _finish_timeline(actor, others, frames, fps, params, timeline)
 
 
-def _envelope_radii(va, params):
+def _envelope_radii(v, params):
     """主车"制动能力包络"的两个半径（用于空间可视化）。
+
+    用**闭合速度**（两车实际接近速度）而非主车绝对车速：追尾时闭合速度可能只有 5m/s，
+    而主车绝对车速 20m/s 会把环画成 80m、铺满整个场景。
 
     r_danger = v·t_r + v²/(2·cap_brake)：紧急制动刚好能停住的最远距离（危险区外边界）；
     r_warning = v·t_r + v²/(2·a_comfort)：舒适制动刚好能停住（预警区外边界）。
+    半径按 max_region_radius_m 封顶，避免高速对向/远距离时环覆盖整个画面。
     """
-    v = float(np.linalg.norm(va))
+    v = max(0.0, float(v))
     t_r = float(params["t_reaction_s"])
     a_comf = float(params["a_comfort_mps2"])
     cap_brake = float(params["cap_brake_mps2"])
     r_warn = v * t_r + v * v / (2.0 * a_comf)
     r_dang = v * t_r + v * v / (2.0 * cap_brake)
-    return round(r_warn, 2), round(r_dang, 2)
+    rmax = float(params.get("max_region_radius_m", 40.0))
+    return round(min(r_warn, rmax), 2), round(min(r_dang, rmax), 2)
 
 
 def _impact_entry(f, va, aa, rw, rd):
@@ -455,16 +467,17 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
     margin = float(params["d_near_miss_m"]) + (float(params["vru_margin_m"]) if vru else 0.0)
 
     rel_spd = float(np.linalg.norm(va - vb))
+    closing_spd = _closing_speed(pa, pb, va, vb)
     if _contact(pa, dims_a, pb, dims_b):
-        return {"zone": ZONE_IMPACT, "factors": _factors(None, rel_spd, va, vb, vru, params),
+        return {"zone": ZONE_IMPACT, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
                 "binding": "impact", "risk_level": "critical"}
 
     ttc, min_d = _predict_contact(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     if ttc is None:
         if min_d < margin:
-            return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, va, vb, vru, params),
+            return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
                     "binding": "near_miss", "risk_level": "elevated"}
-        return {"zone": ZONE_SAFE, "factors": _factors(None, rel_spd, va, vb, vru, params),
+        return {"zone": ZONE_SAFE, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
                 "binding": None, "risk_level": "low"}
 
     a_brake = min_required_deceleration(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
@@ -477,7 +490,7 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
     if tier == 3:
         binding = "none"
     sev = _severity(rel_spd, _geometry(va, vb), vru, params)
-    return {"zone": zone, "factors": _factors((a_brake, a_lat, ttc), rel_spd, va, vb, vru, params),
+    return {"zone": zone, "factors": _factors((a_brake, a_lat, ttc), rel_spd, closing_spd, va, vb, vru, params),
             "binding": binding, "risk_level": _risk_level(zone, sev)}
 
 
@@ -505,10 +518,25 @@ def _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params, 
     return best
 
 
-def _factors(kin, rel_spd, va, vb, vru, params):
+def _closing_speed(pa, pb, va, vb) -> float:
+    """两物体沿连线的闭合速度（gap 缩小的速率，≥0）。
+
+    追尾时是"速度差"、对向时是"速度和"、横穿时随夹角变化——用这个算区域半径
+    才能反映**实际接近情况**，而不是主车绝对车速（那会把追尾 20m/s 的车画成 80m 的环）。
+    """
+    d = np.asarray(pb[:3, 3], dtype=np.float64) - np.asarray(pa[:3, 3], dtype=np.float64)
+    dd = float(np.linalg.norm(d))
+    if dd < 1e-3:
+        return 0.0
+    u = d / dd
+    return max(0.0, float(np.dot(np.asarray(va, dtype=np.float64) - np.asarray(vb, dtype=np.float64), u)))
+
+
+def _factors(kin, rel_spd, closing_spd, va, vb, vru, params):
     """拼一个可追溯的因素字典。kin = (a_brake, a_lat, ttc) 或 None。"""
     f = {
         "relative_speed_mps": round(rel_spd, 3),
+        "closing_speed_mps": round(closing_spd, 3),
         "delta_v_mps": round(rel_spd, 3),
         "geometry": _geometry(va, vb),
         "class_other": "pedestrian" if vru else "vehicle",
