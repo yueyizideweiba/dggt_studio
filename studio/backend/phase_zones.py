@@ -103,8 +103,8 @@ PHASE_PARAMS_DEFAULT = {
     "vru_margin_m": 1.0,          # 行人类物体的额外安全余量
     "max_region_radius_m": 40.0,  # 区域环半径封顶（避免高速对向时环铺满整个场景）
     "max_pair_distance_m": 50.0,  # 全局两两：超过该间距的对接"接近过程"无意义（判 safe，去噪）
-    "thw_warning_s": 1.5,         # 车头时距阈值：低于它且无预测接触时判"预警"（跟车过近）
-    "thw_danger_s": 0.8,          # 车头时距阈值：低于它判"危险"
+    "thw_warning_s": 1.0,         # 车头时距阈值：低于它且无预测接触时判"预警"（跟车/贴车过近）
+    "thw_danger_s": 0.5,          # 车头时距阈值：低于它判"危险"
     "post_impact_frames": 2,
     "severity_delta_v_high": 14.0,
     "severity_delta_v_med": 7.0,
@@ -482,15 +482,20 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
 
     ttc, min_d = _predict_contact(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     if ttc is None:
-        # 无预测接触，但"车头时距"过近（跟车过近）→ 也应有预警/危险（贴车不一定要撞才警告）
-        thw = _time_headway(pa, va, pb)
-        if thw is not None:
-            if thw < float(params["thw_danger_s"]):
-                return {"zone": ZONE_DANGER, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
-                        "binding": "headway", "risk_level": "high"}
-            if thw < float(params["thw_warning_s"]):
-                return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
-                        "binding": "headway", "risk_level": "elevated"}
+        # 同向贴车（无预测接触）：先看航向是否同向（夹角<45°，排除对向/横穿——那些由 TTC 管）
+        ang = _heading_angle(va, vb)
+        if ang < 45.0:
+            # 跟车过近（时距过短）：从"后方车"视角双向都试（a 跟 b 或 b 跟 a）
+            thw = _time_headway(pa, va, pb)
+            if thw is None:
+                thw = _time_headway(pb, vb, pa)
+            if thw is not None:
+                if thw < float(params["thw_danger_s"]):
+                    return {"zone": ZONE_DANGER, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
+                            "binding": "headway", "risk_level": "high"}
+                if thw < float(params["thw_warning_s"]):
+                    return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
+                            "binding": "headway", "risk_level": "elevated"}
         # 近距离擦过（险情）：只在"确实在接近"（闭合速度 > 0.5 m/s）时才判预警，
         # 否则两辆静止停得很近也会被误判成"预警"（全局模型里尤其噪）。
         if min_d < margin and closing_spd > 0.5:
@@ -551,24 +556,34 @@ def _closing_speed(pa, pb, va, vb) -> float:
     return max(0.0, float(np.dot(np.asarray(va, dtype=np.float64) - np.asarray(vb, dtype=np.float64), u)))
 
 
-def _time_headway(pa, va, pb, max_lateral: float = 2.5) -> Optional[float]:
+def _time_headway(pa, va, pb) -> Optional[float]:
     """车头时距 THW = 沿主车航向的纵向间距 / 主车速度。
 
-    只对"对方在主车**同车道前方**"有效（横向偏移 ≤ max_lateral，否则相邻车道的车不算），
-    返回 None。用于"跟车过近但无预测接触"时的预警判据。
+    只对"对方在主车前方至少 2m"有效（long_gap≤2m 排除并排/后方），不再按横向车道限制：
+    同向贴行的车不一定同车道，纵向接近就应有预警。
     """
     head = _heading_unit(va)
     rel = np.asarray(pb[:3, 3], dtype=np.float64) - np.asarray(pa[:3, 3], dtype=np.float64)
     long_gap = float(np.dot(rel, head))
-    if long_gap <= 0.0:
-        return None
-    lateral = float(np.linalg.norm(rel - head * long_gap))
-    if lateral > float(max_lateral):
+    if long_gap <= 2.0:
         return None
     spd = float(np.linalg.norm(va))
     if spd < 0.5:
         return None
     return long_gap / spd
+
+
+def _heading_angle(va, vb) -> float:
+    """两车航向夹角（度，0=同向，180=对向）。"""
+    na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+    if na < 0.3 or nb < 0.3:
+        return 0.0
+    ha = np.array([va[0], va[2]], dtype=np.float64)
+    hb = np.array([vb[0], vb[2]], dtype=np.float64)
+    ha = ha / np.linalg.norm(ha)
+    hb = hb / np.linalg.norm(hb)
+    cos = float(np.clip(np.dot(ha, hb), -1.0, 1.0))
+    return math.degrees(math.acos(cos))
 
 
 def _factors(kin, rel_spd, closing_spd, va, vb, vru, params, thw=None):
