@@ -1929,6 +1929,9 @@ class DGGTStudio {
                 }
                 this.updateStatus(`已生成 Corner Case: ${scenario.name}`);
                 this._renderPhaseAnalysis(data.phase_analysis);
+                if (this.viewer3d && data.phase_analysis) {
+                    this.viewer3d.setPhaseZones(data.phase_analysis, data.phase_analysis.actor);
+                }
             } else {
                 alert('生成失败: ' + (data.detail || '未知错误'));
             }
@@ -2195,6 +2198,7 @@ class DGGTStudio {
                 this.viewer3d._invalidateCache();
                 this.viewer3d.trajectory = null;
                 this.viewer3d.clearCriticalFrames();
+                this.viewer3d.clearPhaseZones();
                 if (this.viewer3d.selectedTrackId !== null) {
                     this.viewer3d._fetchTrajectory(this.viewer3d.selectedTrackId);
                 }

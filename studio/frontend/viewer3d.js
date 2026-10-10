@@ -609,6 +609,11 @@ class DGGTViewer3D {
             }
         }
 
+        // 多阶段交互区域（预警/危险/发生 制动能力包络同心环）
+        if (this.phaseZones && this.phaseActor !== null) {
+            this._drawPhaseZones(sx, sy);
+        }
+
         // 选中 track 的轨迹（可编辑点）
         if (this.showTrajectory && this.trajectory && this.trajectory.trajectory) {
             const pts = this.trajectory.trajectory;
@@ -1121,6 +1126,72 @@ class DGGTViewer3D {
         this.criticalFrames = null;
         this.criticalTracks = null;
         this._drawOverlay();
+    }
+
+    // 设置多阶段交互区域（预警区/危险区/发生区）并叠加到视图
+    setPhaseZones(phase, actorId) {
+        this.phaseZones = phase || null;
+        this.phaseActor = (actorId === undefined || actorId === null) ? null : Number(actorId);
+        this._drawOverlay();
+    }
+
+    clearPhaseZones() {
+        this.phaseZones = null;
+        this.phaseActor = null;
+        this._drawOverlay();
+    }
+
+    // 在视图里画出主车的"制动能力包络"同心环：红=发生区(紧急制动也来不及)、黄=预警区边界
+    _drawPhaseZones(sx, sy) {
+        if (!this.phaseZones || this.phaseActor === null) return;
+        const obj = this.objects.find(o => Number(o.track_id) === this.phaseActor);
+        if (!obj || !obj.center) return;
+        const tl = this.phaseZones.timeline || [];
+        if (!tl.length) return;
+        let entry = null;
+        for (const e of tl) { if (e.frame === this.frameIdx) { entry = e; break; } }
+        if (!entry) {
+            let best = null, bd = 1e9;
+            for (const e of tl) { const d = Math.abs(e.frame - this.frameIdx); if (d < bd) { bd = d; best = e; } }
+            entry = best;
+        }
+        if (!entry) return;
+        const rw = Number(entry.r_warning_m) || 0;
+        const rd = Number(entry.r_danger_m) || 0;
+        if (!rw && !rd) return;
+        const cx = obj.center[0], cy = obj.center[1], cz = obj.center[2];
+        const N = 48;
+        const ring = (r, strokeColor, fillColor, dash) => {
+            if (!r) return;
+            this.octx.beginPath();
+            let started = false;
+            for (let i = 0; i <= N; i++) {
+                const a = (i / N) * Math.PI * 2;
+                const sp = this._worldToScreen([cx + r * Math.cos(a), cy, cz + r * Math.sin(a)], this.lastC2W);
+                if (!sp) { started = false; continue; }
+                const x = sp.x * sx, y = sp.y * sy;
+                if (!started) { this.octx.moveTo(x, y); started = true; }
+                else this.octx.lineTo(x, y);
+            }
+            this.octx.closePath();
+            if (fillColor) { this.octx.fillStyle = fillColor; this.octx.fill(); }
+            this.octx.strokeStyle = strokeColor;
+            this.octx.lineWidth = 2;
+            this.octx.setLineDash(dash || []);
+            this.octx.stroke();
+            this.octx.setLineDash([]);
+        };
+        // 发生区（紧急制动也来不及）：红环 + 淡红填充；预警区外边界：黄环
+        ring(rd, 'rgba(231,76,60,0.85)', 'rgba(231,76,60,0.08)', [6, 4]);
+        ring(rw, 'rgba(241,196,15,0.85)', null, []);
+        // 当前区域标签
+        const sp = this._worldToScreen([cx, cy, cz], this.lastC2W);
+        if (sp) {
+            const zl = { safe: '安全', warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击', occluded: '遮挡' };
+            this.octx.fillStyle = 'rgba(255,255,255,0.95)';
+            this.octx.font = 'bold 13px sans-serif';
+            this.octx.fillText(zl[entry.zone] || entry.zone, sp.x * sx + 12, sp.y * sy - 12);
+        }
     }
 
     // 设置智能轨迹编辑参数

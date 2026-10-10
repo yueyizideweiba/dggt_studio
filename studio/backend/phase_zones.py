@@ -358,17 +358,18 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
         pa = np.asarray(pa, dtype=np.float64)
         va = vel_actor.get(int(f), np.zeros(3, dtype=np.float64))
         aa = acc_actor.get(int(f), np.zeros(3, dtype=np.float64))
+        rw, rd = _envelope_radii(va, params)
 
         if cfrs and any(c <= int(f) <= c + post for c in cfrs):
-            timeline.append(_impact_entry(f, va, aa))
+            timeline.append(_impact_entry(f, va, aa, rw, rd))
             continue
         if cfrs and int(f) > max(cfrs) + post:
-            timeline.append(_concluded_entry(f, va, aa))
+            timeline.append(_concluded_entry(f, va, aa, rw, rd))
             continue
 
         # 无其它参与者 → 单参与者急刹（hard-brake 类）：按主车自身制动强度给相态
         if not others:
-            timeline.append(_single_vehicle_entry(f, va, aa, params))
+            timeline.append(_single_vehicle_entry(f, va, aa, params, rw, rd))
             continue
 
         best = _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params,
@@ -380,25 +381,43 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
             "other": best.get("other"),
             "binding": best.get("binding"),
             "risk_level": best.get("risk_level"),
+            "r_warning_m": rw, "r_danger_m": rd,
             "advice": advice, "advice_level": int(advice.get("level", -1)),
         })
 
     return _finish_timeline(actor, others, frames, fps, params, timeline)
 
 
-def _impact_entry(f, va, aa):
+def _envelope_radii(va, params):
+    """主车"制动能力包络"的两个半径（用于空间可视化）。
+
+    r_danger = v·t_r + v²/(2·cap_brake)：紧急制动刚好能停住的最远距离（危险区外边界）；
+    r_warning = v·t_r + v²/(2·a_comfort)：舒适制动刚好能停住（预警区外边界）。
+    """
+    v = float(np.linalg.norm(va))
+    t_r = float(params["t_reaction_s"])
+    a_comf = float(params["a_comfort_mps2"])
+    cap_brake = float(params["cap_brake_mps2"])
+    r_warn = v * t_r + v * v / (2.0 * a_comf)
+    r_dang = v * t_r + v * v / (2.0 * cap_brake)
+    return round(r_warn, 2), round(r_dang, 2)
+
+
+def _impact_entry(f, va, aa, rw, rd):
     return {"frame": int(f), "zone": ZONE_IMPACT, "factors": None, "other": None,
             "binding": "impact", "risk_level": "critical",
+            "r_warning_m": rw, "r_danger_m": rd,
             "advice": _ZONE_ADVICE[ZONE_IMPACT], "advice_level": 4}
 
 
-def _concluded_entry(f, va, aa):
+def _concluded_entry(f, va, aa, rw, rd):
     return {"frame": int(f), "zone": ZONE_SAFE, "factors": None, "other": None,
             "binding": None, "risk_level": "low",
+            "r_warning_m": rw, "r_danger_m": rd,
             "advice": _ZONE_ADVICE[ZONE_SAFE], "advice_level": 0, "event_concluded": True}
 
 
-def _single_vehicle_entry(f, va, aa, params):
+def _single_vehicle_entry(f, va, aa, params, rw, rd):
     """单参与者（急刹）：把主车自身的制动强度映射成相态（对后车构成追尾风险）。"""
     spd = float(np.linalg.norm(va))
     decel = 0.0
@@ -416,6 +435,7 @@ def _single_vehicle_entry(f, va, aa, params):
     return {"frame": int(f), "zone": zone,
             "factors": {"self_decel_mps2": round(decel, 3), "cap_brake_mps2": round(cap_brake, 3)},
             "other": None, "binding": "self_brake", "risk_level": _risk_level(zone, "low"),
+            "r_warning_m": rw, "r_danger_m": rd,
             "advice": _ZONE_ADVICE[zone], "advice_level": _ZONE_ADVICE[zone]["level"]}
 
 
