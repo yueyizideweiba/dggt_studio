@@ -1944,13 +1944,17 @@ class DGGTStudio {
 
     async _loadPairwiseZones(startFrame, numFrames) {
         if (!this.state.sceneId) return;
+        // 参与者范围：显式指定哪些物体是"车辆"，留空则由后端默认取车辆类物体
+        const tidStr = (document.getElementById('pairwiseTrackIds')?.value || '').trim();
+        const trackIds = tidStr ? tidStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : null;
         try {
             const resp = await fetch(`${API_BASE}/corner_case/pairwise`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     scene_id: this.state.sceneId,
-                    start_frame: startFrame, num_frames: numFrames, fps: 10.0
+                    start_frame: startFrame, num_frames: numFrames, fps: 10.0,
+                    track_ids: trackIds
                 })
             });
             const d = await resp.json();

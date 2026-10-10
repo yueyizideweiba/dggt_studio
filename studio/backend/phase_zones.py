@@ -650,13 +650,17 @@ def _tracks_at_frame(tm, f: int) -> List[int]:
 
 def compute_pairwise_phases(tm, frames: List[int], fps: float,
                             params: Optional[Dict[str, Any]] = None,
-                            max_pairs_per_frame: int = 40) -> Dict[int, List[Dict[str, Any]]]:
-    """全局两两相态：场景里**任意两个物体**之间的多阶段区域判定（不只事故参与者）。
+                            max_pairs_per_frame: int = 40,
+                            track_ids: Optional[List[int]] = None) -> Dict[int, List[Dict[str, Any]]]:
+    """全局两两相态：在**指定的参与者集合**内做两两多阶段区域判定。
+
+    Args:
+        track_ids: 显式指定"哪些物体是车辆/参与者"；只在这些物体之间判定。
+                   为 None 时默认只用**车辆类**物体（vehicle / large_vehicle），排除行人、
+                   锥桶等非车辆（它们对车辆间多阶段模型是噪声）。
 
     返回 {frame: [ {a, b, zone, binding, factors, risk_level, r_warning_m, r_danger_m,
                    pos_a, pos_b} ... ]}，只保留非 safe 的冲突对（按严重度降序，封顶）。
-
-    区域半径用"闭合速度"动态计算，反应主体 a 取速度更快的一方（更可能是"需要反应"的车）。
     """
     params = _prepare_params(params)
     frames = list(frames)
@@ -669,11 +673,17 @@ def compute_pairwise_phases(tm, frames: List[int], fps: float,
         dims[tid] = _dims(tm, tid)
         cls[tid] = _class_of(dims[tid])
 
+    # 参与者集合：显式指定用 track_ids；否则默认"车辆类"物体
+    if track_ids:
+        allowed = {int(t) for t in track_ids}
+    else:
+        allowed = {int(t) for t in tids if cls.get(t) in ("vehicle", "large_vehicle")}
+
     order = {ZONE_IMPACT: 5, ZONE_OCCURRENCE: 4, ZONE_DANGER: 3,
              ZONE_WARNING: 2, ZONE_OCCLUDED: 1}
     out: Dict[int, List[Dict[str, Any]]] = {}
     for f in frames:
-        present = [t for t in _tracks_at_frame(tm, f) if t in tids]
+        present = [t for t in _tracks_at_frame(tm, f) if t in allowed]
         rows = []
         for i in range(len(present)):
             for j in range(i + 1, len(present)):
