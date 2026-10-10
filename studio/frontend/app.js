@@ -1940,7 +1940,7 @@ class DGGTStudio {
                 }
                 this.updateStatus(`已生成 Corner Case: ${scenario.name}`);
                 this._renderPhaseAnalysis(data.phase_analysis);
-                this._loadPairwiseZones(startFrame, numFrames);
+                this._loadPairwiseZones(0, this.state.totalFrames || 25);
             } else {
                 alert('生成失败: ' + (data.detail || '未知错误'));
             }
@@ -1951,8 +1951,8 @@ class DGGTStudio {
     }
 
     async _loadPairwiseZones(startFrame, numFrames) {
-        if (!this.state.sceneId) return;
-        // 参与者范围：用物体列表里多选(Shift+点击)的对象；不选任何对象 = 全局所有物体
+        if (!this.state.sceneId) return null;
+        // 参与者范围：用视图里多选(Shift+点击)的对象；不选任何对象 = 全局所有物体
         const sel = this.state.selectedObjects || [];
         const trackIds = sel.length ? sel.map(Number) : null;
         try {
@@ -1968,21 +1968,44 @@ class DGGTStudio {
             const d = await resp.json();
             if (d.success && d.frames && this.viewer3d) {
                 const map = {};
-                Object.entries(d.frames).forEach(([f, pairs]) => { map[Number(f)] = pairs; });
+                let pairCount = 0;
+                const involved = new Set();
+                Object.entries(d.frames).forEach(([f, pairs]) => {
+                    map[Number(f)] = pairs;
+                    (pairs || []).forEach(p => { pairCount++; involved.add(p.a); involved.add(p.b); });
+                });
                 this.viewer3d.setPairwiseZones(map);
+                return { pairCount, involved: Array.from(involved), trackIds };
             }
+            return { error: (d && d.detail) || '未知错误' };
         } catch (e) {
             console.warn('加载全局两两相态失败', e);
+            return { error: e.message };
         }
     }
 
-    applyPairwiseSelection() {
+    async applyPairwiseSelection() {
         const sel = this.state.selectedObjects || [];
-        const startFrame = this.state.currentFrame;
-        const numFrames = Math.max(2, (this.state.totalFrames || 25) - startFrame);
-        this._loadPairwiseZones(startFrame, numFrames);
+        const totalFrames = this.state.totalFrames || 25;
+        // 全场景范围拉取（不要用 currentFrame 起点的窗口，否则往前拖帧就没区域了）
+        const res = await this._loadPairwiseZones(0, totalFrames);
+        const statusEl = document.getElementById('cornerCaseStatus');
+        if (res && res.error) {
+            this.updateStatus('多阶段模型应用失败: ' + res.error);
+            if (statusEl) statusEl.innerHTML = `<div class="cc-phase-error">应用失败: ${res.error}</div>`;
+            return;
+        }
         const n = sel.length;
-        this.updateStatus(n ? `多阶段模型已应用到选中的 ${n} 个物体` : '多阶段模型：全局所有物体');
+        const m = res ? res.pairCount : 0;
+        const scope = n ? `选中的 ${n} 个物体 [${sel.join(', ')}]` : '全局所有物体';
+        const head = `✅ 多阶段模型已应用到 ${scope}`;
+        const detail = m > 0
+            ? `，共发现 <b>${m}</b> 个冲突对，涉及物体 ${(res.involved || []).join(', ')}`
+            : `，这些物体之间<b>没有冲突</b>（当前窗口内都处于安全区）`;
+        this.updateStatus(head + detail);
+        if (statusEl) {
+            statusEl.innerHTML = `<div class="cc-phase-story">${head}${detail}</div>`;
+        }
     }
 
     async evadeSelected() {
@@ -2027,7 +2050,7 @@ class DGGTStudio {
         this.state.renderCache.clear();
         if (this.viewer3d) this.viewer3d._invalidateCache();
         await this.loadFrame(this.state.currentFrame);
-        this._loadPairwiseZones(startFrame, numFrames);
+        this._loadPairwiseZones(0, this.state.totalFrames || 25);
         this.updateStatus(`规避控制(${tids.length} 个物体): ${okAll ? '完成' : '部分失败'}`);
         const statusEl = document.getElementById('cornerCaseStatus');
         if (statusEl) {
