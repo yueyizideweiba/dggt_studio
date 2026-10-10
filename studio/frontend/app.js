@@ -1975,6 +1975,7 @@ class DGGTStudio {
                     (pairs || []).forEach(p => { pairCount++; involved.add(p.a); involved.add(p.b); });
                 });
                 this.viewer3d.setPairwiseZones(map);
+                this._renderPairwiseStrip(map);
                 return { pairCount, involved: Array.from(involved), trackIds };
             }
             return { error: (d && d.detail) || '未知错误' };
@@ -2058,6 +2059,44 @@ class DGGTStudio {
         }
     }
 
+    _renderPairwiseStrip(pairsByFrame) {
+        const el = document.getElementById('cornerPhasePanel');
+        if (!el) return;
+        if (!pairsByFrame) { el.innerHTML = ''; return; }
+        const frames = Object.keys(pairsByFrame).map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+        const colors = { safe: '#2ecc71', warning: '#f1c40f', danger: '#e67e22', occurrence: '#e74c3c', impact: '#8e1b1b', occluded: '#95a5a6' };
+        const labels = { safe: '安全', warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击', occluded: '遮挡' };
+        const order = { safe: 0, warning: 1, danger: 2, occurrence: 3, impact: 4 };
+        if (!frames.length) {
+            el.innerHTML = '<div class="cc-phase-title">全局两两相态（帧色条）</div><div class="cc-phase-error">当前窗口内无冲突对</div>';
+            return;
+        }
+        const minF = frames[0], maxF = frames[frames.length - 1];
+        let cells = '';
+        for (let f = minF; f <= maxF; f++) {
+            const pairs = pairsByFrame[f] || [];
+            let worst = 'safe';
+            for (const p of pairs) { if (order[p.zone] > order[worst]) worst = p.zone; }
+            const title = pairs.length ? `帧${f}：${pairs.length} 个冲突对，最重=${labels[worst] || worst}` : `帧${f}：无冲突`;
+            cells += `<span class="cc-phase-cell" data-f="${f}" style="background:${colors[worst] || '#555'}" title="${title}"></span>`;
+        }
+        const legend = Object.entries(labels).map(([k, v]) =>
+            `<span class="cc-legend"><i style="background:${colors[k]}"></i>${v}</span>`).join('');
+        el.innerHTML = `<div class="cc-phase-title">全局两两相态（帧色条，点击查看决策链路）</div>
+            <div class="cc-phase-strip">${cells}</div>
+            <div class="cc-phase-legend">${legend}</div>`;
+        el.querySelectorAll('.cc-phase-cell').forEach(cell => {
+            cell.addEventListener('click', () => {
+                const f = Number(cell.dataset.f);
+                const pairs = pairsByFrame[f] || [];
+                if (!pairs.length) { alert(`帧 ${f}：无冲突`); return; }
+                const txt = pairs.map(p =>
+                    `${p.a}-${p.b} ${labels[p.zone] || p.zone} (risk=${p.risk_score})\n    ${(p.decision && p.decision.rule) || ''}`).join('\n');
+                alert(`帧 ${f}：${pairs.length} 个冲突对\n${txt}`);
+            });
+        });
+    }
+
     _renderPhaseAnalysis(pa) {
         const el = document.getElementById('cornerPhasePanel');
         if (!el) return;
@@ -2100,12 +2139,13 @@ class DGGTStudio {
             <div class="cc-phase-story">${s.story || ''}</div>
             <div class="cc-phase-bounds">边界：${bounds.join('　') || '—'}　|　时长：预警${dur.warning ?? 0}s / 危险${dur.danger ?? 0}s / 发生${dur.occurrence ?? 0}s ${flag}</div>
             ${factorHtml}`;
-        // 点击色条 → 弹该帧因素详情（简单 alert）
+        // 点击色条 → 弹该帧因素 + 决策链路详情
         el.querySelectorAll('.cc-phase-cell').forEach(cell => {
             cell.addEventListener('click', () => {
                 const e = tl[parseInt(cell.dataset.i)];
                 const f = e.factors ? Object.entries(e.factors).map(([k, v]) => `${k}: ${v}`).join('\n') : '(无因素)';
-                alert(`帧 ${e.frame} · ${labels[e.zone] || e.zone} · risk=${e.risk_level}\n${f}`);
+                const d = (e.decision && e.decision.rule) ? `\n决策：${e.decision.rule}` : '';
+                alert(`帧 ${e.frame} · ${labels[e.zone] || e.zone} · risk=${e.risk_level} (${e.risk_score})\n${f}${d}`);
             });
         });
     }
