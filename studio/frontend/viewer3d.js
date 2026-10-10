@@ -15,6 +15,7 @@ class DGGTViewer3D {
         this.sceneCenter = [0, 0, 0];
         this.cameraMeta = null;
         this.selectedTrackId = null;
+        this.selectedTrackIds = new Set();   // 视图多选集合（Shift/点击切换）
         this.showBoxes = true;
         this.showTrajectory = true;
         this.lockHeight = true;     // 轨迹/移动编辑时锁定高度（仅在地面 XZ 平面移动）
@@ -586,11 +587,11 @@ class DGGTViewer3D {
             this._drawRoadMap(sx, sy);
         }
 
-        // 绘制所有动态物体的包围盒
+        // 绘制所有动态物体的包围盒（多选的也高亮）
         if (this.showBoxes && this.objects) {
             this.objects.forEach(obj => {
                 if (!obj.center || !obj.dimensions) return;
-                const isSelected = obj.track_id === this.selectedTrackId;
+                const isSelected = this.selectedTrackIds.has(obj.track_id) || obj.track_id === this.selectedTrackId;
                 this._drawBoundingBox(obj, sx, sy, isSelected);
             });
         }
@@ -759,10 +760,14 @@ class DGGTViewer3D {
                 return;  // 场景锁定，不旋转
             }
 
-            // 选择模式：点中则选中，否则旋转视角
+            // 选择模式：点中则选中（Shift/Ctrl+点击 多选切换），否则旋转视角
             const picked = this._pickObject(e);
             if (picked) {
-                this.selectTrack(picked.track_id);
+                if (e.shiftKey || e.ctrlKey || e.metaKey) {
+                    this.toggleSelectTrack(picked.track_id);
+                } else {
+                    this.selectTrack(picked.track_id);
+                }
             }
             this.isOrbiting = true;
             this.canvas.style.cursor = 'grabbing';
@@ -867,14 +872,42 @@ class DGGTViewer3D {
     selectTrack(trackId) {
         const changed = this.selectedTrackId !== trackId;
         this.selectedTrackId = trackId;
+        this.selectedTrackIds = new Set([trackId]);   // 单选：重置多选集合
         const obj = this.objects.find(o => o.track_id === trackId);
         if (obj) this.onObjectSelected(trackId, obj);
         if (changed) {
             this.trajectory = null;
             this._fetchTrajectory(trackId);
         }
+        this._notifyMultiSelect();
         this._drawOverlay();
         this.requestRender();
+    }
+
+    toggleSelectTrack(trackId) {
+        if (this.selectedTrackIds.has(trackId)) {
+            this.selectedTrackIds.delete(trackId);
+        } else {
+            this.selectedTrackIds.add(trackId);
+        }
+        this.selectedTrackId = trackId;
+        this.trajectory = null;
+        this._fetchTrajectory(trackId);
+        this._notifyMultiSelect();
+        this._drawOverlay();
+        this.requestRender();
+    }
+
+    setSelectedTrackIds(ids) {
+        this.selectedTrackIds = new Set((ids || []).map(Number));
+        if (this.selectedTrackIds.size) this.selectedTrackId = Array.from(this.selectedTrackIds)[0];
+        else this.selectedTrackId = null;
+        this._drawOverlay();
+        this.requestRender();
+    }
+
+    _notifyMultiSelect() {
+        if (this.onMultiSelectChange) this.onMultiSelectChange(Array.from(this.selectedTrackIds));
     }
 
     selectByObjectId(trackId) { this.selectTrack(trackId); }

@@ -221,6 +221,12 @@ class DGGTStudio {
                 this.updateSelectedObjectPanel();
                 this.updateObjectList();
             },
+            onMultiSelectChange: (ids) => {
+                // 视图多选（Shift/点击）→ 同步到全局选中集合
+                this.state.selectedObjects = (ids || []).map(Number);
+                this.updateObjectList();
+                this.updateSelectedObjectPanel();
+            },
             onObjectEdited: (trackId) => {
                 // 编辑后清空 2D 渲染缓存，保证切回 2D 时显示最新结果
                 this.state.renderCache.clear();
