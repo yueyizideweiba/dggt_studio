@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260925h">
+    <link rel="stylesheet" href="styles.css?v=20260925i">
 </head>
 <body>
     <div id="app">
@@ -201,11 +201,11 @@
                             <button id="generateCornerCaseBtn" class="btn btn-primary btn-block">生成事故轨迹</button>
                         </div>
                         <div class="button-row">
-                            <button id="evadeSelectedBtn" class="btn btn-secondary btn-block">对选中车辆执行规避控制</button>
+                            <button id="evadeSelectedBtn" class="btn btn-secondary btn-block">对选中物体执行规避控制</button>
                         </div>
                         <div class="form-group">
-                            <label>多阶段模型参与者范围（track id，逗号分隔；留空=全局所有物体）</label>
-                            <input type="text" id="pairwiseTrackIds" placeholder="例如 3,5,2">
+                            <label class="cc-desc">多阶段模型范围：在左侧物体列表<b>多选</b>（Shift+点击），点下方「应用」；不选任何物体 = 全局所有物体</label>
+                            <button id="applyPairwiseSelectionBtn" class="btn btn-secondary btn-block">应用多阶段模型到选中物体</button>
                         </div>
                         <div class="button-row">
                             <button id="clearCornerCaseBtn" class="btn btn-secondary btn-block">清除生成的轨迹</button>
@@ -1116,9 +1116,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260925h"></script>
-    <script src="app.js?v=20260925h"></script>
+    <script src="viewer3d.js?v=20260925i"></script>
+    <script src="app.js?v=20260925i"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260925h"></script>
+    <script src="ui-panels.js?v=20260925i"></script>
 </body>
 </html>

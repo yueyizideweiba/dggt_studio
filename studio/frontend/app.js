@@ -1651,6 +1651,8 @@ class DGGTStudio {
         if (genBtn) genBtn.addEventListener('click', () => this.generateCornerCase());
         const evadeBtn = document.getElementById('evadeSelectedBtn');
         if (evadeBtn) evadeBtn.addEventListener('click', () => this.evadeSelected());
+        const applyPairwiseBtn = document.getElementById('applyPairwiseSelectionBtn');
+        if (applyPairwiseBtn) applyPairwiseBtn.addEventListener('click', () => this.applyPairwiseSelection());
         const clearBtn = document.getElementById('clearCornerCaseBtn');
         if (clearBtn) clearBtn.addEventListener('click', () => this.clearCornerCase());
         const jumpBtn = document.getElementById('jumpCriticalFrameBtn');
@@ -1944,9 +1946,9 @@ class DGGTStudio {
 
     async _loadPairwiseZones(startFrame, numFrames) {
         if (!this.state.sceneId) return;
-        // 参与者范围：显式指定哪些物体是"车辆"，留空则由后端默认取车辆类物体
-        const tidStr = (document.getElementById('pairwiseTrackIds')?.value || '').trim();
-        const trackIds = tidStr ? tidStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)) : null;
+        // 参与者范围：用物体列表里多选(Shift+点击)的对象；不选任何对象 = 全局所有物体
+        const sel = this.state.selectedObjects || [];
+        const trackIds = sel.length ? sel.map(Number) : null;
         try {
             const resp = await fetch(`${API_BASE}/corner_case/pairwise`, {
                 method: 'POST',
@@ -1968,42 +1970,62 @@ class DGGTStudio {
         }
     }
 
+    applyPairwiseSelection() {
+        const sel = this.state.selectedObjects || [];
+        const startFrame = this.state.currentFrame;
+        const numFrames = Math.max(2, (this.state.totalFrames || 25) - startFrame);
+        this._loadPairwiseZones(startFrame, numFrames);
+        const n = sel.length;
+        this.updateStatus(n ? `多阶段模型已应用到选中的 ${n} 个物体` : '多阶段模型：全局所有物体');
+    }
+
     async evadeSelected() {
-        const tid = this.viewer3d ? this.viewer3d.selectedTrackId : null;
-        if (tid === null || tid === undefined) {
-            alert('请先在视图里点选一辆车，再执行规避控制');
+        // 优先用物体列表里多选的物体；没有多选再退回视图单选
+        const sel = (this.state.selectedObjects || []).map(Number);
+        const viewTid = this.viewer3d ? this.viewer3d.selectedTrackId : null;
+        const tids = sel.length ? sel : (viewTid !== null && viewTid !== undefined ? [Number(viewTid)] : []);
+        if (!tids.length) {
+            alert('请先在左侧物体列表多选物体（Shift+点击），或在视图里点选一辆车');
             return;
         }
         const startFrame = this.state.currentFrame;
         const numFrames = Math.max(2, (this.state.totalFrames || 25) - startFrame);
-        try {
-            const resp = await fetch(`${API_BASE}/corner_case/evade`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    scene_id: this.state.sceneId,
-                    actor_track_id: Number(tid),
-                    start_frame: startFrame,
-                    num_frames: numFrames,
-                    fps: 10.0,
-                    action: 'auto'
-                })
-            });
-            const d = await resp.json();
-            if (d.success) {
-                this.state.renderCache.clear();
-                if (this.viewer3d) this.viewer3d._invalidateCache();
-                await this.loadFrame(this.state.currentFrame);
-                this._loadPairwiseZones(startFrame, numFrames);
-                this.updateStatus(`规避控制: ${d.story}`);
-                const statusEl = document.getElementById('cornerCaseStatus');
-                if (statusEl) statusEl.innerHTML = `<div class="cc-phase-story">${d.story}</div>`;
-            } else {
-                alert('规避失败: ' + (d.detail || d.reason || '未知错误'));
+        const stories = [];
+        let okAll = true;
+        for (const tid of tids) {
+            try {
+                const resp = await fetch(`${API_BASE}/corner_case/evade`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.state.sceneId,
+                        actor_track_id: tid,
+                        start_frame: startFrame,
+                        num_frames: numFrames,
+                        fps: 10.0,
+                        action: 'auto'
+                    })
+                });
+                const d = await resp.json();
+                if (d.success) {
+                    stories.push(d.story);
+                } else {
+                    okAll = false;
+                    stories.push(`T${tid}: ${d.detail || d.reason || '未知错误'}`);
+                }
+            } catch (e) {
+                okAll = false;
+                stories.push(`T${tid}: ${e.message}`);
             }
-        } catch (e) {
-            console.error('规避控制失败', e);
-            alert('规避控制失败: ' + e.message);
+        }
+        this.state.renderCache.clear();
+        if (this.viewer3d) this.viewer3d._invalidateCache();
+        await this.loadFrame(this.state.currentFrame);
+        this._loadPairwiseZones(startFrame, numFrames);
+        this.updateStatus(`规避控制(${tids.length} 个物体): ${okAll ? '完成' : '部分失败'}`);
+        const statusEl = document.getElementById('cornerCaseStatus');
+        if (statusEl) {
+            statusEl.innerHTML = `<div class="cc-phase-story">${stories.map(s => this._escapeHtml(s)).join('<br>')}</div>`;
         }
     }
 
