@@ -396,6 +396,8 @@ def compute_phase_timeline(tm, actor: int, others: List[int], frames: List[int],
             "other": best.get("other"),
             "binding": best.get("binding"),
             "risk_level": best.get("risk_level"),
+            "risk_score": best.get("risk_score"),
+            "decision": best.get("decision"),
             "r_warning_m": rw, "r_danger_m": rd,
             "advice": advice, "advice_level": int(advice.get("level", -1)),
         })
@@ -459,11 +461,32 @@ def _single_vehicle_entry(f, va, aa, params, rw, rd):
             "advice": _ZONE_ADVICE[zone], "advice_level": _ZONE_ADVICE[zone]["level"]}
 
 
-def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
-    """单对参与者的多因素相态判定（可独立复用的单元）。
+# 风险标量：紧急度(区域) × 严重度(Δv·几何·VRU)，0~1 单调递增（可解释、可比较）
+_ZONE_URGENCY = {ZONE_SAFE: 0.0, ZONE_OCCLUDED: 0.0, ZONE_NA: 0.0,
+                 ZONE_WARNING: 0.33, ZONE_DANGER: 0.67, ZONE_OCCURRENCE: 0.9, ZONE_IMPACT: 1.0}
+_SEV_WEIGHT = {"low": 0.6, "medium": 0.8, "high": 1.0}
 
-    返回 {zone, factors, binding, risk_level}。这是整个模型的"最小可解释单元"，
-    验证脚本直接拿它做受控实验。
+
+def _risk_score(zone, severity):
+    """标量风险指数 = 紧急度(区域) × 严重度权重，0~1。"""
+    urg = _ZONE_URGENCY.get(zone, 0.0)
+    sev = _SEV_WEIGHT.get(severity, 0.8)
+    return round(urg * sev, 3)
+
+
+def _mk(zone, binding, factors, decision, sev):
+    return {"zone": zone, "binding": binding, "factors": factors,
+            "risk_level": _risk_level(zone, sev),
+            "risk_score": _risk_score(zone, sev),
+            "decision": decision}
+
+
+def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
+    """单对参与者的多因素相态判定（最小可解释单元）。
+
+    返回 {zone, binding, factors, risk_level, risk_score, decision}。
+    `decision` 是**决策链路**：记录每个因素的取值、能力档位、以及得出该区域的规则，
+    让每一条区域判定都可被追溯、可被评审（论文里"为什么是这个区域"的直接证据）。
     """
     t_r = float(params["t_reaction_s"])
     lane = float(params["lane_width_m"])
@@ -476,33 +499,39 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
 
     rel_spd = float(np.linalg.norm(va - vb))
     closing_spd = _closing_speed(pa, pb, va, vb)
+    geo = _geometry(va, vb)
+    sev = _severity(rel_spd, geo, vru, params)
+
+    def fac(kin, thw=None):
+        return _factors(kin, rel_spd, closing_spd, va, vb, vru, params, thw=thw)
+
     if _contact(pa, dims_a, pb, dims_b):
-        return {"zone": ZONE_IMPACT, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
-                "binding": "impact", "risk_level": "critical"}
+        return _mk(ZONE_IMPACT, "impact", fac(None),
+                   {"rule": "两物体 OBB 已接触（撞击）"}, sev)
 
     ttc, min_d = _predict_contact(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     if ttc is None:
-        # 同向贴车（无预测接触）：先看航向是否同向（夹角<45°，排除对向/横穿——那些由 TTC 管）
         ang = _heading_angle(va, vb)
         if ang < 45.0:
-            # 跟车过近（时距过短）：从"后方车"视角双向都试（a 跟 b 或 b 跟 a）
             thw = _time_headway(pa, va, pb)
             if thw is None:
                 thw = _time_headway(pb, vb, pa)
             if thw is not None:
                 if thw < float(params["thw_danger_s"]):
-                    return {"zone": ZONE_DANGER, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
-                            "binding": "headway", "risk_level": "high"}
+                    return _mk(ZONE_DANGER, "headway", fac(None, thw),
+                               {"rule": "同向贴车：THW=%.2fs < thw_danger=%.1f → 危险" % (thw, params["thw_danger_s"]),
+                                "thw_s": round(thw, 3), "heading_angle_deg": round(ang, 1)}, sev)
                 if thw < float(params["thw_warning_s"]):
-                    return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params, thw=thw),
-                            "binding": "headway", "risk_level": "elevated"}
-        # 近距离擦过（险情）：只在"确实在接近"（闭合速度 > 0.5 m/s）时才判预警，
-        # 否则两辆静止停得很近也会被误判成"预警"（全局模型里尤其噪）。
+                    return _mk(ZONE_WARNING, "headway", fac(None, thw),
+                               {"rule": "同向贴车：THW=%.2fs < thw_warning=%.1f → 预警" % (thw, params["thw_warning_s"]),
+                                "thw_s": round(thw, 3), "heading_angle_deg": round(ang, 1)}, sev)
         if min_d < margin and closing_spd > 0.5:
-            return {"zone": ZONE_WARNING, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
-                    "binding": "near_miss", "risk_level": "elevated"}
-        return {"zone": ZONE_SAFE, "factors": _factors(None, rel_spd, closing_spd, va, vb, vru, params),
-                "binding": None, "risk_level": "low"}
+            return _mk(ZONE_WARNING, "near_miss", fac(None),
+                       {"rule": "无接触但近距擦过：min_d=%.2fm < margin=%.2fm 且闭合=%.2fm/s → 预警"
+                                % (min_d, margin, closing_spd),
+                        "min_d_m": round(min_d, 3), "closing_speed_mps": round(closing_spd, 3)}, sev)
+        return _mk(ZONE_SAFE, None, fac(None),
+                   {"rule": "无预测接触、时距足够、非近距 → 安全"}, sev)
 
     a_brake = min_required_deceleration(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
     a_lat = _a_lat_required(ttc, t_r, lane)
@@ -513,9 +542,17 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
     binding = "brake" if bt <= st else "steer"
     if tier == 3:
         binding = "none"
-    sev = _severity(rel_spd, _geometry(va, vb), vru, params)
-    return {"zone": zone, "factors": _factors((a_brake, a_lat, ttc), rel_spd, closing_spd, va, vb, vru, params),
-            "binding": binding, "risk_level": _risk_level(zone, sev)}
+    a_brake_s = "∞" if a_brake == float("inf") else "%.2f" % a_brake
+    a_lat_s = "∞" if a_lat == float("inf") else "%.2f" % a_lat
+    decision = {
+        "a_brake_mps2": None if a_brake == float("inf") else round(float(a_brake), 3),
+        "a_lat_mps2": None if a_lat == float("inf") else round(float(a_lat), 3),
+        "tier_brake": int(bt), "tier_steer": int(st), "tier": int(tier),
+        "ttc_s": round(float(ttc), 3),
+        "rule": "能力包络：制动档=%d(a*=%s, 舒适%.1f/紧急%.1f)，转向档=%d(a_lat=%s, 舒适%.1f/紧急%.1f) → tier=min=%d → %s"
+                % (bt, a_brake_s, a_comf, cap_brake, st, a_lat_s, a_lat_comf, cap_lat, tier, zone),
+    }
+    return _mk(zone, binding, fac((a_brake, a_lat, ttc)), decision, sev)
 
 
 def _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params, occlusion, f):
@@ -630,6 +667,18 @@ def _finish_timeline(actor, others, frames, fps, params, timeline) -> Dict[str, 
     w_f, d_f = first_frame(ZONE_WARNING), first_frame(ZONE_DANGER)
     o_f, i_f = first_frame(ZONE_OCCURRENCE), first_frame(ZONE_IMPACT)
     oc_f = first_frame(ZONE_OCCLUDED)
+    # 最晚反应点：最后一个"危险区"帧（进入发生/撞击前仍可用紧急动作规避的最后时刻）；
+    # 若无危险区，退而取最后一个预警区。
+    latest_reaction = None
+    for e in timeline:
+        if e["zone"] == ZONE_DANGER:
+            latest_reaction = e["frame"]
+    if latest_reaction is None:
+        for e in timeline:
+            if e["zone"] == ZONE_WARNING:
+                latest_reaction = e["frame"]
+    # 峰值风险（0~1），用于量化整条交互的危险程度
+    max_risk = max((e.get("risk_score") or 0.0 for e in timeline), default=0.0)
     event = ("collision" if i_f is not None else
              "near_miss" if o_f is not None else
              "avoid" if (d_f is not None or w_f is not None) else "none")
@@ -641,13 +690,16 @@ def _finish_timeline(actor, others, frames, fps, params, timeline) -> Dict[str, 
         "actor": int(actor), "others": [int(o) for o in others], "fps": float(fps),
         "params": params, "timeline": timeline,
         "boundaries": {"warning_frame": w_f, "danger_frame": d_f,
-                       "occurrence_frame": o_f, "collision_frame": i_f},
+                       "occurrence_frame": o_f, "collision_frame": i_f,
+                       "latest_reaction_frame": latest_reaction},
         "summary": {
             "first_warning_frame": w_f, "first_danger_frame": d_f,
             "first_occurrence_frame": o_f, "collision_frame": i_f,
             "first_occluded_frame": oc_f,
+            "latest_reaction_frame": latest_reaction,
             "zone_durations_s": {"warning": round(dw, 2), "danger": round(dd, 2),
                                  "occurrence": round(do, 2)},
+            "max_risk_score": round(max_risk, 3),
             "compressed_warning": bool(compressed), "skipped_warning": bool(skipped),
             "event": event, "story": story,
         },
@@ -773,6 +825,7 @@ def compute_pairwise_phases(tm, frames: List[int], fps: float,
                 rows.append({
                     "a": int(a), "b": int(b), "zone": r["zone"], "binding": r["binding"],
                     "factors": fac, "risk_level": r["risk_level"],
+                    "risk_score": r.get("risk_score"), "decision": r.get("decision"),
                     "r_warning_m": rw, "r_danger_m": rd,
                     "pos_a": [float(x) for x in ca],
                     "pos_b": [float(x) for x in cb],
