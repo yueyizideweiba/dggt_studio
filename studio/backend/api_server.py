@@ -2859,6 +2859,44 @@ async def corner_case_pairwise_phases(request: PairwisePhaseRequest):
     }
 
 
+class EvadeRequest(BaseModel):
+    """对某辆车执行规避控制：根据其当前相态施加制动/转向，返回是否规避成功。"""
+    scene_id: str
+    actor_track_id: int
+    start_frame: int = 0
+    num_frames: int = 25
+    fps: float = 10.0
+    action: str = "auto"          # auto | brake | steer
+    steer_lateral_m: Optional[float] = None
+    # 相态参数覆盖（None 用默认）
+    t_reaction_s: Optional[float] = None
+    a_comfort_mps2: Optional[float] = None
+    a_emergency_mps2: Optional[float] = None
+    mu: Optional[float] = None
+
+
+@app.post("/api/corner_case/evade")
+async def corner_case_evade(request: EvadeRequest):
+    """对指定车施加规避控制（others 取场景里所有其它物体，全局）。"""
+    import phase_zones
+    tm = get_track_manager_or_404(request.scene_id)
+    tm.fps = float(request.fps or 10.0)
+    frames = list(range(int(request.start_frame), int(request.start_frame) + int(request.num_frames) + 1))
+    others = [t for t in phase_zones._tracks_at_frame(tm, int(request.start_frame))
+              if int(t) != int(request.actor_track_id)]
+    prof = {k: v for k, v in (("t_reaction_s", request.t_reaction_s),
+                              ("a_comfort_mps2", request.a_comfort_mps2),
+                              ("a_emergency_mps2", request.a_emergency_mps2),
+                              ("mu", request.mu)) if v is not None}
+    try:
+        res = phase_zones.apply_evasion(
+            tm, int(request.actor_track_id), others, frames, request.fps,
+            params=prof or None, action=request.action, steer_lateral_m=request.steer_lateral_m)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"规避控制失败: {e}")
+    return {"success": True, **res}
+
+
 class CornerCaseClearRequest(BaseModel):
     scene_id: str
     track_ids: List[int]

@@ -759,6 +759,7 @@ class DGGTStudio {
                 this._autoHeadingLoad();
                 this.loadEgoInfo();
                 this.loadSceneMap();          // 高精地图（道路）图层
+                this._loadPairwiseZones(0, this.state.totalFrames);   // 全局两两相态（常驻）
                 this.updateStatus(`场景已加载: ${this.state.sceneId}`);
             }
         } catch (error) {
@@ -1648,6 +1649,8 @@ class DGGTStudio {
         }
         const genBtn = document.getElementById('generateCornerCaseBtn');
         if (genBtn) genBtn.addEventListener('click', () => this.generateCornerCase());
+        const evadeBtn = document.getElementById('evadeSelectedBtn');
+        if (evadeBtn) evadeBtn.addEventListener('click', () => this.evadeSelected());
         const clearBtn = document.getElementById('clearCornerCaseBtn');
         if (clearBtn) clearBtn.addEventListener('click', () => this.clearCornerCase());
         const jumpBtn = document.getElementById('jumpCriticalFrameBtn');
@@ -1958,6 +1961,45 @@ class DGGTStudio {
             }
         } catch (e) {
             console.warn('加载全局两两相态失败', e);
+        }
+    }
+
+    async evadeSelected() {
+        const tid = this.viewer3d ? this.viewer3d.selectedTrackId : null;
+        if (tid === null || tid === undefined) {
+            alert('请先在视图里点选一辆车，再执行规避控制');
+            return;
+        }
+        const startFrame = this.state.currentFrame;
+        const numFrames = Math.max(2, (this.state.totalFrames || 25) - startFrame);
+        try {
+            const resp = await fetch(`${API_BASE}/corner_case/evade`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    actor_track_id: Number(tid),
+                    start_frame: startFrame,
+                    num_frames: numFrames,
+                    fps: 10.0,
+                    action: 'auto'
+                })
+            });
+            const d = await resp.json();
+            if (d.success) {
+                this.state.renderCache.clear();
+                if (this.viewer3d) this.viewer3d._invalidateCache();
+                await this.loadFrame(this.state.currentFrame);
+                this._loadPairwiseZones(startFrame, numFrames);
+                this.updateStatus(`规避控制: ${d.story}`);
+                const statusEl = document.getElementById('cornerCaseStatus');
+                if (statusEl) statusEl.innerHTML = `<div class="cc-phase-story">${d.story}</div>`;
+            } else {
+                alert('规避失败: ' + (d.detail || d.reason || '未知错误'));
+            }
+        } catch (e) {
+            console.error('规避控制失败', e);
+            alert('规避控制失败: ' + e.message);
         }
     }
 

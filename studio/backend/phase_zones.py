@@ -723,3 +723,218 @@ def compute_pairwise_phases(tm, frames: List[int], fps: float,
         rows.sort(key=lambda x: -order.get(x["zone"], 0))
         out[int(f)] = rows[:max_pairs_per_frame]
     return out
+
+
+# --------------------------------------------------------------------------- 规避控制（为 AD 训练提供"每阶段该做什么反应"）
+_ZONE_SEV = {ZONE_SAFE: 0, ZONE_WARNING: 1, ZONE_DANGER: 2,
+             ZONE_OCCURRENCE: 3, ZONE_IMPACT: 4, ZONE_OCCLUDED: -1, ZONE_NA: -2}
+
+
+def _local_write_pose(tm, tid, f, pose):
+    pose = np.asarray(pose, dtype=np.float32)
+    try:
+        if tm.is_synthetic(int(tid)):
+            tm.set_synthetic_pose(int(tid), int(f), pose)
+        else:
+            tm.set_track_pose(int(tid), int(f), pose)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pose_with_center(base, center):
+    p = np.array(base, dtype=np.float32).copy()
+    p[0, 3], p[1, 3], p[2, 3] = float(center[0]), float(center[1]), float(center[2])
+    return p
+
+
+def _ground_right(head):
+    """航向的右向量（世界 XZ 平面）。"""
+    h = np.asarray(head, dtype=np.float64)
+    return np.array([h[2], 0.0, -h[0]], dtype=np.float64)
+
+
+def _heading_unit(va):
+    v = np.asarray(va, dtype=np.float64)
+    h = np.array([v[0], 0.0, v[2]])
+    n = float(np.linalg.norm(h))
+    return h / n if n > 1e-6 else np.array([0.0, 0.0, 1.0])
+
+
+def _brake_evasion(tm, actor, frames, fps, begin_frame, decel, va):
+    """沿当前航向以恒定减速度制动（标准 AEB 原语），改写 actor 从 begin_frame 起的轨迹。"""
+    spd = float(np.linalg.norm(va))
+    if spd < 1e-3:
+        return
+    head = _heading_unit(va)
+    pose0 = tm.get_track_pose(int(actor), int(begin_frame))
+    if pose0 is None:
+        return
+    pose0 = np.asarray(pose0, dtype=np.float64)
+    c0 = pose0[:3, 3].copy()
+    t_brake = spd / max(1e-6, float(decel))
+    d_stop = spd * t_brake - 0.5 * float(decel) * t_brake * t_brake
+    for f in frames:
+        if int(f) < int(begin_frame):
+            continue
+        dt = (int(f) - int(begin_frame)) / float(fps)
+        d = d_stop if dt >= t_brake else (spd * dt - 0.5 * float(decel) * dt * dt)
+        c = c0 + head * d
+        c[1] = c0[1]
+        _local_write_pose(tm, actor, int(f), _pose_with_center(pose0, c))
+
+
+def _steer_evasion(tm, actor, frames, fps, begin_frame, va, lateral, direction=None):
+    """横向 smoothstep 变道（转向避让）：纵向保持原速，横向在 ~0.8s 内平移一个车道。"""
+    head = _heading_unit(va)
+    if direction is None:
+        direction = _ground_right(head)
+    else:
+        direction = np.asarray(direction, dtype=np.float64)
+        direction[1] = 0.0
+    spd = float(np.linalg.norm(va))
+    pose0 = tm.get_track_pose(int(actor), int(begin_frame))
+    if pose0 is None:
+        return
+    pose0 = np.asarray(pose0, dtype=np.float64)
+    c0 = pose0[:3, 3].copy()
+    dur = 0.8
+    for f in frames:
+        if int(f) < int(begin_frame):
+            continue
+        t = (int(f) - int(begin_frame)) / float(fps)
+        u = min(1.0, t / dur)
+        sm = u * u * (3.0 - 2.0 * u)      # smoothstep
+        c = c0 + head * (spd * t) + direction * (float(lateral) * sm)
+        c[1] = c0[1]
+        _local_write_pose(tm, actor, int(f), _pose_with_center(pose0, c))
+
+
+def _recompute_zone(tm, actor, others, frames, fps, params):
+    f0 = int(frames[0])
+    pa = tm.get_track_pose(int(actor), f0)
+    if pa is None:
+        return ZONE_NA, None
+    pa = np.asarray(pa, dtype=np.float64)
+    dims_actor = _dims(tm, int(actor))
+    _, vel, acc = _motion_series(tm, int(actor), frames, fps)
+    mot = {int(o): _motion_series(tm, int(o), frames, fps) for o in others}
+    dims = {int(o): _dims(tm, int(o)) for o in others}
+    cls = {int(o): _class_of(dims[o]) for o in others}
+    va = vel.get(f0, np.zeros(3, dtype=np.float64))
+    aa = acc.get(f0, np.zeros(3, dtype=np.float64))
+    best = _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params, {}, f0)
+    return best["zone"], best.get("binding")
+
+
+def _pair_collides_window(tm, a, b, frames) -> bool:
+    """窗口内两物体是否有任何一帧发生接触（用于判断"规避后是否还相撞"）。
+
+    碰撞后 `separate_pair` 会把两车推到"零间隙 + 容差"，此时 SAT 判为"分离"；所以这里
+    把包围盒在宽/长方向各外扩 tol，用"接触 + 容差"来识别"确实相撞过"。
+    """
+    if a is None or b is None:
+        return False
+    tol = 0.2
+    da = _dims(tm, int(a))
+    db = _dims(tm, int(b))
+    da_inf = [da[0] + tol, da[1], da[2] + tol]
+    db_inf = [db[0] + tol, db[1], db[2] + tol]
+    for f in frames:
+        pa = tm.get_track_pose(int(a), int(f))
+        pb = tm.get_track_pose(int(b), int(f))
+        if pa is None or pb is None:
+            continue
+        if _contact(np.asarray(pa, np.float64), da_inf, np.asarray(pb, np.float64), db_inf):
+            return True
+    return False
+
+
+def apply_evasion(tm, actor, others, frames, fps, params=None, action="auto",
+                  steer_lateral_m=None):
+    """对某辆车执行**规避控制**：根据它当前所处的相态，施加制动/转向，改写其轨迹，
+    并验证是否规避成功——这正是自动驾驶训练时要学的"每个阶段该做什么反应"。
+
+    阶段 → 反应：
+      warning    → 舒适制动(a_comfort)，可完全规避
+      danger     → 紧急制动(cap_brake) 或转向(binding=steer)，可完全规避
+      occurrence → 全力制动(最小化损失；不可避免，只能降低 Δv)
+      impact     → 无规避动作（已接触）
+
+    返回 {ok, action, maneuver, before_zone, after_zone, avoided, story}。
+    """
+    params = _prepare_params(params)
+    frames = [int(f) for f in frames]
+    f0 = int(frames[0])
+    actor = int(actor)
+    others = [int(o) for o in others if int(o) != actor]
+
+    pa = tm.get_track_pose(actor, f0)
+    if pa is None:
+        return {"ok": False, "reason": "actor 在起始帧无位姿"}
+    pa = np.asarray(pa, dtype=np.float64)
+    dims_actor = _dims(tm, actor)
+    _, vel_actor, acc_actor = _motion_series(tm, actor, frames, fps)
+    mot = {o: _motion_series(tm, o, frames, fps) for o in others}
+    dims = {o: _dims(tm, o) for o in others}
+    cls = {o: _class_of(dims[o]) for o in others}
+    va = vel_actor.get(f0, np.zeros(3, dtype=np.float64))
+    aa = acc_actor.get(f0, np.zeros(3, dtype=np.float64))
+    best = _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params, {}, f0)
+    before_zone = best["zone"]
+    binding = best.get("binding") or "brake"
+    worst_other = best.get("other")
+    # 注意：必须在**施加规避之前**测"规避前是否相撞"
+    before_collides = _pair_collides_window(tm, actor, worst_other, frames)
+
+    # 决定动作
+    if action == "auto":
+        if before_zone in (ZONE_SAFE, ZONE_NA, ZONE_IMPACT, ZONE_OCCLUDED):
+            action = "none"
+        elif before_zone == ZONE_WARNING:
+            action = "brake"
+        elif before_zone == ZONE_DANGER:
+            action = "steer" if binding == "steer" else "brake"
+        else:  # occurrence
+            action = "brake"
+
+    maneuver = {"type": "none"}
+    decel = 0.0
+    if action == "brake":
+        decel = float(params["cap_brake_mps2"]) if before_zone in (ZONE_DANGER, ZONE_OCCURRENCE) \
+            else float(params["a_comfort_mps2"])
+        _brake_evasion(tm, actor, frames, fps, f0, decel, va)
+        maneuver = {"type": "brake", "decel_mps2": decel}
+    elif action == "steer":
+        lat = float(steer_lateral_m or params["lane_width_m"])
+        _steer_evasion(tm, actor, frames, fps, f0, va, lat)
+        maneuver = {"type": "steer", "lateral_m": lat}
+
+    # 验证：看"整个窗口内是否还会相撞"（不能只看 f0，制动后 f0 位置没变、仍会判 danger）
+    after_zone, after_binding = _recompute_zone(tm, actor, others, frames, fps, params)
+    after_collides = _pair_collides_window(tm, actor, worst_other, frames)
+    avoided = bool(before_collides and not after_collides)
+
+    zl = {ZONE_SAFE: "安全", ZONE_WARNING: "预警", ZONE_DANGER: "危险",
+          ZONE_OCCURRENCE: "发生", ZONE_IMPACT: "撞击"}
+    mdesc = maneuver["type"]
+    if maneuver["type"] == "brake":
+        mdesc = "制动 %.1f m/s²" % maneuver["decel_mps2"]
+    elif maneuver["type"] == "steer":
+        mdesc = "转向避让 %.1f m" % maneuver["lateral_m"]
+    if avoided:
+        outcome = "规避成功（窗口内不再相撞）"
+    elif before_zone == ZONE_OCCURRENCE and after_collides:
+        outcome = "已最小化损失（发生区不可避免，只能降低 Δv）"
+    elif before_collides and after_collides:
+        outcome = "未规避（仍相撞）"
+    elif not before_collides:
+        outcome = "本无接触冲突"
+    else:
+        outcome = "未改善"
+    story = "在【%s】阶段对 T%d 施加【%s】：%s" % (
+        zl.get(before_zone, before_zone), actor, mdesc, outcome)
+    return {"ok": True, "actor": actor, "action": action, "maneuver": maneuver,
+            "before_zone": before_zone, "after_zone": after_zone,
+            "before_binding": binding, "after_binding": after_binding,
+            "before_collides": bool(before_collides), "after_collides": bool(after_collides),
+            "avoided": avoided, "story": story}
