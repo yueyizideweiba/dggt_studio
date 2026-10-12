@@ -106,13 +106,35 @@ def build_route(road_model, lane_id, extend_m: float = 0.0,
 
 def route_poses(tm, route_pts, frames: List[int], fps: float, speed_mps: float,
                 backward: bool = False, start_arc: float = 0.0,
-                ground: Optional[Callable[[float, float], float]] = None) -> Dict[int, np.ndarray]:
-    """沿路线逐帧生成"严格按路线"的位姿（位置=折线采样、朝向=切线、y=路面高）。"""
+                ground: Optional[Callable[[float, float], float]] = None,
+                dims: Optional[List[float]] = None, up_sign: float = 1.0) -> Dict[int, np.ndarray]:
+    """沿路线逐帧生成"严格按路线"的位姿（位置=折线采样、朝向=切线、y=物体**中心**高）。
+
+    pose 的 y 是物体包围盒**中心**（不是路面接触点）：路面高 + up_sign * 半高。
+    否则车会"陷进地里"半截。
+    """
     P = np.asarray(route_pts, dtype=np.float64)
     if P is None or len(P) < 2:
         return {}
     if backward:
         P = P[::-1].copy()
+    dh = (0.5 * float(dims[1])) if (dims and len(dims) >= 2) else 0.0
+    # 地面参考：路线折线自带的路面高（平滑、无点云噪声），再用 4DGS 点云在若干
+    # 参考点处校准一个**全局垂直偏移**（高精地图与 4DGS 重建可能差一个常数 datum）。
+    # 这样既不会像"逐点用 ground_y_at"那样一颠一颠，也不会像"纯用折线 y"那样整体悬浮/下沉。
+    offset = 0.0
+    if ground is not None:
+        refs = []
+        n = len(P)
+        for i in np.linspace(0, n - 1, min(6, n)).astype(int):
+            try:
+                gy = float(ground(float(P[i][0]), float(P[i][2])))
+                if gy is not None:
+                    refs.append(gy - float(P[i][1]))
+            except Exception:  # noqa: BLE001
+                pass
+        if refs:
+            offset = float(np.median(refs))
     total = polyline_total(P)
     dt = 1.0 / max(1e-6, float(fps))
     poses: Dict[int, np.ndarray] = {}
@@ -127,41 +149,16 @@ def route_poses(tm, route_pts, frames: List[int], fps: float, speed_mps: float,
             continue
         yaw = math.atan2(float(tang[0]), float(tang[2]))
         x, z = float(c[0]), float(c[2])
-        y = float(c[1])
-        if ground is not None:
-            try:
-                y = float(ground(x, z))
-            except Exception:  # noqa: BLE001
-                pass
+        y = float(c[1]) + float(offset) + float(up_sign) * dh
         poses[int(f)] = _yaw_pose(x, y, z, yaw)
     return poses
 
 
-def create_route_vehicle(tm, road_model, lane_id, direction: str = "forward",
-                         speed_mps: float = 8.0, start_frame: int = 0, num_frames: int = 30,
-                         fps: float = 10.0, extend_m: float = 0.0, start_arc: float = 0.0,
-                         model: str = "default", ply_path: Optional[str] = None,
-                         dims: Optional[List[float]] = None, scale: Optional[float] = None,
-                         model_corr=None, type_name: Optional[str] = None,
-                         source: Optional[str] = None) -> Dict[str, Any]:
-    """创建一辆沿指定路线行驶的车辆实体，返回 {ok, track_id, ...}。
-
-    model='default' → 用主车 ego.ply（含主车的 scale/dims，看上去就是"那辆备用车"）；
-    model='custom'  → 用传入的 ply_path/dims/scale。
-    """
+def _resolve_model(tm, model: str, ply_path: Optional[str],
+                   dims: Optional[List[float]], scale: Optional[float],
+                   model_corr, type_name: Optional[str]):
+    """解析车辆外观 → (ply, scale, dims, model_corr, type_name)。"""
     from track_manager import EGO_PLY_DEFAULT, SAM3D_MODEL_CORR
-
-    route = build_route(road_model, lane_id, extend_m=extend_m)
-    if route is None or len(route) < 2:
-        return {"ok": False, "reason": "该车道没有可用的中心线折线（或地图不可用）"}
-
-    frames = list(range(int(start_frame), int(start_frame) + int(num_frames) + 1))
-    backward = str(direction).strip().lower() in ("backward", "back", "reverse", "neg", "-1")
-    ground = getattr(tm, "ground_y_at", None)
-    poses = route_poses(tm, route, frames, fps, float(speed_mps), backward=backward,
-                        start_arc=float(start_arc), ground=ground if callable(ground) else None)
-    if len(poses) < 2:
-        return {"ok": False, "reason": "路线太短或速度过慢，生成的帧数不足 2 帧"}
 
     if str(model).lower() == "custom" and ply_path:
         ply = str(ply_path)
@@ -176,8 +173,42 @@ def create_route_vehicle(tm, road_model, lane_id, direction: str = "forward",
         dm = list(ego.get("dimensions") or dims or [1.7, 1.26, 4.01])
         corr = SAM3D_MODEL_CORR
         tn = type_name or "道路车辆(默认模型)"
+    return ply, sc, dm, corr, tn
+
+
+def _up_sign(tm) -> float:
+    fn = getattr(tm, "world_up_sign", None)
+    return float(fn()) if callable(fn) else 1.0
+
+
+def create_route_vehicle(tm, road_model, lane_id, direction: str = "forward",
+                         speed_mps: float = 8.0, start_frame: int = 0, num_frames: int = 30,
+                         fps: float = 10.0, extend_m: float = 0.0, start_arc: float = 0.0,
+                         model: str = "default", ply_path: Optional[str] = None,
+                         dims: Optional[List[float]] = None, scale: Optional[float] = None,
+                         model_corr=None, type_name: Optional[str] = None,
+                         source: Optional[str] = None) -> Dict[str, Any]:
+    """创建一辆沿指定路线行驶的车辆实体，返回 {ok, track_id, ...}。
+
+    model='default' → 用主车 ego.ply（含主车的 scale/dims，看上去就是"那辆备用车"）；
+    model='custom'  → 用传入的 ply_path/dims/scale。
+    """
+    route = build_route(road_model, lane_id, extend_m=extend_m)
+    if route is None or len(route) < 2:
+        return {"ok": False, "reason": "该车道没有可用的中心线折线（或地图不可用）"}
+
+    ply, sc, dm, corr, tn = _resolve_model(tm, model, ply_path, dims, scale, model_corr, type_name)
     if not ply or not os.path.exists(str(ply)):
         return {"ok": False, "reason": "模型 PLY 不存在: %s" % ply}
+
+    frames = list(range(int(start_frame), int(start_frame) + int(num_frames) + 1))
+    backward = str(direction).strip().lower() in ("backward", "back", "reverse", "neg", "-1")
+    ground = getattr(tm, "ground_y_at", None)
+    poses = route_poses(tm, route, frames, fps, float(speed_mps), backward=backward,
+                        start_arc=float(start_arc), ground=ground if callable(ground) else None,
+                        dims=dm, up_sign=_up_sign(tm))
+    if len(poses) < 2:
+        return {"ok": False, "reason": "路线太短或速度过慢，生成的帧数不足 2 帧"}
 
     tm.push_history()
     obj_id = tm.add_sam3d_track(ply, poses, dm, scale=sc, model_corr=corr, type_name=tn)
@@ -348,16 +379,21 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
 
     def edges(lid):
         out = []
+        # 后继边只取 `exit_lanes`（地图的"真实下一车道"），**不要**用 `successors()`——
+        # 后者会把 left/right_neighbors（并排邻道/变道候选）也混进后继里，而这些本该由
+        # 下面的"变道边"处理。混进来之后再靠 gap/dot 猜"是不是真后继"，会：
+        #   (a) 把 90° 的左右转 exit 误判成"平行邻道"丢掉 → 无法左转/右转；
+        #   (b) 把 50m 外的平行邻道当后继 → 走出"开到尽头再倒回去"的诡异绕圈。
         try:
-            for nxt in road_model.successors(lid):
+            for nxt in road_model.pure_successors(lid):
                 if str(nxt) == lid:
                     continue
                 gap, dot = _lane_conn(road_model, lid, str(nxt))
-                if gap is None or gap > 22.0 or dot <= 0.3:
-                    continue           # 几何不连续 → 不是真正的后继（多半是平行邻道）
-                # 实际行驶距离 = 整条车道；转弯按角度加惩罚；路口连接缺口越长越可疑
-                turn = float(turn_penalty) * float(1.0 - dot)
-                cost = float(road_model.lane_length(lid)) + turn + float(gap_penalty) * gap
+                if dot is not None and dot < -0.35:
+                    continue               # 反向（本图不存在，仅兜底）
+                d = float(dot) if dot is not None else 1.0
+                turn = float(turn_penalty) * float(1.0 - max(-1.0, min(1.0, d)))
+                cost = float(road_model.lane_length(lid)) + turn + float(gap_penalty) * (gap or 0.0)
                 out.append((str(nxt), cost, "successor"))
         except Exception:  # noqa: BLE001
             pass
@@ -370,11 +406,14 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
                 if not (nb and nb.get("lane")):
                     continue
                 nb_id = str(nb["lane"])
-                # 变道只能并入**同向**车道：双向道路的"左邻道"往往是对向车道，
-                # 并入它等于逆行，而且几何上会出现 180° 掉头尖点（发卡弯）。
+                # 变道只能并入**平行同向**车道：
+                #  - 双向道路的"左邻道"往往是对向车道（dot≈-1）→ 逆行，必须拒绝；
+                #  - 路口的 left/right_neighbors 还会把**转弯进口道**（与当前车道成 60~130°）
+                #    也列成邻居；把这种也当"变道"就会斜穿路口、走出诡异绕圈。
+                #    真正的变道发生在两段**基本平行**的车道之间（dot≈1），故要求 dot>0.6。
                 da = _lane_mean_dir(road_model, lid)
                 db = _lane_mean_dir(road_model, nb_id)
-                if da is None or db is None or float(np.dot(da, db)) <= 0.3:
+                if da is None or db is None or float(np.dot(da, db)) <= 0.6:
                     continue
                 # 变道只前进 lane_change_len 米 → 代价按"米 + 机动惩罚"记账
                 out.append((nb_id, float(lane_change_len) + float(lane_change_cost),
@@ -560,33 +599,23 @@ def create_vehicle_on_path(tm, path_pts, direction: str = "forward",
                            model_corr=None, type_name: Optional[str] = None,
                            source: Optional[str] = None) -> Dict[str, Any]:
     """在**给定的路线折线**上创建一辆严格沿路线行驶的车辆（用于"起终点自动算路"的结果）。"""
-    from track_manager import EGO_PLY_DEFAULT, SAM3D_MODEL_CORR
-
     P = np.asarray(path_pts, dtype=np.float64)
     if P is None or len(P) < 2:
         return {"ok": False, "reason": "路线折线为空"}
+
+    ply, sc, dm, corr, tn = _resolve_model(tm, model, ply_path, dims, scale, model_corr, type_name)
+    if not ply or not os.path.exists(str(ply)):
+        return {"ok": False, "reason": "模型 PLY 不存在: %s" % ply}
+
     frames = list(range(int(start_frame), int(start_frame) + int(num_frames) + 1))
     backward = str(direction).strip().lower() in ("backward", "back", "reverse", "-1")
     ground = getattr(tm, "ground_y_at", None)
     poses = route_poses(tm, P, frames, fps, float(speed_mps), backward=backward,
-                        start_arc=float(start_arc), ground=ground if callable(ground) else None)
+                        start_arc=float(start_arc), ground=ground if callable(ground) else None,
+                        dims=dm, up_sign=_up_sign(tm))
     if len(poses) < 2:
         return {"ok": False, "reason": "路线太短或速度过慢，生成的帧数不足 2 帧"}
-    if str(model).lower() == "custom" and ply_path:
-        ply = str(ply_path)
-        sc = float(scale if scale is not None else 1.0)
-        dm = list(dims or [1.8, 1.5, 4.6])
-        corr = model_corr if model_corr is not None else SAM3D_MODEL_CORR
-        tn = type_name or "道路车辆(自定义模型)"
-    else:
-        ego = getattr(tm, "ego", None) or {}
-        ply = ego.get("ply_path") or os.environ.get("DGGT_EGO_PLY", EGO_PLY_DEFAULT)
-        sc = float(ego.get("scale") or 1.0)
-        dm = list(ego.get("dimensions") or [1.7, 1.26, 4.01])
-        corr = SAM3D_MODEL_CORR
-        tn = type_name or "道路车辆(默认模型)"
-    if not ply or not os.path.exists(str(ply)):
-        return {"ok": False, "reason": "模型 PLY 不存在: %s" % ply}
+
     tm.push_history()
     obj_id = tm.add_sam3d_track(ply, poses, dm, scale=sc, model_corr=corr, type_name=tn)
     try:
