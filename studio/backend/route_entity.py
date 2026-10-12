@@ -270,10 +270,15 @@ def _resample(P: np.ndarray, step: float = 1.0) -> np.ndarray:
     return np.asarray(out, dtype=np.float64)
 
 
-def _smooth_polyline(P: np.ndarray, passes: int = 3, window: int = 12) -> np.ndarray:
-    """窗口移动平均（端点固定）：把路口转弯/变道的折角在 ~window 米内磨成平滑曲线。
+def _smooth_polyline(P: np.ndarray, passes: int = 3, window: int = 12,
+                     max_window: int = 28) -> np.ndarray:
+    """窗口移动平均（端点固定），**窗宽随局部转角自适应**：
 
-    用 [1,2,1]/4 迭代是"扩散"，要几十次才覆盖十几米；直接上窗口平均更可控。
+    - 直行段（转角≈0°）用 `window` 米的小窗 → 保持贴路、不削弯；
+    - 路口/变道的折角（转角大）每 30° 加 6m 窗，上限 `max_window` → 把锐角磨成圆角，
+      符合真实车辆"转弯切圆"的样子（路口盒子内本来就没有车道，切角不会掉 off-road）。
+
+    窗必须对称且随位置收缩，否则端点附近会把 p[1] 推到前方 ~w/2 米处产生"瞬移"。
     """
     p = np.asarray(P, dtype=np.float64).copy()
     n = len(p)
@@ -283,9 +288,16 @@ def _smooth_polyline(P: np.ndarray, passes: int = 3, window: int = 12) -> np.nda
     for _ in range(max(1, int(passes))):
         q = p.copy()
         for i in range(1, n - 1):
-            # 窗口必须**对称且随位置收缩**：否则端点附近平均的是一侧窗口，
-            # p[1] 会被推到前方 ~w/2 米处，路线首尾出现 18~20m 的"瞬移"跳变。
-            wi = min(w, i, n - 1 - i)
+            v1 = p[i][[0, 2]] - p[i - 1][[0, 2]]
+            v2 = p[i + 1][[0, 2]] - p[i][[0, 2]]
+            n1 = float(np.linalg.norm(v1))
+            n2 = float(np.linalg.norm(v2))
+            ang = 0.0
+            if n1 > 1e-6 and n2 > 1e-6:
+                c = float(np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0))
+                ang = math.degrees(math.acos(c))
+            extra = int(ang / 30.0) * 6           # 每 30° 转角多加 6m 平滑窗
+            wi = min(w + extra, int(max_window), i, n - 1 - i)
             q[i] = p[i - wi:i + wi + 1].mean(axis=0)
         p = q
     return p
@@ -306,6 +318,30 @@ def _lane_mean_dir(road_model, lid):
         return (s / sl) if sl > 1e-6 else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _neighbor_ids(road_model, lid) -> List[str]:
+    """车道 `lid` 的**全部**相邻车道（left_neighbors ∪ right_neighbors）。
+
+    不要用 `neighbor_lane()`：它每侧只返回"离中点最近的**一条**"邻居，路口车道的中点
+    往往离**转弯进口道**最近（dot≈0.3），于是返回了转弯道、把真正平行的邻道漏掉——
+    再叠加方向门槛，就会让路口车道"完全无法变道"。这里把地图里声明的邻居全列出来，
+    由调用方逐条做"平行同向"过滤。
+    """
+    try:
+        lanes = getattr(road_model, "map", {}).get("lanes", {})
+    except Exception:  # noqa: BLE001
+        lanes = {}
+    L = lanes.get(str(lid))
+    if not L:
+        return []
+    out: List[str] = []
+    for key in ("left_neighbors", "right_neighbors"):
+        for x in (L.get(key) or []):
+            s = str(x)
+            if s in lanes and s not in out:
+                out.append(s)
+    return out
 
 
 def _lane_conn(road_model, a, b):
@@ -398,26 +434,21 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
         except Exception:  # noqa: BLE001
             pass
         if allow_lane_change:
-            for side in ("left", "right"):
-                try:
-                    nb = road_model.neighbor_lane(lid, side)
-                except Exception:  # noqa: BLE001
-                    nb = None
-                if not (nb and nb.get("lane")):
+            da = _lane_mean_dir(road_model, lid)
+            for nb_id in _neighbor_ids(road_model, lid):
+                if str(nb_id) == str(lid):
                     continue
-                nb_id = str(nb["lane"])
                 # 变道只能并入**平行同向**车道：
                 #  - 双向道路的"左邻道"往往是对向车道（dot≈-1）→ 逆行，必须拒绝；
-                #  - 路口的 left/right_neighbors 还会把**转弯进口道**（与当前车道成 60~130°）
-                #    也列成邻居；把这种也当"变道"就会斜穿路口、走出诡异绕圈。
+                #  - 路口的 left/right_neighbors 还会把**转弯进口道**（与当前车道成 60~130°，
+                #    dot≈0.3~0.5）也列成邻居；把这种当"变道"就会斜穿路口、走出诡异绕圈。
                 #    真正的变道发生在两段**基本平行**的车道之间（dot≈1），故要求 dot>0.6。
-                da = _lane_mean_dir(road_model, lid)
                 db = _lane_mean_dir(road_model, nb_id)
                 if da is None or db is None or float(np.dot(da, db)) <= 0.6:
                     continue
                 # 变道只前进 lane_change_len 米 → 代价按"米 + 机动惩罚"记账
                 out.append((nb_id, float(lane_change_len) + float(lane_change_cost),
-                            "lane_change:" + side))
+                            "lane_change"))
         return out
 
     pq = [(h(a), 0.0, a, [])]
