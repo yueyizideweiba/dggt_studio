@@ -3819,6 +3819,93 @@ async def road_vehicle(request: RoadVehicleRequest):
     return {"success": True, **res}
 
 
+class RoadPickRequest(BaseModel):
+    """视图点选：世界坐标 (x,z) → 最近车道 + 弧长（用于选起终点）。"""
+    scene_id: str
+    xz: List[float]
+
+
+@app.post("/api/road/nearest_lane")
+async def road_nearest_lane(request: RoadPickRequest):
+    """把一个世界坐标点吸附到最近的车道中心线，返回 lane_id / 弧长 / 距离。"""
+    import road_rules
+    from road_rules import project_arc
+    renderer = get_scene_or_404(request.scene_id)
+    rm = road_rules.get_road_model(getattr(renderer, "scene_path", None))
+    if rm is None or not getattr(rm, "available", False):
+        raise HTTPException(status_code=400, detail="本场景没有可用的高精地图")
+    q = np.asarray(request.xz, dtype=np.float64)[:2]
+    best, best_d, best_pt = None, 1e18, None
+    for lid in rm.lane_ids():
+        P = rm.lane_pts(lid)
+        if P is None or len(P) < 2:
+            continue
+        P = np.asarray(P, dtype=np.float64)
+        dd = np.linalg.norm(P[:, [0, 2]] - q, axis=1)
+        j = int(np.argmin(dd))
+        if float(dd[j]) < best_d:
+            best, best_d, best_pt = lid, float(dd[j]), P
+    if best is None:
+        raise HTTPException(status_code=400, detail="附近没有车道")
+    return {"success": True, "lane_id": str(best), "dist_m": round(best_d, 2),
+            "arc": round(float(project_arc(best_pt, q)), 2),
+            "length_m": round(float(rm.lane_length(best)), 1),
+            "snap": [round(float(v), 2) for v in best_pt[int(np.argmin(np.linalg.norm(best_pt[:, [0, 2]] - q, axis=1)))][:3]]}
+
+
+class RoadRouteRequest(BaseModel):
+    """起终点自动算路（可在同一条或不同车道），可选顺带创建沿路线行驶的车辆。"""
+    scene_id: str
+    start_lane: str
+    start_arc: float = 0.0
+    end_lane: str
+    end_arc: Optional[float] = None
+    allow_lane_change: bool = True
+    create: bool = False
+    direction: str = "forward"
+    speed_mps: float = 8.0
+    start_frame: int = 0
+    num_frames: int = 60
+    fps: float = 10.0
+    model: str = "default"
+    ply_path: Optional[str] = None
+
+
+@app.post("/api/road/route")
+async def road_route(request: RoadRouteRequest):
+    """在车道图上规划一条从起点到终点、严格沿道路的路线（含平滑变道与转弯）。"""
+    import route_entity, road_rules
+    renderer = get_scene_or_404(request.scene_id)
+    tm = get_track_manager_or_404(request.scene_id)
+    tm.fps = float(request.fps or 10.0)
+    rm = road_rules.get_road_model(getattr(renderer, "scene_path", None))
+    if rm is None or not getattr(rm, "available", False):
+        raise HTTPException(status_code=400, detail="本场景没有可用的高精地图")
+    end_arc = request.end_arc if request.end_arc is not None else rm.lane_length(request.end_lane)
+    try:
+        route = route_entity.plan_route(rm, request.start_lane, float(request.start_arc),
+                                        request.end_lane, float(end_arc),
+                                        allow_lane_change=bool(request.allow_lane_change))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"算路失败: {e}")
+    if not route:
+        raise HTTPException(status_code=400, detail="无法规划到终点的路线（车道图不连通或起终点不可达）")
+    out: Dict[str, Any] = {
+        "success": True, "lane_ids": route["lane_ids"], "num_lanes": route["num_lanes"],
+        "length_m": route["length_m"], "cost": route["cost"],
+        "pts": [[round(float(v), 2) for v in p[:3]] for p in route["pts"]],
+    }
+    if request.create:
+        res = route_entity.create_vehicle_on_path(
+            tm, route["pts"], direction=request.direction, speed_mps=request.speed_mps,
+            start_frame=request.start_frame, num_frames=request.num_frames, fps=request.fps,
+            model=request.model, ply_path=request.ply_path, source="road_route")
+        if not res.get("ok"):
+            raise HTTPException(status_code=400, detail=res.get("reason", "创建失败"))
+        out["vehicle"] = res
+    return out
+
+
 @app.get("/api/scene3d/{scene_id}/frame/{frame_idx}")
 async def get_scene3d(scene_id: str, frame_idx: int):
     """获取某一帧的 3D 场景元信息（用于自由视角浏览/编辑）。

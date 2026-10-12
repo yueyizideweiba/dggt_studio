@@ -51,6 +51,8 @@ class DGGTViewer3D {
         this.isPanning = false;
         this.isDraggingObject = false;
         this.draggingTrajPoint = null;  // 正在拖动的轨迹点 frame_idx
+        this.pickMode = null;             // 'start' | 'end'：视图里拾取路线起终点
+        this.onGroundPick = options.onGroundPick || null;  // 拾取回调 (mode, worldPoint)
         this.prevMouse = { x: 0, y: 0 };
 
         // 渲染节流
@@ -294,6 +296,50 @@ class DGGTViewer3D {
     }
 
     _deg2rad(d) { return d * Math.PI / 180; }
+
+    // 地面高度估计：用当前帧物体包围盒底面 y 的中位数（比直接用相机目标 y 更准）
+    _groundYEstimate() {
+        const ys = [];
+        for (const o of (this.objects || [])) {
+            if (!o.center) continue;
+            const h = (o.dimensions && o.dimensions.length === 3) ? Number(o.dimensions[1]) : 0;
+            ys.push(Number(o.center[1]) - (isFinite(h) ? h / 2 : 0));
+        }
+        if (!ys.length) return Number(this.target[1]) || 0;
+        ys.sort((a, b) => a - b);
+        return ys[Math.floor(ys.length / 2)];
+    }
+
+    // 屏幕点 → 世界坐标：从相机射线与水平面(y=planeY)求交（用于"在视图里选起点/终点"）
+    _screenToWorldGround(e, planeY) {
+        const c2w = this.lastC2W || this._computeC2W();
+        const m = this._canvasMouse(e);
+        const fy = (this.renderHeight / 2.0) / Math.tan(this._deg2rad(this.fovY) / 2.0);
+        const fx = fy;
+        const ndx = (m.x - this.renderWidth / 2.0) / fx;
+        const ndy = (m.y - this.renderHeight / 2.0) / fy;
+        const Rc = [
+            [c2w[0][0], c2w[0][1], c2w[0][2]],
+            [c2w[1][0], c2w[1][1], c2w[1][2]],
+            [c2w[2][0], c2w[2][1], c2w[2][2]],
+        ];
+        const dir = [
+            Rc[0][0] * ndx + Rc[0][1] * ndy + Rc[0][2],
+            Rc[1][0] * ndx + Rc[1][1] * ndy + Rc[1][2],
+            Rc[2][0] * ndx + Rc[2][1] * ndy + Rc[2][2],
+        ];
+        const t = [c2w[0][3], c2w[1][3], c2w[2][3]];
+        if (Math.abs(dir[1]) < 1e-6) return null;
+        const s = (Number(planeY) - t[1]) / dir[1];
+        if (!(s > 0)) return null;
+        return [t[0] + s * dir[0], Number(planeY), t[2] + s * dir[2]];
+    }
+
+    // 拾取模式：设为 'start' / 'end' 后，视图里下一次点击会回调 onGroundPick(世界点)
+    setPickMode(mode) {
+        this.pickMode = mode || null;
+        if (this.canvas) this.canvas.style.cursor = this.pickMode ? 'crosshair' : 'grab';
+    }
 
     // ==================== 缓存 ====================
 
@@ -616,6 +662,11 @@ class DGGTViewer3D {
             this._drawPairwiseZones(sx, sy);
         }
 
+        // 规划路线预览（视图拾取起终点后）
+        if (this.routePreview && this.routePreview.pts && this.routePreview.pts.length > 1) {
+            this._drawRoutePreview(sx, sy);
+        }
+
         // 选中 track 的轨迹（可编辑点）
         if (this.showTrajectory && this.trajectory && this.trajectory.trajectory) {
             const pts = this.trajectory.trajectory;
@@ -727,6 +778,15 @@ class DGGTViewer3D {
         this.prevMouse = { x: e.clientX, y: e.clientY };
 
         if (e.button === 0) {
+            // 路线拾取模式：这一下点击直接取地面点，不参与选择/旋转
+            if (this.pickMode) {
+                const gp = this._screenToWorldGround(e, this._groundYEstimate());
+                const mode = this.pickMode;
+                this.pickMode = null;
+                if (this.canvas) this.canvas.style.cursor = 'grab';
+                if (gp && this.onGroundPick) this.onGroundPick(mode, gp);
+                return;
+            }
             // 轨迹编辑状态：只允许拖动轨迹顶点
             if (this.trajectoryEditMode && this.selectedTrackId !== null) {
                 const tp = this._pickTrajPoint(e);
@@ -1242,6 +1302,57 @@ class DGGTViewer3D {
                 this.octx.fillText(zl[p.zone] || p.zone, sp.x * sx + 8, sp.y * sy - 8);
             }
         }
+    }
+
+    // 设置/清除规划路线预览：pts 为 [[x,y,z],...]，picks 为 {start:[x,y,z],end:[...]}
+    setRoutePreview(pts, picks) {
+        this.routePreview = pts && pts.length ? { pts: pts, picks: picks || null } : null;
+        this._drawOverlay();
+    }
+
+    clearRoutePreview() {
+        this.routePreview = null;
+        this._drawOverlay();
+    }
+
+    // 画规划路线（青色实线 + 起点/终点标记）
+    _drawRoutePreview(sx, sy) {
+        const rp = this.routePreview;
+        if (!rp) return;
+        const ctx = this.octx;
+        ctx.beginPath();
+        let started = false;
+        for (const p of rp.pts) {
+            const sp = this._worldToScreen(p, this.lastC2W);
+            if (!sp) { started = false; continue; }
+            const X = sp.x * sx, Y = sp.y * sy;
+            if (!started) { ctx.moveTo(X, Y); started = true; }
+            else ctx.lineTo(X, Y);
+        }
+        ctx.strokeStyle = 'rgba(0,220,200,0.95)';
+        ctx.lineWidth = 4;
+        ctx.setLineDash([10, 6]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        const mark = (pt, color, label) => {
+            const sp = this._worldToScreen(pt, this.lastC2W);
+            if (!sp) return;
+            const X = sp.x * sx, Y = sp.y * sy;
+            ctx.beginPath();
+            ctx.arc(X, Y, 7, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 12px sans-serif';
+            ctx.fillText(label, X + 10, Y - 10);
+        };
+        const pk = rp.picks || {};
+        if (pk.start) mark(pk.start, 'rgba(60,220,90,0.95)', '起点');
+        if (pk.end) mark(pk.end, 'rgba(240,80,80,0.95)', '终点');
     }
 
     // 设置智能轨迹编辑参数

@@ -227,6 +227,7 @@ class DGGTStudio {
                 this.updateObjectList();
                 this.updateSelectedObjectPanel();
             },
+            onGroundPick: (mode, worldPt) => this._onRoadPick(mode, worldPt),
             onObjectEdited: (trackId) => {
                 // 编辑后清空 2D 渲染缓存，保证切回 2D 时显示最新结果
                 this.state.renderCache.clear();
@@ -1663,6 +1664,18 @@ class DGGTStudio {
         // 道路车辆（沿路线行驶）
         const roadVehicleBtn = document.getElementById('roadVehicleBtn');
         if (roadVehicleBtn) roadVehicleBtn.addEventListener('click', () => this.createRoadVehicle());
+        const pickStartBtn = document.getElementById('roadPickStartBtn');
+        if (pickStartBtn) pickStartBtn.addEventListener('click', () => this._startRoadPick('start'));
+        const pickEndBtn = document.getElementById('roadPickEndBtn');
+        if (pickEndBtn) pickEndBtn.addEventListener('click', () => this._startRoadPick('end'));
+        const routeBtn = document.getElementById('roadRouteBtn');
+        if (routeBtn) routeBtn.addEventListener('click', () => this.createRouteVehicle());
+        const clearRouteBtn = document.getElementById('roadClearRouteBtn');
+        if (clearRouteBtn) clearRouteBtn.addEventListener('click', () => {
+            this._roadPicks = { start: null, end: null };
+            if (this.viewer3d) this.viewer3d.clearRoutePreview();
+            this._setRoadStatus('已清除起终点与路线预览');
+        });
         const reloadRoadLanesBtn = document.getElementById('reloadRoadLanesBtn');
         if (reloadRoadLanesBtn) reloadRoadLanesBtn.addEventListener('click', () => this._loadRoadLanes());
         const roadModelSel = document.getElementById('roadModel');
@@ -2144,6 +2157,117 @@ class DGGTStudio {
             await this.loadFrame(this.state.currentFrame);
         } catch (e) {
             if (statusEl) statusEl.textContent = '创建失败: ' + e.message;
+        }
+    }
+
+    _setRoadStatus(msg) {
+        const el = document.getElementById('roadVehicleStatus');
+        if (el) el.textContent = msg || '';
+    }
+
+    // 进入视图拾取模式：下一次在 3D 视图点击地面 → 吸附最近车道
+    _startRoadPick(mode) {
+        if (!this.viewer3d) return;
+        this._roadPicks = this._roadPicks || { start: null, end: null };
+        this.viewer3d.setPickMode(mode);
+        this._setRoadStatus(mode === 'start'
+            ? '请在 3D 视图中点击「起点」位置（会吸附到最近的车道中心线）'
+            : '请在 3D 视图中点击「终点」位置（会吸附到最近的车道中心线）');
+    }
+
+    // 视图拾取回调：世界点 → /api/road/nearest_lane → 记录起点/终点
+    async _onRoadPick(mode, worldPt) {
+        this._roadPicks = this._roadPicks || { start: null, end: null };
+        const x = Number(worldPt[0]), z = Number(worldPt[2]);
+        this._setRoadStatus(`已拾取 ${mode === 'start' ? '起点' : '终点'} (${x.toFixed(1)}, ${z.toFixed(1)})，正在吸附车道…`);
+        try {
+            const r = await fetch(`${API_BASE}/road/nearest_lane`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ scene_id: this.state.sceneId, xz: [x, z] })
+            });
+            const d = await r.json();
+            if (!d.success) { this._setRoadStatus('吸附车道失败: ' + (d.detail || '未知错误')); return; }
+            const snap = d.snap || [];
+            const pick = { xz: [snap[0], snap[2]], lane_id: String(d.lane_id), arc: d.arc, dist: d.dist_m };
+            this._roadPicks[mode] = pick;
+            this._refreshRoadPicks();
+        } catch (e) {
+            this._setRoadStatus('吸附车道失败: ' + e.message);
+        }
+    }
+
+    _refreshRoadPicks() {
+        const p = this._roadPicks || {};
+        const fmt = (q) => q ? `车道${q.lane_id}@${Number(q.arc).toFixed(1)}m(偏${Number(q.dist).toFixed(1)}m)` : '未选';
+        this._setRoadStatus(`起点：${fmt(p.start)}　终点：${fmt(p.end)}${p.start && p.end ? '　→ 可点「自动算路并放置」' : ''}`);
+        // 若两端都有，先用 /road/route (create=false) 预览路线
+        if (p.start && p.end) this._previewRoute();
+    }
+
+    // 预览路线（不放置车辆），把折线画到 3D 视图
+    async _previewRoute() {
+        const p = this._roadPicks || {};
+        if (!p.start || !p.end) return;
+        try {
+            const r = await fetch(`${API_BASE}/road/route`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    start_lane: p.start.lane_id, start_arc: p.start.arc,
+                    end_lane: p.end.lane_id, end_arc: p.end.arc,
+                    allow_lane_change: true, create: false
+                })
+            });
+            const d = await r.json();
+            if (!d.success) { this._setRoadStatus('算路失败: ' + (d.detail || '未知错误')); return; }
+            this._lastRoute = d;
+            if (this.viewer3d) {
+                this.viewer3d.setRoutePreview(d.pts || [], { start: p.start.xz, end: p.end.xz });
+            }
+            this._setRoadStatus(
+                `路线预览：经 ${(d.lane_ids || []).length} 条车道（${(d.lane_ids || []).join('→')}），全长 ${Number(d.length_m).toFixed(1)}m\n` +
+                '确认无误后点「自动算路并放置」生成沿路线行驶的车辆');
+        } catch (e) {
+            this._setRoadStatus('算路失败: ' + e.message);
+        }
+    }
+
+    // 用拾取的起终点算路并直接放置一辆沿路线行驶的车辆
+    async createRouteVehicle() {
+        const p = this._roadPicks || {};
+        if (!p.start || !p.end) { alert('请先分别拾取起点和终点（点「拾取起点」/「拾取终点」后在 3D 视图里点击地面）'); return; }
+        const speed = parseFloat((document.getElementById('roadSpeed') || {}).value) || 8.0;
+        const numFrames = parseInt((document.getElementById('roadNumFrames') || {}).value) || 60;
+        const startFrame = this.state.currentFrame;
+        this._setRoadStatus('算路并创建车辆中…');
+        try {
+            const r = await fetch(`${API_BASE}/road/route`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scene_id: this.state.sceneId,
+                    start_lane: p.start.lane_id, start_arc: p.start.arc,
+                    end_lane: p.end.lane_id, end_arc: p.end.arc,
+                    allow_lane_change: true, create: true,
+                    speed_mps: speed, start_frame: startFrame, num_frames: numFrames,
+                    model: 'default'
+                })
+            });
+            const d = await r.json();
+            if (!d.success) { this._setRoadStatus('创建失败: ' + (d.detail || '未知错误')); return; }
+            this._lastRoute = d;
+            if (this.viewer3d) {
+                this.viewer3d.setRoutePreview(d.pts || [], { start: p.start.xz, end: p.end.xz });
+            }
+            const v = d.vehicle || {};
+            this._setRoadStatus(
+                `已创建路线车辆 T${v.track_id}：经 ${(d.lane_ids || []).length} 条车道（${(d.lane_ids || []).join('→')}），` +
+                `全长 ${Number(d.length_m).toFixed(1)}m，${v.num_frames}帧，${v.speed_mps}m/s`);
+            this.updateStatus(`路线车辆 T${v.track_id} 已放置`);
+            this.state.renderCache.clear();
+            if (this.viewer3d) this.viewer3d._invalidateCache();
+            await this.loadFrame(this.state.currentFrame);
+        } catch (e) {
+            this._setRoadStatus('创建失败: ' + e.message);
         }
     }
 
