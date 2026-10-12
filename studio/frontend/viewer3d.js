@@ -1233,8 +1233,8 @@ class DGGTViewer3D {
         this._drawOverlay();
     }
 
-    // 世界坐标两点连线（按区域着色）
-    _lineWorld(a, b, color, sx, sy, width) {
+    // 世界坐标两点连线（按区域着色；dash 传 [a,b] 表示虚线）
+    _lineWorld(a, b, color, sx, sy, width, dash) {
         const spa = this._worldToScreen(a, this.lastC2W);
         const spb = this._worldToScreen(b, this.lastC2W);
         if (!spa || !spb) return;
@@ -1243,7 +1243,9 @@ class DGGTViewer3D {
         this.octx.lineTo(spb.x * sx, spb.y * sy);
         this.octx.strokeStyle = color;
         this.octx.lineWidth = width;
+        if (dash) this.octx.setLineDash(dash); else this.octx.setLineDash([]);
         this.octx.stroke();
+        this.octx.setLineDash([]);
     }
 
     // 世界 XZ 平面上的"方向性椭圆"：中心前移半长轴，只朝 (ux,uz) 方向延伸（teardrop）
@@ -1270,15 +1272,17 @@ class DGGTViewer3D {
         if (strokeColor) { this.octx.strokeStyle = strokeColor; this.octx.lineWidth = 2; this.octx.stroke(); }
     }
 
-    // 画当前帧所有冲突对的"方向性区域 + 连接线"（不再画 360° 圆）
+    // 画当前帧所有冲突对的"同心方向性三区（预警/危险/发生）+ 连接线"
     _drawPairwiseZones(sx, sy) {
         if (!this.pairwiseZones) return;
         const pairs = this.pairwiseZones[this.frameIdx] || [];
         if (!pairs.length) return;
-        const stroke = { warning: 'rgba(241,196,15,0.85)', danger: 'rgba(230,126,34,0.9)',
-                         occurrence: 'rgba(231,76,60,0.95)', impact: 'rgba(142,27,27,0.95)' };
-        const fill = { warning: 'rgba(241,196,15,0.08)', danger: 'rgba(230,126,34,0.10)',
-                       occurrence: 'rgba(231,76,60,0.12)', impact: 'rgba(142,27,27,0.16)' };
+        const C = {
+            warning:    { stroke: 'rgba(241,196,15,0.9)', fill: 'rgba(241,196,15,0.08)', line: 'rgba(241,196,15,0.55)' },
+            danger:     { stroke: 'rgba(235,126,34,0.95)', fill: 'rgba(235,126,34,0.13)', line: 'rgba(235,126,34,0.75)' },
+            occurrence: { stroke: 'rgba(231,76,60,1)',    fill: 'rgba(231,76,60,0.22)',  line: 'rgba(231,76,60,0.95)' },
+            impact:     { stroke: 'rgba(142,27,27,1)',    fill: 'rgba(142,27,27,0.28)',  line: 'rgba(142,27,27,1)' },
+        };
         const zl = { warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击' };
         for (const p of pairs) {
             const ca = p.pos_a, cb = p.pos_b;
@@ -1286,22 +1290,63 @@ class DGGTViewer3D {
             const dd = Math.hypot(dx, dz);
             if (dd < 1e-3) continue;
             const ux = dx / dd, uz = dz / dd;
-            const col = stroke[p.zone] || 'rgba(255,255,255,0.6)';
-            // 连接线（按区域着色，宽度随严重度）
-            this._lineWorld(ca, cb, col, sx, sy, p.zone === 'occurrence' || p.zone === 'impact' ? 4 : 2.5);
-            // 方向性危险区椭圆（围绕反应主体 a，长轴指向 b）
-            this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, Number(p.r_danger_m) || 0, 1.6, sx, sy, col, fill[p.zone]);
-            if (Number(p.r_warning_m) > Number(p.r_danger_m)) {
-                this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, Number(p.r_warning_m) || 0, 2.0, sx, sy, 'rgba(241,196,15,0.45)', null);
+            const c = C[p.zone] || C.warning;
+            const isOcc = p.zone === 'occurrence' || p.zone === 'impact';
+            // 连接线：预警虚线 / 危险实线 / 发生加粗实线，宽度随 risk_score
+            const lw = isOcc ? 5 : (p.zone === 'danger' ? 3.5 : 2);
+            this._lineWorld(ca, cb, c.line, sx, sy, lw, p.zone === 'warning' ? [6, 4] : null);
+            // 三区同心方向性区域（从外到内叠画：预警→危险→发生，最内最醒目）
+            const rw = Number(p.r_warning_m) || 0, rd = Number(p.r_danger_m) || 0;
+            if (rw > rd) this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, rw, 2.4, sx, sy, 'rgba(241,196,15,0.5)', 'rgba(241,196,15,0.03)');
+            if (rd > 0) this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, rd, 1.8, sx, sy, c.stroke, c.fill);
+            if (isOcc) {
+                const ro = Math.max(2.2, Math.min(rd * 0.5, 6.0));
+                this._ellipseWorld(ca[0], ca[1], ca[2], ux, uz, ro, 1.6, sx, sy, c.stroke, c.fill);
+                // 预计撞击点标记（反应主体前方 ro 处）
+                const ip = [ca[0] + ux * ro, ca[1], ca[2] + uz * ro];
+                const sp2 = this._worldToScreen(ip, this.lastC2W);
+                if (sp2) {
+                    const X = sp2.x * sx, Y = sp2.y * sy;
+                    this.octx.beginPath(); this.octx.arc(X, Y, 5, 0, Math.PI * 2);
+                    this.octx.fillStyle = '#fff'; this.octx.fill();
+                    this.octx.strokeStyle = 'rgba(231,76,60,1)'; this.octx.lineWidth = 3; this.octx.stroke();
+                }
             }
-            // 区域标签（在 a 位置上方）
+            // 标签：区域 + 风险指数
             const sp = this._worldToScreen(ca, this.lastC2W);
             if (sp) {
+                const rs = (p.risk_score != null) ? `  r=${p.risk_score}` : '';
                 this.octx.fillStyle = 'rgba(255,255,255,0.95)';
                 this.octx.font = 'bold 12px sans-serif';
-                this.octx.fillText(zl[p.zone] || p.zone, sp.x * sx + 8, sp.y * sy - 8);
+                this.octx.fillText((zl[p.zone] || p.zone) + rs, sp.x * sx + 10, sp.y * sy - 10);
             }
         }
+        this._drawZoneLegend();
+    }
+
+    // 三区图例（覆盖层左上角）
+    _drawZoneLegend() {
+        const items = [
+            ['warning', '预警', 'rgba(241,196,15,0.9)'],
+            ['danger', '危险', 'rgba(235,126,34,0.95)'],
+            ['occurrence', '发生', 'rgba(231,76,60,1)'],
+            ['impact', '撞击', 'rgba(142,27,27,1)'],
+        ];
+        const x0 = 16, y0 = 16, lh = 20;
+        const w = 104, h = items.length * lh + 12;
+        this.octx.fillStyle = 'rgba(15,18,28,0.66)';
+        this.octx.fillRect(x0, y0, w, h);
+        this.octx.strokeStyle = 'rgba(255,255,255,0.16)';
+        this.octx.lineWidth = 1;
+        this.octx.strokeRect(x0, y0, w, h);
+        this.octx.font = '12px sans-serif';
+        items.forEach((it, i) => {
+            const yy = y0 + 16 + i * lh;
+            this.octx.fillStyle = it[2];
+            this.octx.beginPath(); this.octx.arc(x0 + 14, yy - 4, 5, 0, Math.PI * 2); this.octx.fill();
+            this.octx.fillStyle = 'rgba(255,255,255,0.9)';
+            this.octx.fillText(it[1], x0 + 26, yy);
+        });
     }
 
     // 设置/清除规划路线预览：pts 为 [[x,y,z],...]，picks 为 {start:[x,y,z],end:[...]}

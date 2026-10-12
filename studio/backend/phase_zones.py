@@ -10,15 +10,19 @@
 一、判据因素（每个因素都逐帧计算、逐帧可解释、逐帧可追溯）
 --------------------------------------------------------------
 1. 纵向制动所需减速度 a_brake  —— 反应时间 t_r 后以恒定减速度制动，能在预测时域内不与对方
-   OBB 接触所需的最小 a。这是"刹不刹得住"的纵向能力判据。
-2. 横向转向所需加速度 a_lat     —— 要在 (TTC - t_r) 秒内横向避让一个车道(lane_width)，
-   所需的最小横向加速度 a_lat = 2·lane_width / (TTC - t_r)^2。这是"转不转得开"的横向能力判据。
+   OBB 接触所需的最小 a。这是"刹不刹得住"的纵向能力判据。数值用**二分法精确求根**；
+   一维闭合（对向/追尾）另有解析上界 a_stop = v_rel²/(2·(gap - v_rel·t_r))（brake-to-stop）。
+2. 横向转向所需加速度 a_lat     —— 要在 (TTC - t_r) 秒内横向避让 OBB 净空 W_clr（两车半宽之和
+   + 余量，而非固定一个车道宽），所需的最小横向加速度 a_lat = 2·W_clr / (TTC - t_r)²。
+   这是"转不转得开"的横向能力判据。
 3. 撞击严重度（能量）Δv + 接触几何 —— 预测接触时的相对速度 |v_a - v_b|，与接触几何
    （对向 head-on / 侧面 side / 追尾 rear / 静止 stationary）一起决定后果严重度。
 4. 物体类型（VRU 弱势道路使用者）—— 行人类体积的参与者给更大的安全余量与更保守的严重度。
 5. 路面附着 μ —— 决定纵向制动上限 cap_brake=μ·g 与横向转向上限 cap_lat≈0.9·μ·g（湿滑/冰雪
    直接压缩能力包络 → 危险区与发生区变宽）。
 6. TTC 与反应裕度 —— TTC 是时间紧迫度；反应裕度 = TTC - t_r 是"反应之后还剩多少时间"。
+7. 机动余量 μ —— μ_brake = 1 - a_brake/cap_brake、μ_lat = 1 - a_lat/cap_lat（1=零负担，0=用满能力，
+   <0=能力不足）。最优机动余量 μ* = max(μ_brake, μ_lat) 是"还剩多少能力"的连续、可比较指标。
 
 --------------------------------------------------------------
 二、能力包络 → 区域（紧急度维度）
@@ -261,24 +265,72 @@ def _contact_with_braking(pa, va, aa, dims_a, pb, vb, ab, dims_b, a, params) -> 
     return False
 
 
+def _deceleration_closed_form_1d(gap: float, v_rel: float, t_r: float) -> Optional[float]:
+    """一维闭合场景（对向/追尾，B 匀速或静止，转化为 B 的参考系）的**解析上界**。
+
+    设有效接触间隙 `gap`（已扣掉两车半长：OBB 相切时的中心距），相对速度 v_rel。
+    反应时间 t_r 内相对速度不变，剩余间隙 d = gap - v_rel·t_r；之后要以恒定减速度 a 在
+    相撞前把相对速度降到 0，最小 a 满足：
+
+        v_rel² = 2·a·d   ⟹   a* = v_rel² / (2d)  =  v_rel² / (2·(gap - v_rel·t_r))
+
+    这是"恒定减速度刹停"的标准运动学闭式（RSS / ISO 15623 制动判据的连续版本）。
+    它是"brake-to-stop（把相对速度降到 0）"的**解析上界**：数值解 `min_required_deceleration`
+    只需在预测时域 H 内避免接触（不必完全刹停），因此当 H 不足以完全刹停时，闭式 ≥ 数值解。
+    d ≤ 0 表示反应期内就已接触（a* = ∞）；一般二阶加速度 / 横穿情形无闭式解。
+    """
+    d = float(gap) - float(v_rel) * float(t_r)
+    if d <= 1e-9:
+        return None if v_rel <= 1e-9 else float("inf")
+    if float(v_rel) <= 1e-9:
+        return 0.0
+    return float(v_rel) * float(v_rel) / (2.0 * d)
+
+
 def min_required_deceleration(pa, va, aa, dims_a, pb, vb, ab, dims_b, params) -> float:
+    """最小避免接触的纵向减速度 a*（对 a 的**二分精确解**）。
+
+    判据 `P(a)` = "主车反应 t_r 后以恒定减速度 a 制动，预测时域内不再接触"。
+    对一维闭合（对向/追尾）P 关于 a 单调（减速度越大越早停），故二分收敛到阈值 a*；
+    a* = 0 表示无需干预，a* = ∞ 表示直到能力上限仍不可避免（ICS）。
+    解析参考值见 `_deceleration_closed_form_1d`；一般情形（二阶加速度/横穿）用二分。
+    """
     cap_brake = float(params["cap_brake_mps2"])
-    step = float(params["a_scan_step_mps2"])
     if not _contact_with_braking(pa, va, aa, dims_a, pb, vb, ab, dims_b, 0.0, params):
         return 0.0
-    a = step
-    while a <= cap_brake + 1e-6:
-        if not _contact_with_braking(pa, va, aa, dims_a, pb, vb, ab, dims_b, a, params):
-            return a
-        a += step
-    return float("inf")
+    if _contact_with_braking(pa, va, aa, dims_a, pb, vb, ab, dims_b, cap_brake, params):
+        return float("inf")
+    lo, hi = 0.0, cap_brake    # 不变式：P(lo)=仍接触，P(hi)=已避免
+    for _ in range(36):
+        mid = 0.5 * (lo + hi)
+        if _contact_with_braking(pa, va, aa, dims_a, pb, vb, ab, dims_b, mid, params):
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
-def _a_lat_required(ttc: float, t_reaction: float, lane_width: float) -> float:
+def _lateral_clearance(dims_a, dims_b, params) -> float:
+    """转向避让所需的最小横向位移（OBB 感知，而非固定一个车道宽）。
+
+    要避免接触，主车需横向移动"两车半宽之和 + 安全余量"（从完全重叠到刚好错开）。
+    相比固定 lane_width（≈3.5 m），OBB 感知的横移更贴近真实：两辆 2 m 宽的车只需
+    ~2 m 横移即可错开，而非整整一个车道。
+    """
+    try:
+        wa = float(dims_a[0]) if dims_a and len(dims_a) > 0 else float(params["lane_width_m"])
+        wb = float(dims_b[0]) if dims_b and len(dims_b) > 0 else float(params["lane_width_m"])
+        margin = float(params["d_near_miss_m"]) * 0.5   # 半侧安全余量
+        return 0.5 * (wa + wb) + margin
+    except Exception:  # noqa: BLE001
+        return float(params["lane_width_m"])
+
+
+def _a_lat_required(ttc: float, t_reaction: float, clearance: float) -> float:
     t_avail = float(ttc) - float(t_reaction)
     if t_avail <= 0.05:
         return float("inf")
-    return 2.0 * float(lane_width) / (t_avail * t_avail)
+    return 2.0 * float(clearance) / (t_avail * t_avail)
 
 
 def _geometry(va, vb) -> str:
@@ -489,7 +541,6 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
     让每一条区域判定都可被追溯、可被评审（论文里"为什么是这个区域"的直接证据）。
     """
     t_r = float(params["t_reaction_s"])
-    lane = float(params["lane_width_m"])
     a_comf = float(params["a_comfort_mps2"])
     a_lat_comf = float(params["a_lat_comfort_mps2"])
     cap_brake = float(params["cap_brake_mps2"])
@@ -534,7 +585,8 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
                    {"rule": "无预测接触、时距足够、非近距 → 安全"}, sev)
 
     a_brake = min_required_deceleration(pa, va, aa, dims_a, pb, vb, ab, dims_b, params)
-    a_lat = _a_lat_required(ttc, t_r, lane)
+    clearance = _lateral_clearance(dims_a, dims_b, params)
+    a_lat = _a_lat_required(ttc, t_r, clearance)
     bt = 0 if a_brake == 0.0 else (1 if a_brake <= a_comf else (2 if a_brake <= cap_brake else 3))
     st = 1 if a_lat <= a_lat_comf else (2 if a_lat <= cap_lat else 3)
     tier = max(1, min(bt, st))
@@ -542,17 +594,31 @@ def analyze_pair(pa, va, aa, dims_a, pb, vb, ab, dims_b, class_b, params):
     binding = "brake" if bt <= st else "steer"
     if tier == 3:
         binding = "none"
+    mb = (1.0 - float(a_brake) / cap_brake) if a_brake != float("inf") else None
+    ml = (1.0 - float(a_lat) / cap_lat) if a_lat != float("inf") else None
     a_brake_s = "∞" if a_brake == float("inf") else "%.2f" % a_brake
     a_lat_s = "∞" if a_lat == float("inf") else "%.2f" % a_lat
+    # 一维闭合（对向/追尾）的解析参考值（brake-to-stop 上界，已扣 OBB 半长）
+    a_closed = None
+    if geo in ("head-on", "rear"):
+        gap = float(np.linalg.norm(np.asarray(pb[:3, 3]) - np.asarray(pa[:3, 3])))
+        eff_gap = gap - 0.5 * (float(dims_a[2]) + float(dims_b[2]))
+        a_closed = _deceleration_closed_form_1d(eff_gap, rel_spd, t_r)
     decision = {
         "a_brake_mps2": None if a_brake == float("inf") else round(float(a_brake), 3),
         "a_lat_mps2": None if a_lat == float("inf") else round(float(a_lat), 3),
+        "lateral_clearance_m": round(float(clearance), 3),
+        "a_closed_form_mps2": None if (a_closed is None or a_closed == float("inf")) else round(float(a_closed), 3),
         "tier_brake": int(bt), "tier_steer": int(st), "tier": int(tier),
+        "margin_brake": None if mb is None else round(float(mb), 3),
+        "margin_lat": None if ml is None else round(float(ml), 3),
         "ttc_s": round(float(ttc), 3),
-        "rule": "能力包络：制动档=%d(a*=%s, 舒适%.1f/紧急%.1f)，转向档=%d(a_lat=%s, 舒适%.1f/紧急%.1f) → tier=min=%d → %s"
-                % (bt, a_brake_s, a_comf, cap_brake, st, a_lat_s, a_lat_comf, cap_lat, tier, zone),
+        "rule": "能力包络：制动档=%d(a*=%s, 舒适%.1f/紧急%.1f/余量%s)，转向档=%d(a_lat=%s, 横移%.2fm, 舒适%.1f/紧急%.1f/余量%s) → tier=min=%d → %s"
+                % (bt, a_brake_s, a_comf, cap_brake, ("%.2f" % mb if mb is not None else "∞"),
+                   st, a_lat_s, clearance, a_lat_comf, cap_lat, ("%.2f" % ml if ml is not None else "∞"),
+                   tier, zone),
     }
-    return _mk(zone, binding, fac((a_brake, a_lat, ttc)), decision, sev)
+    return _mk(zone, binding, fac((a_brake, a_lat, ttc, clearance)), decision, sev)
 
 
 def _best_of_others(tm, pa, va, aa, dims_actor, others, mot, dims, cls, params, occlusion, f):
@@ -624,7 +690,7 @@ def _heading_angle(va, vb) -> float:
 
 
 def _factors(kin, rel_spd, closing_spd, va, vb, vru, params, thw=None):
-    """拼一个可追溯的因素字典。kin = (a_brake, a_lat, ttc) 或 None。"""
+    """拼一个可追溯的因素字典。kin = (a_brake, a_lat, ttc, clearance) 或 None。"""
     f = {
         "relative_speed_mps": round(rel_spd, 3),
         "closing_speed_mps": round(closing_spd, 3),
@@ -638,11 +704,19 @@ def _factors(kin, rel_spd, closing_spd, va, vb, vru, params, thw=None):
     if thw is not None:
         f["thw_s"] = round(float(thw), 2)
     if kin is not None:
-        a_brake, a_lat, ttc = kin
+        a_brake, a_lat, ttc, clearance = kin
         f["ttc_s"] = round(float(ttc), 3)
         f["reaction_margin_s"] = round(max(0.0, float(ttc) - float(params["t_reaction_s"])), 3)
         f["a_brake_mps2"] = None if a_brake == float("inf") else round(float(a_brake), 3)
         f["a_lat_mps2"] = None if a_lat == float("inf") else round(float(a_lat), 3)
+        f["lateral_clearance_m"] = round(float(clearance), 3)
+        cb = float(params["cap_brake_mps2"])
+        cl = float(params["cap_lat_mps2"])
+        # 机动余量：1=零负担，0=用满能力，<0=能力不足（可解释的"还剩多少能力"）
+        f["margin_brake"] = None if a_brake == float("inf") else round(1.0 - float(a_brake) / cb, 3)
+        f["margin_lat"] = None if a_lat == float("inf") else round(1.0 - float(a_lat) / cl, 3)
+        _m = [x for x in (f["margin_brake"], f["margin_lat"]) if x is not None]
+        f["maneuver_margin"] = round(float(max(_m)), 3) if _m else None
     return f
 
 
@@ -667,16 +741,23 @@ def _finish_timeline(actor, others, frames, fps, params, timeline) -> Dict[str, 
     w_f, d_f = first_frame(ZONE_WARNING), first_frame(ZONE_DANGER)
     o_f, i_f = first_frame(ZONE_OCCURRENCE), first_frame(ZONE_IMPACT)
     oc_f = first_frame(ZONE_OCCLUDED)
-    # 最晚反应点：最后一个"危险区"帧（进入发生/撞击前仍可用紧急动作规避的最后时刻）；
-    # 若无危险区，退而取最后一个预警区。
+    # 最晚反应点 (Latest Reaction Point, LRP)：最后一个"危险区"帧 —— 进入发生/撞击前，
+    # 仍可用紧急动作规避的**最后时刻**；若无危险区，退而取最后一个预警区。
+    # 附上该点的 TTC 与机动余量，把 LRP 从"一个帧号"升级为"帧号 + 还剩多少时间 + 还剩多少能力"。
     latest_reaction = None
+    latest_reaction_ctx: Dict[str, Any] = {}
     for e in timeline:
         if e["zone"] == ZONE_DANGER:
             latest_reaction = e["frame"]
+            latest_reaction_ctx = e
     if latest_reaction is None:
         for e in timeline:
             if e["zone"] == ZONE_WARNING:
                 latest_reaction = e["frame"]
+                latest_reaction_ctx = e
+    _lf = latest_reaction_ctx.get("factors") or {}
+    lrp_ttc = _lf.get("ttc_s")
+    lrp_margin = _lf.get("maneuver_margin")
     # 峰值风险（0~1），用于量化整条交互的危险程度
     max_risk = max((e.get("risk_score") or 0.0 for e in timeline), default=0.0)
     event = ("collision" if i_f is not None else
@@ -697,6 +778,8 @@ def _finish_timeline(actor, others, frames, fps, params, timeline) -> Dict[str, 
             "first_occurrence_frame": o_f, "collision_frame": i_f,
             "first_occluded_frame": oc_f,
             "latest_reaction_frame": latest_reaction,
+            "latest_reaction": {"frame": latest_reaction, "ttc_s": lrp_ttc,
+                                "maneuver_margin": lrp_margin},
             "zone_durations_s": {"warning": round(dw, 2), "danger": round(dd, 2),
                                  "occurrence": round(do, 2)},
             "max_risk_score": round(max_risk, 3),
