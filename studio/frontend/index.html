@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260925q">
+    <link rel="stylesheet" href="styles.css?v=20260925r">
 </head>
 <body>
     <div id="app">
@@ -629,6 +629,15 @@
                 <span id="objectCount">物体: 0</span>
                 <span class="separator">|</span>
                 <span id="selectedCount">选中: 0</span>
+                <span class="separator">|</span>
+                <label class="status-toggle" title="显示/隐藏 3D 视图里的多阶段区域（预警区/危险区/发生区）">
+                    <input type="checkbox" id="zoneVisToggle" checked>
+                    <span>多阶段区域</span>
+                </label>
+                <label class="status-toggle" title="显示/隐藏 区域图例（左上角）">
+                    <input type="checkbox" id="zoneLegendToggle" checked>
+                    <span>图例</span>
+                </label>
             </div>
             <div class="status-right">
                 <span id="fpsDisplay">FPS: --</span>
@@ -1183,9 +1192,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260925q"></script>
-    <script src="app.js?v=20260925q"></script>
+    <script src="viewer3d.js?v=20260925r"></script>
+    <script src="app.js?v=20260925r"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260925q"></script>
+    <script src="ui-panels.js?v=20260925r"></script>
 </body>
 </html>

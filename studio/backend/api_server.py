@@ -562,6 +562,12 @@ def render_ego_frame(renderer, tm, frame_idx: int, draw_bboxes: bool = True,
         object_overrides = tm.build_object_overrides(frame_idx)
         # 自车视角下不渲染"主车实体"（否则车体会糊在镜头上）
         extra_objects = tm.build_extra_objects(frame_idx, include_ego=False)
+        # 首次渲染时整体预热 donor 外观缓存（幂等，只做一次）：
+        # 否则"拖动/跳到某个补帧帧"时，它的 donor 还没被渲染过 → 该帧物体闪一下消失。
+        try:
+            tm.prewarm_render_appearance()
+        except Exception as e:  # noqa: BLE001
+            print(f"[render] 外观缓存预热失败（不影响渲染，可能个别补帧物体缺失）: {e}")
     else:
         object_overrides = {}
         extra_objects = []

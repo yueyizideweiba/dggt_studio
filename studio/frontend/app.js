@@ -238,6 +238,8 @@ class DGGTStudio {
             }
         });
         this.viewer3d.init();
+        // 应用底部状态栏的多阶段区域/图例可见性（viewer 刚建好）
+        this._applyZoneVis();
         return this.viewer3d;
     }
 
@@ -1680,6 +1682,8 @@ class DGGTStudio {
         });
         const reloadRoadLanesBtn = document.getElementById('reloadRoadLanesBtn');
         if (reloadRoadLanesBtn) reloadRoadLanesBtn.addEventListener('click', () => this._loadRoadLanes());
+        // 底部状态栏：多阶段区域 / 图例 可见性（默认可见，选择记在 localStorage）
+        this._bindZoneVisibility();
         const roadModelSel = document.getElementById('roadModel');
         if (roadModelSel) roadModelSel.addEventListener('change', () => {
             const wrap = document.getElementById('roadPromptWrap');
@@ -2083,6 +2087,33 @@ class DGGTStudio {
         if (statusEl) {
             statusEl.innerHTML = `<div class="cc-phase-story">${stories.map(s => this._escapeHtml(s)).join('<br>')}</div>`;
         }
+    }
+
+    // 底部状态栏：多阶段区域 / 图例 的可见性开关（默认都可见；选择持久化到 localStorage）
+    _bindZoneVisibility() {
+        const KEY = 'dggt.zones.visible.v1';
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
+        this._zoneVis = { zone: saved.zone !== false, legend: saved.legend !== false };
+        const zt = document.getElementById('zoneVisToggle');
+        const lt = document.getElementById('zoneLegendToggle');
+        if (zt) zt.checked = this._zoneVis.zone;
+        if (lt) lt.checked = this._zoneVis.legend;
+        this._applyZoneVis();
+        const save = () => {
+            this._zoneVis = { zone: !!(zt && zt.checked), legend: !!(lt && lt.checked) };
+            try { localStorage.setItem(KEY, JSON.stringify(this._zoneVis)); } catch (e) { /* ignore */ }
+            this._applyZoneVis();
+        };
+        if (zt) zt.addEventListener('change', save);
+        if (lt) lt.addEventListener('change', save);
+    }
+
+    // 把当前的可见性状态应用到 3D 视图（viewer 可能还没建，建好后 ensureViewer3d 会再调一次）
+    _applyZoneVis() {
+        if (!this.viewer3d || !this._zoneVis) return;
+        this.viewer3d.setZoneVisible(this._zoneVis.zone);
+        this.viewer3d.setZoneLegendVisible(this._zoneVis.legend);
     }
 
     async _loadRoadLanes() {

@@ -630,6 +630,28 @@ body {
     color: var(--border-color);
 }
 
+/* 底部状态栏里的可见性开关（多阶段区域 / 图例） */
+.status-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    color: var(--text-secondary);
+    user-select: none;
+}
+
+.status-toggle input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    cursor: pointer;
+    accent-color: #e67e22;
+}
+
+.status-toggle:hover {
+    color: var(--text-primary);
+}
+
 /* ==================== 模态框 ==================== */
 
 .modal {

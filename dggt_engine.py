@@ -515,6 +515,43 @@ class DGGTRenderer:
                         dtype=torch.int64) for uid, part in cached], dim=0)
         return cached, True, synth
 
+    def _load_donor_part(self, view: int, donor_raw: int, real_frame: int, max_tries: int = 160):
+        """取 donor 物体的外观（高斯切片），保证任何渲染顺序都能拿到。
+
+        渲染器按帧加载 PLY 并顺手缓存外观（`_obj_appearance`），缓存**按渲染顺序**长大。
+        合成参与者 / "漏检补帧"物体是克隆 donor 外观渲染的，若用户直接跳到补帧帧
+        （其 donor 的检测帧还没被渲染过），缓存未命中 → 该物体整帧被跳过，逐帧播放时
+        表现就是"某些帧物体闪一下消失、下一帧又出现"。
+
+        这里在缓存未命中时按"离当前帧由近到远"扫描同视角的动态 PLY（全帧范围、最多
+        `max_tries` 次），找到含该 raw id 的帧就把外观缓存下来并返回。因为补帧用的 donor
+        raw id 一定来自某个真实检测帧，所以只要检测帧在范围内就一定能解析到。
+        """
+        key = (int(view), int(donor_raw))
+        part = self._obj_appearance.get(key)
+        if part is not None:
+            return part
+        n_real = int(getattr(self, "num_real_frames", 0) or 0)
+        if n_real <= 0:
+            return None
+        # 全帧范围按"离当前帧的距离"排序（先往前、再往后：历史检测帧更可能有外观）
+        order = []
+        for d in range(0, n_real):
+            for f in (int(real_frame) - d, int(real_frame) + d):
+                if 0 <= f < n_real and f not in order:
+                    order.append(f)
+            if len(order) >= int(max_tries):
+                break
+        for f in order[:int(max_tries)]:
+            try:
+                self._appearance_objects(int(f), int(view))
+            except Exception:  # noqa: BLE001
+                continue
+            part = self._obj_appearance.get(key)
+            if part is not None:
+                return part
+        return None
+
     def _load_frame_objects(self, frame_idx):
         obj_meta_path = os.path.join(self.meta_dir, f"frame_{frame_idx:04d}_objects.json")
         if not os.path.exists(obj_meta_path):
@@ -1026,28 +1063,31 @@ class DGGTRenderer:
                 donor_view = int(donor_id) // VIEW_ID_STRIDE if self.num_views > 1 else 0
                 donor_raw = int(donor_id) % VIEW_ID_STRIDE if self.num_views > 1 else int(donor_id)
                 dyn_gs = view_dyn_gs.get(donor_view)
-                if dyn_gs is None or "object_ids" not in dyn_gs:
-                    continue
-                mask = dyn_gs["object_ids"] == donor_raw
-                if mask.any():
-                    p_world, q_world = self._transform_gaussians(dyn_gs["means"][mask], dyn_gs["quats"][mask], transform)
-                    dyn_means.append(p_world)
-                    dyn_quats.append(q_world)
-                    dyn_scales.append(dyn_gs["scales"][mask])
-                    dyn_opac.append(dyn_gs["opacities"][mask])
-                    dyn_cols.append(dyn_gs["colors"][mask])
-                else:
-                    # 资产化兜底：这一帧的逐帧 PLY 里没有这个 donor（检测漏帧），
-                    # 回退到"该物体最后一次出现"的外观缓存，仍按给定位姿渲染。
-                    part = self._obj_appearance.get((int(donor_view), int(donor_raw)))
-                    if part is None:
+                # 优先用"本帧 PLY 里的该物体高斯"（最准确）
+                if dyn_gs is not None and "object_ids" in dyn_gs:
+                    mask = dyn_gs["object_ids"] == donor_raw
+                    if mask.any():
+                        p_world, q_world = self._transform_gaussians(dyn_gs["means"][mask], dyn_gs["quats"][mask], transform)
+                        dyn_means.append(p_world)
+                        dyn_quats.append(q_world)
+                        dyn_scales.append(dyn_gs["scales"][mask])
+                        dyn_opac.append(dyn_gs["opacities"][mask])
+                        dyn_cols.append(dyn_gs["colors"][mask])
                         continue
-                    p_world, q_world = self._transform_gaussians(part["means"], part["quats"], transform)
-                    dyn_means.append(p_world)
-                    dyn_quats.append(q_world)
-                    dyn_scales.append(part["scales"])
-                    dyn_opac.append(part["opacities"])
-                    dyn_cols.append(part["colors"])
+                # 资产化兜底：这一帧的逐帧 PLY 里没有这个 donor（检测漏帧 / 超范围帧），
+                # 回退到"该物体最后一次出现"的外观。**注意**：缓存是按渲染顺序长大的，
+                # 若用户直接跳到补帧（其 donor 的检测帧还没被渲染过），缓存会未命中 →
+                # 该帧物体就"闪一下消失"。所以这里改成 `_load_donor_part`：未命中时
+                # 就近视扫描同视角的动态 PLY 把外观补进缓存，保证任何渲染顺序都能渲染。
+                part = self._load_donor_part(int(donor_view), int(donor_raw), int(t))
+                if part is None:
+                    continue
+                p_world, q_world = self._transform_gaussians(part["means"], part["quats"], transform)
+                dyn_means.append(p_world)
+                dyn_quats.append(q_world)
+                dyn_scales.append(part["scales"])
+                dyn_opac.append(part["opacities"])
+                dyn_cols.append(part["colors"])
 
         # 渲染 SAM 3D 导入物体（自带 .ply 高斯，无需 donor 克隆）
         if self.sam3d_objects and not self.static_only:

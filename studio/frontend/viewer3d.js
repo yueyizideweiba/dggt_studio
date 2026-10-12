@@ -19,6 +19,9 @@ class DGGTViewer3D {
         this.selectedTrackIds = new Set();   // 视图多选集合（Shift/点击切换）
         this.showBoxes = true;
         this.showTrajectory = true;
+        // 多阶段区域（预警/危险/发生）与图例的可见性：由底部状态栏开关控制，默认可见
+        this.zoneVisible = true;
+        this.zoneLegendVisible = true;
         this.lockHeight = true;     // 轨迹/移动编辑时锁定高度（仅在地面 XZ 平面移动）
         this.trajectory = null;     // 选中 track 的轨迹 {trajectory:[{frame_idx,center,edited}], ...}
 
@@ -658,7 +661,8 @@ class DGGTViewer3D {
         }
 
         // 全局两两相态区域（任意两物体之间：预警/危险/发生 方向性区域 + 连接线）
-        if (this.pairwiseZones) {
+        // 可见性由底部状态栏的开关控制（默认都可见；关掉区域仍保留数据）
+        if (this.pairwiseZones && (this.zoneVisible || this.zoneLegendVisible)) {
             this._drawPairwiseZones(sx, sy);
         }
 
@@ -1233,6 +1237,17 @@ class DGGTViewer3D {
         this._drawOverlay();
     }
 
+    // 多阶段区域 / 图例 可见性（底部状态栏开关调用；数据保留，只控显隐）
+    setZoneVisible(v) {
+        this.zoneVisible = !!v;
+        this._drawOverlay();
+    }
+
+    setZoneLegendVisible(v) {
+        this.zoneLegendVisible = !!v;
+        this._drawOverlay();
+    }
+
     // 世界坐标两点连线（按区域着色；dash 传 [a,b] 表示虚线）
     _lineWorld(a, b, color, sx, sy, width, dash) {
         const spa = this._worldToScreen(a, this.lastC2W);
@@ -1276,7 +1291,10 @@ class DGGTViewer3D {
     _drawPairwiseZones(sx, sy) {
         if (!this.pairwiseZones) return;
         const pairs = this.pairwiseZones[this.frameIdx] || [];
-        if (!pairs.length) return;
+        if (!pairs.length) {
+            if (this.zoneLegendVisible) this._drawZoneLegend();
+            return;
+        }
         const C = {
             warning:    { stroke: 'rgba(241,196,15,0.9)', fill: 'rgba(241,196,15,0.08)', line: 'rgba(241,196,15,0.55)' },
             danger:     { stroke: 'rgba(235,126,34,0.95)', fill: 'rgba(235,126,34,0.13)', line: 'rgba(235,126,34,0.75)' },
@@ -1285,6 +1303,7 @@ class DGGTViewer3D {
         };
         const zl = { warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击' };
         for (const p of pairs) {
+            if (!this.zoneVisible) break;      // 底部栏关掉"多阶段区域"→ 不画区域，仅可留图例
             const ca = p.pos_a, cb = p.pos_b;
             const dx = cb[0] - ca[0], dz = cb[2] - ca[2];
             const dd = Math.hypot(dx, dz);
@@ -1321,7 +1340,7 @@ class DGGTViewer3D {
                 this.octx.fillText((zl[p.zone] || p.zone) + rs, sp.x * sx + 10, sp.y * sy - 10);
             }
         }
-        this._drawZoneLegend();
+        if (this.zoneLegendVisible) this._drawZoneLegend();
     }
 
     // 三区图例（覆盖层左上角）

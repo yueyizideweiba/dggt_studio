@@ -222,6 +222,8 @@ class TrackManager:
         self.track_deleted = set()
         # track_id -> 3x3 np 局部旋转偏移（全局作用于该物体所有帧，用于 360° 旋转）
         self.track_rotations = {}
+        # 外观缓存是否已整体预热（见 prewarm_render_appearance：避免补帧/合成物体闪烁）
+        self._appearance_prewarmed = False
 
         # 合成参与者（自动生成的事故参与者，原始数据中不存在）
         # synth_track_id -> {
@@ -1937,40 +1939,37 @@ class TrackManager:
 
         return overrides
 
-    def prewarm_render_appearance(self, max_frames: int = 40):
-        """渲染前预热 donor 外观缓存，避免合成参与者"整段消失"。
+    def prewarm_render_appearance(self, max_frames: int = 600, force: bool = False):
+        """预热 donor 外观缓存，避免"某些帧物体闪一下消失"（逐帧播放时的闪烁）。
 
-        渲染器按帧顺序加载 PLY 并顺手缓存每个物体的外观（`_obj_appearance`）。合成参与者
-        是"克隆 donor 高斯"渲染的，若它的 donor 在该帧还没出现过（或该帧的逐帧 PLY 里没有
-        donor），就会去查外观缓存；**缓存还没有 → 直接把该物体整帧跳过**（画面里就是
-        "参与者消失"）。事故生成经常让参与者出现在窗口最开头，而 donor 可能到窗口中部才被
-        检测到，所以这里先按"每个 donor 首次出现的帧"把缓存预热一遍。
+        渲染器按帧加载 PLY 并顺手缓存每个物体的外观（`_obj_appearance`）。合成参与者与
+        "漏检补帧"物体是**克隆 donor 高斯**渲染的：它引用的 raw id 若在**当前帧**的 PLY 里
+        没有、外观缓存里也还没有，就会被整帧跳过 —— 画面里就是"这一帧参与者没了"。
+
+        关键点是**缓存按渲染顺序长大**：只要播放/拖动是从中间某帧开始的，或者直接跳到某个
+        补帧帧，它的 donor 可能"还没被渲染过" → 未命中 → 该帧丢失、下一帧又出现（闪烁）。
+
+        因此这里不再只预热"每个 donor 的首个检测帧"，而是把**所有含动态物体的帧 × 所有视角**
+        都过一遍，把每个 raw id 的外观一次性缓存下来；之后无论从哪一帧开始渲染都能命中。
+        `force=False` 时只做一次（TrackManager 生命周期内）。
         """
-        needed = set()
-        for s in self.synthetic_tracks.values():
-            if s.get("ply_path"):
-                continue                       # SAM3D 物体自带高斯，不需要 donor 缓存
-            donor = s.get("donor_track_id")
-            if donor is None:
-                continue
-            fm = self.track_to_frames.get(int(donor)) or {}
-            if fm:
-                needed.add(int(min(fm.keys())))
-        # 真实 track 被编辑（事故生成）后也可能需要"补帧"渲染，用它们的首个检测帧预热
-        for tid in set(self.track_edits) | set(self.track_rotations):
-            if int(tid) in self.synthetic_tracks:
-                continue
-            fm = self.track_to_frames.get(int(tid)) or {}
-            if fm:
-                needed.add(int(min(fm.keys())))
-        ok = 0
-        for f in sorted(needed)[:max(1, int(max_frames))]:
-            try:
-                self.renderer._appearance_objects(int(f), 0)
-                ok += 1
-            except Exception:  # noqa: BLE001
-                continue
-        return ok
+        if getattr(self, "_appearance_prewarmed", False) and not force:
+            return 0
+        r = self.renderer
+        n_views = int(getattr(r, "num_views", 1) or 1)
+        n_real = int(getattr(r, "num_real_frames", 0) or 0)
+        cap = int(max(1, min(int(max_frames), max(n_real, 1))))
+        warmed = 0
+        for f in range(cap):
+            for v in range(n_views):
+                try:
+                    objs, _from_cache, _gs = r._appearance_objects(int(f), int(v))
+                    if objs:
+                        warmed += 1
+                except Exception:  # noqa: BLE001
+                    continue
+        self._appearance_prewarmed = True
+        return warmed
 
     def build_extra_objects(self, frame_idx, include_ego=True):
         """构建该帧需要额外渲染的合成参与者列表（克隆 donor 高斯）。
