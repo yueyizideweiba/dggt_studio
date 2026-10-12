@@ -2020,7 +2020,7 @@ class DGGTStudio {
         const totalFrames = this.state.totalFrames || 25;
         // 全场景范围拉取（不要用 currentFrame 起点的窗口，否则往前拖帧就没区域了）
         const res = await this._loadPairwiseZones(0, totalFrames);
-        const statusEl = document.getElementById('cornerCaseStatus');
+        const statusEl = document.getElementById('phaseModelStatus');
         if (res && res.error) {
             this.updateStatus('多阶段模型应用失败: ' + res.error);
             if (statusEl) statusEl.innerHTML = `<div class="cc-phase-error">应用失败: ${res.error}</div>`;
@@ -2050,7 +2050,7 @@ class DGGTStudio {
         }
         const startFrame = this.state.currentFrame;
         const numFrames = Math.max(2, (this.state.totalFrames || 25) - startFrame);
-        const stories = [];
+        const results = [];
         let okAll = true;
         for (const tid of tids) {
             try {
@@ -2068,14 +2068,14 @@ class DGGTStudio {
                 });
                 const d = await resp.json();
                 if (d.success) {
-                    stories.push(d.story);
+                    results.push(d);
                 } else {
                     okAll = false;
-                    stories.push(`T${tid}: ${d.detail || d.reason || '未知错误'}`);
+                    results.push({ actor: tid, error: d.detail || d.reason || '未知错误' });
                 }
             } catch (e) {
                 okAll = false;
-                stories.push(`T${tid}: ${e.message}`);
+                results.push({ actor: tid, error: e.message });
             }
         }
         this.state.renderCache.clear();
@@ -2083,10 +2083,44 @@ class DGGTStudio {
         await this.loadFrame(this.state.currentFrame);
         this._loadPairwiseZones(0, this.state.totalFrames || 25);
         this.updateStatus(`规避控制(${tids.length} 个物体): ${okAll ? '完成' : '部分失败'}`);
-        const statusEl = document.getElementById('cornerCaseStatus');
+        const statusEl = document.getElementById('evadeStatus');
         if (statusEl) {
-            statusEl.innerHTML = `<div class="cc-phase-story">${stories.map(s => this._escapeHtml(s)).join('<br>')}</div>`;
+            const avoidedCount = results.filter(r => r.avoided).length;
+            statusEl.innerHTML = `<div class="cc-phase-story">✅ 已对 ${tids.join(', ')} 施加规避控制：<b>${avoidedCount}/${tids.length}</b> 个物体规避成功</div>`;
         }
+        const resultEl = document.getElementById('evadeResultPanel');
+        if (resultEl) resultEl.innerHTML = results.map(r => this._renderEvasionResult(r)).join('');
+    }
+
+    // 渲染规避控制结果（学术化：能力包络最小努力原则 + 各物理量 + 决策链路）
+    _renderEvasionResult(r) {
+        if (r.error) return `<div class="cc-phase-error">T${r.actor}: ${this._escapeHtml(r.error)}</div>`;
+        const p = r.plan || {};
+        const zl = { safe: '安全', warning: '预警', danger: '危险', occurrence: '发生', impact: '撞击' };
+        const man = r.maneuver || {};
+        let manStr = '无动作';
+        if (man.type === 'brake') manStr = `制动 ${man.decel_mps2} m/s²`;
+        else if (man.type === 'steer') manStr = `转向避让 ${man.lateral_m} m（${man.dur_s}s 内完成）`;
+        const okBadge = r.avoided
+            ? '<b style="color:#2ecc71">✓ 规避成功</b>'
+            : '<b style="color:#e67e22">✗ 未规避（或仅最小化损失）</b>';
+        const rows = [
+            ['所处阶段', zl[r.before_zone] || r.before_zone],
+            ['决定因素', r.before_binding || '—'],
+            ['施加机动', manStr],
+            ['制动需求 a*', p.a_brake_req_mps2 == null ? '∞' : p.a_brake_req_mps2 + ' m/s²'],
+            ['转向需求 a_lat', p.a_lat_req_mps2 == null ? '∞' : p.a_lat_req_mps2 + ' m/s²'],
+            ['横向净空', (p.lateral_clearance_m == null ? '—' : p.lateral_clearance_m + ' m')],
+            ['TTC', (p.ttc_s == null ? '—' : p.ttc_s + ' s')],
+            ['机动余量', `μ_brake=${p.margin_brake == null ? '∞' : p.margin_brake}，μ_lat=${p.margin_lat == null ? '∞' : p.margin_lat}`],
+            ['规避前 Δv', (p.delta_v_before_mps == null ? '—' : p.delta_v_before_mps + ' m/s')],
+            ['结果', okBadge],
+        ];
+        let html = `<div class="cc-phase-title">T${r.actor} · 规避控制</div>`;
+        html += '<div class="cc-phase-factors">' + rows.map(([k, v]) => `${k}: ${v}`).join('，') + '</div>';
+        html += `<div class="cc-phase-story">${this._escapeHtml(r.story || '')}</div>`;
+        if (p.principle) html += `<div class="cc-phase-bounds">决策原则：${this._escapeHtml(p.principle)}</div>`;
+        return html;
     }
 
     // 底部状态栏：多阶段区域 / 图例 的可见性开关（默认都可见；选择持久化到 localStorage）

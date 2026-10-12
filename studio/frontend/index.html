@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260925r">
+    <link rel="stylesheet" href="styles.css?v=20260925s">
 </head>
 <body>
     <div id="app">
@@ -201,13 +201,6 @@
                             <button id="generateCornerCaseBtn" class="btn btn-primary btn-block">生成事故轨迹</button>
                         </div>
                         <div class="button-row">
-                            <button id="evadeSelectedBtn" class="btn btn-secondary btn-block">对选中物体执行规避控制</button>
-                        </div>
-                        <div class="form-group">
-                            <label class="cc-desc">多阶段模型范围：在左侧物体列表<b>多选</b>（Shift+点击），点下方「应用」；不选任何物体 = 全局所有物体</label>
-                            <button id="applyPairwiseSelectionBtn" class="btn btn-secondary btn-block">应用多阶段模型到选中物体</button>
-                        </div>
-                        <div class="button-row">
                             <button id="clearCornerCaseBtn" class="btn btn-secondary btn-block">清除生成的轨迹</button>
                         </div>
                         <div class="button-row">
@@ -223,7 +216,34 @@
                             <button id="carlaQuickBtn" class="btn btn-secondary btn-block">送进 CARLA 仿真（看事故回放 / 实时）</button>
                         </div>
                         <div id="cornerCaseStatus" class="cc-status"></div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-phase-model">
+                    <div class="panel-header">
+                        <h3>多阶段模型（预警 / 危险 / 发生）</h3>
+                    </div>
+                    <div class="corner-case-panel">
+                        <div class="form-group">
+                            <label class="cc-desc">在左侧物体列表<b>多选</b>（Shift+点击）后点「应用」；不选任何物体 = 全局所有物体</label>
+                            <button id="applyPairwiseSelectionBtn" class="btn btn-secondary btn-block">应用多阶段模型到选中物体</button>
+                        </div>
+                        <div id="phaseModelStatus" class="cc-status"></div>
                         <div id="cornerPhasePanel" class="cc-phase-panel"></div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-evasion">
+                    <div class="panel-header">
+                        <h3>规避控制（重新规划避让路线）</h3>
+                    </div>
+                    <div class="corner-case-panel">
+                        <div class="form-group">
+                            <label class="cc-desc">生成事故后，在左侧列表或 3D 视图里<b>选中事故中的一个物体</b>，点下方按钮即可重新规划一条<b>避免该事故</b>的路线（根据多阶段模型施加最优规避动作）</label>
+                            <button id="evadeSelectedBtn" class="btn btn-primary btn-block">对选中物体执行规避控制</button>
+                        </div>
+                        <div id="evadeStatus" class="cc-status"></div>
+                        <div id="evadeResultPanel" class="cc-phase-panel"></div>
                     </div>
                 </div>
 
@@ -1192,9 +1212,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260925r"></script>
-    <script src="app.js?v=20260925r"></script>
+    <script src="viewer3d.js?v=20260925s"></script>
+    <script src="app.js?v=20260925s"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260925r"></script>
+    <script src="ui-panels.js?v=20260925s"></script>
 </body>
 </html>

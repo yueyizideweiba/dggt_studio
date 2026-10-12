@@ -953,8 +953,13 @@ def _heading_unit(va):
     return h / n if n > 1e-6 else np.array([0.0, 0.0, 1.0])
 
 
-def _brake_evasion(tm, actor, frames, fps, begin_frame, decel, va):
-    """沿当前航向以恒定减速度制动（标准 AEB 原语），改写 actor 从 begin_frame 起的轨迹。"""
+def _brake_evasion(tm, actor, frames, fps, begin_frame, decel, va, t_reaction=0.0):
+    """沿当前航向以恒定减速度制动（标准 AEB 原语），改写 actor 从 begin_frame 起的轨迹。
+
+    **反应延迟 t_reaction**：反应期内保持原速，之后才开始制动——这与 `min_required_deceleration`
+    里"反应 t_r 后再以 a 制动"的假设严格一致，保证"模型说不可规避(occurrence)"与
+    "规避后仍相撞"的口径一致（不会出现"发生区却规避成功"的自相矛盾）。
+    """
     spd = float(np.linalg.norm(va))
     if spd < 1e-3:
         return
@@ -964,20 +969,32 @@ def _brake_evasion(tm, actor, frames, fps, begin_frame, decel, va):
         return
     pose0 = np.asarray(pose0, dtype=np.float64)
     c0 = pose0[:3, 3].copy()
+    t_r = max(0.0, float(t_reaction))
     t_brake = spd / max(1e-6, float(decel))
-    d_stop = spd * t_brake - 0.5 * float(decel) * t_brake * t_brake
+    d_react = spd * t_r
+    d_brake = 0.5 * spd * t_brake   # v²/(2a) = 0.5*v*(v/a)
     for f in frames:
         if int(f) < int(begin_frame):
             continue
-        dt = (int(f) - int(begin_frame)) / float(fps)
-        d = d_stop if dt >= t_brake else (spd * dt - 0.5 * float(decel) * dt * dt)
+        t = (int(f) - int(begin_frame)) / float(fps)
+        if t <= t_r:
+            d = spd * t
+        else:
+            tb = t - t_r
+            d = d_react + (d_brake if tb >= t_brake else (spd * tb - 0.5 * float(decel) * tb * tb))
         c = c0 + head * d
         c[1] = c0[1]
         _local_write_pose(tm, actor, int(f), _pose_with_center(pose0, c))
 
 
-def _steer_evasion(tm, actor, frames, fps, begin_frame, va, lateral, direction=None):
-    """横向 smoothstep 变道（转向避让）：纵向保持原速，横向在 ~0.8s 内平移一个车道。"""
+def _steer_evasion(tm, actor, frames, fps, begin_frame, va, lateral, direction=None,
+                   dur=0.8, t_reaction=0.0):
+    """横向 smoothstep 变道（转向避让）：纵向保持原速，横向在 `dur` 秒内平移 `lateral`。
+
+    平滑曲线用 smoothstep（C¹ 连续，位移/速度/加速度都连续），这是转向避让的标准
+    横移剖面；`dur` 由"在 TTC−t_r 内完成横移"反推，保证在接触前完成避让。
+    `t_reaction` 是反应延迟：反应期内保持原速、不横移，之后才开始变道。
+    """
     head = _heading_unit(va)
     if direction is None:
         direction = _ground_right(head)
@@ -990,12 +1007,16 @@ def _steer_evasion(tm, actor, frames, fps, begin_frame, va, lateral, direction=N
         return
     pose0 = np.asarray(pose0, dtype=np.float64)
     c0 = pose0[:3, 3].copy()
-    dur = 0.8
+    dur = max(0.2, float(dur))
+    t_r = max(0.0, float(t_reaction))
     for f in frames:
         if int(f) < int(begin_frame):
             continue
         t = (int(f) - int(begin_frame)) / float(fps)
-        u = min(1.0, t / dur)
+        if t <= t_r:
+            u = 0.0
+        else:
+            u = min(1.0, (t - t_r) / dur)
         sm = u * u * (3.0 - 2.0 * u)      # smoothstep
         c = c0 + head * (spd * t) + direction * (float(lateral) * sm)
         c[1] = c0[1]
@@ -1042,18 +1063,63 @@ def _pair_collides_window(tm, a, b, frames) -> bool:
     return False
 
 
+def _maneuver_decision(before_zone, a_brake_req, a_lat_req, cap_brake, cap_lat,
+                       margin_brake, margin_lat, action, steer_penalty=0.15):
+    """能力包络上的**风险加权最小成本**机动决策（可解释、可写论文）。
+
+    对每个机动定义"努力比" e = 1 - μ = 所需 / 能力，再加**机动风险惩罚**：
+
+        cost_brake = e_brake
+        cost_steer = e_lat + c_steer          (c_steer ≥ 0)
+
+    其中 c_steer 是**换道风险惩罚**：转向要横向进入相邻车道交通，风险和不确定性高于"在本车道
+    内减速"，所以只有在"转向明显更省力（cost 更低）"或"制动不可行"时才选转向。这与真实
+    AEB"制动优先、转向兜底"的分级响应一致，也是把"可解释的工程偏好"显式写进目标函数的做法。
+
+    取 cost 更小者；两者都不行（e>1 或需求=∞）即不可避免碰撞态 ICS → 全力制动最小化 Δv。
+    返回 (action, 原则说明)。
+    """
+    if action != "auto":
+        return action, "外部显式指定机动：%s" % action
+    if before_zone in (ZONE_SAFE, ZONE_NA, ZONE_IMPACT, ZONE_OCCLUDED):
+        return "none", "处于【%s】阶段，无需规避（无预测冲突/已接触/不可见）" % before_zone
+    brake_ok = a_brake_req is not None and 0.0 < float(a_brake_req) <= float(cap_brake)
+    steer_ok = a_lat_req is not None and float(a_lat_req) <= float(cap_lat)
+    if before_zone == ZONE_OCCURRENCE or (not brake_ok and not steer_ok):
+        return "brake", "发生区（ICS）：制动与转向都不可解 → 全力制动最小化 Δv"
+
+    def _cost(ok, margin, penalty):
+        return (1.0 - float(margin) + float(penalty)) if (ok and margin is not None) else float("inf")
+    cost_brake = _cost(brake_ok, margin_brake, 0.0)
+    cost_steer = _cost(steer_ok, margin_lat, float(steer_penalty))
+    pick = "brake" if cost_brake <= cost_steer else "steer"
+    return pick, ("风险加权最小成本：cost_brake=%s vs cost_steer=%s（含换道风险惩罚 c_steer=%.2f）→ %s"
+                  % ("∞" if cost_brake == float("inf") else round(cost_brake, 3),
+                     "∞" if cost_steer == float("inf") else round(cost_steer, 3),
+                     float(steer_penalty), pick))
+
+
 def apply_evasion(tm, actor, others, frames, fps, params=None, action="auto",
-                  steer_lateral_m=None):
-    """对某辆车执行**规避控制**：根据它当前所处的相态，施加制动/转向，改写其轨迹，
-    并验证是否规避成功——这正是自动驾驶训练时要学的"每个阶段该做什么反应"。
+                  steer_lateral_m=None, safety_factor=1.15, steer_penalty=0.15):
+    """对某辆车执行**规避控制**：由多阶段模型直接给出"每阶段该做什么、做多少"的最优动作，
+    改写其轨迹并验证是否规避成功——这正是自动驾驶训练时要学的响应策略。
+
+    与旧版的区别（学术化/效果优化）：
+      - **制动量 = 精确所需 a\* × 安全系数**（二分精确解），而不是一刀切用 a_comfort / a_emerg；
+        预警区就用"刚好够"的舒适减速，危险区用"刚好够"的紧急减速，既不刹过头、也不刹不够。
+      - **转向量 = OBB 感知的横向净空**（而非固定一个车道宽），转向时长由 `TTC - t_r` 反推，
+        保证在接触前完成横移。
+      - **主机动选择 = 风险加权最小成本**（努力比 + 换道风险惩罚，制动优先），与区域判定同源，
+        决策链路可追溯。
 
     阶段 → 反应：
-      warning    → 舒适制动(a_comfort)，可完全规避
-      danger     → 紧急制动(cap_brake) 或转向(binding=steer)，可完全规避
-      occurrence → 全力制动(最小化损失；不可避免，只能降低 Δv)
-      impact     → 无规避动作（已接触）
+      warning    → 舒适制动（精确 a*，≤ a_comfort）或转向
+      danger     → 紧急制动（精确 a*，≤ cap_brake）或转向
+      occurrence → 全力制动（不可避免碰撞态，最小化 Δv）
+      impact     → 无动作
 
-    返回 {ok, action, maneuver, before_zone, after_zone, avoided, story}。
+    返回 {ok, action, maneuver, plan, before_zone, after_zone, before_collides,
+          after_collides, avoided, story}。
     """
     params = _prepare_params(params)
     frames = [int(f) for f in frames]
@@ -1076,45 +1142,73 @@ def apply_evasion(tm, actor, others, frames, fps, params=None, action="auto",
     before_zone = best["zone"]
     binding = best.get("binding") or "brake"
     worst_other = best.get("other")
-    # 注意：必须在**施加规避之前**测"规避前是否相撞"
+    fac = best.get("factors") or {}
     before_collides = _pair_collides_window(tm, actor, worst_other, frames)
 
-    # 决定动作
-    if action == "auto":
-        if before_zone in (ZONE_SAFE, ZONE_NA, ZONE_IMPACT, ZONE_OCCLUDED):
-            action = "none"
-        elif before_zone == ZONE_WARNING:
-            action = "brake"
-        elif before_zone == ZONE_DANGER:
-            action = "steer" if binding == "steer" else "brake"
-        else:  # occurrence
-            action = "brake"
+    cap_brake = float(params["cap_brake_mps2"])
+    cap_lat = float(params["cap_lat_mps2"])
+    a_brake_req = fac.get("a_brake_mps2")
+    a_lat_req = fac.get("a_lat_mps2")
+    clearance = fac.get("lateral_clearance_m") or float(params["lane_width_m"])
+    ttc = fac.get("ttc_s")
+    margin_brake = fac.get("margin_brake")
+    margin_lat = fac.get("margin_lat")
+    v_rel_before = float(fac.get("delta_v_mps") or 0.0)
+
+    action, principle = _maneuver_decision(
+        before_zone, a_brake_req, a_lat_req, cap_brake, cap_lat,
+        margin_brake, margin_lat, action, steer_penalty=float(steer_penalty))
 
     maneuver = {"type": "none"}
-    decel = 0.0
+    a_applied = None
+    lateral_applied = None
+    dur_steer = None
     if action == "brake":
-        decel = float(params["cap_brake_mps2"]) if before_zone in (ZONE_DANGER, ZONE_OCCURRENCE) \
-            else float(params["a_comfort_mps2"])
-        _brake_evasion(tm, actor, frames, fps, f0, decel, va)
-        maneuver = {"type": "brake", "decel_mps2": decel}
+        if a_brake_req is not None and float(a_brake_req) > 0:
+            a_applied = round(min(float(a_brake_req) * float(safety_factor), cap_brake), 3)
+        else:
+            a_applied = round(cap_brake, 3)   # occurrence / 无解：全力制动
+        _brake_evasion(tm, actor, frames, fps, f0, a_applied, va,
+                       t_reaction=float(params["t_reaction_s"]))
+        maneuver = {"type": "brake", "decel_mps2": a_applied}
     elif action == "steer":
-        lat = float(steer_lateral_m or params["lane_width_m"])
-        _steer_evasion(tm, actor, frames, fps, f0, va, lat)
-        maneuver = {"type": "steer", "lateral_m": lat}
+        lat = float(steer_lateral_m or clearance)
+        t_avail = (float(ttc) - float(params["t_reaction_s"])) if ttc is not None else 1.0
+        dur_steer = float(min(1.2, max(0.3, 0.8 * t_avail))) if t_avail > 0 else 0.8
+        _steer_evasion(tm, actor, frames, fps, f0, va, lat, dur=dur_steer,
+                       t_reaction=float(params["t_reaction_s"]))
+        lateral_applied = round(lat, 3)
+        maneuver = {"type": "steer", "lateral_m": lateral_applied, "dur_s": round(dur_steer, 3)}
 
-    # 验证：看"整个窗口内是否还会相撞"（不能只看 f0，制动后 f0 位置没变、仍会判 danger）
     after_zone, after_binding = _recompute_zone(tm, actor, others, frames, fps, params)
     after_collides = _pair_collides_window(tm, actor, worst_other, frames)
     avoided = bool(before_collides and not after_collides)
+
+    plan = {
+        "zone": before_zone, "binding": binding, "worst_other": worst_other,
+        "a_brake_req_mps2": None if a_brake_req is None else round(float(a_brake_req), 3),
+        "a_lat_req_mps2": None if a_lat_req is None else round(float(a_lat_req), 3),
+        "lateral_clearance_m": round(float(clearance), 3),
+        "ttc_s": None if ttc is None else round(float(ttc), 3),
+        "margin_brake": margin_brake, "margin_lat": margin_lat,
+        "delta_v_before_mps": round(v_rel_before, 3),
+        "chosen": action,
+        "a_applied_mps2": a_applied,
+        "lateral_applied_m": lateral_applied,
+        "steer_dur_s": dur_steer,
+        "principle": principle,
+    }
 
     zl = {ZONE_SAFE: "安全", ZONE_WARNING: "预警", ZONE_DANGER: "危险",
           ZONE_OCCURRENCE: "发生", ZONE_IMPACT: "撞击"}
     mdesc = maneuver["type"]
     if maneuver["type"] == "brake":
-        mdesc = "制动 %.1f m/s²" % maneuver["decel_mps2"]
+        mdesc = "制动 %.2f m/s²" % maneuver["decel_mps2"]
     elif maneuver["type"] == "steer":
-        mdesc = "转向避让 %.1f m" % maneuver["lateral_m"]
-    if avoided:
+        mdesc = "转向避让 %.2f m（%.1fs 内完成）" % (maneuver["lateral_m"], maneuver["dur_s"])
+    if action == "none":
+        outcome = "无需规避（%s 阶段）" % zl.get(before_zone, before_zone)
+    elif avoided:
         outcome = "规避成功（窗口内不再相撞）"
     elif before_zone == ZONE_OCCURRENCE and after_collides:
         outcome = "已最小化损失（发生区不可避免，只能降低 Δv）"
@@ -1127,6 +1221,7 @@ def apply_evasion(tm, actor, others, frames, fps, params=None, action="auto",
     story = "在【%s】阶段对 T%d 施加【%s】：%s" % (
         zl.get(before_zone, before_zone), actor, mdesc, outcome)
     return {"ok": True, "actor": actor, "action": action, "maneuver": maneuver,
+            "plan": plan,
             "before_zone": before_zone, "after_zone": after_zone,
             "before_binding": binding, "after_binding": after_binding,
             "before_collides": bool(before_collides), "after_collides": bool(after_collides),
