@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260925o">
+    <link rel="stylesheet" href="styles.css?v=20260925p">
 </head>
 <body>
     <div id="app">
@@ -276,6 +276,9 @@
                             <button id="roadVehicleBtn" class="btn btn-primary btn-block">在选中的车道上放置车辆</button>
                         </div>
                         <div class="button-row">
+                            <button id="roadPickLaneBtn" class="btn btn-secondary btn-block">拾取车道（在视图里点选车道）</button>
+                        </div>
+                        <div class="button-row">
                             <button id="roadPickStartBtn" class="btn btn-secondary half">拾取起点</button>
                             <button id="roadPickEndBtn" class="btn btn-secondary half">拾取终点</button>
                         </div>
@@ -283,7 +286,7 @@
                             <button id="roadRouteBtn" class="btn btn-primary half">自动算路并放置</button>
                             <button id="roadClearRouteBtn" class="btn btn-secondary half">清除路线</button>
                         </div>
-                        <div class="cc-hint">提示：点「拾取起点/终点」后在 3D 视图里点击地面即可（自动吸附到最近车道中心线）。</div>
+                        <div class="cc-hint">提示：<b>拾取车道</b>→在 3D 视图里点一下目标车道即可选中并放置；<b>拾取起点/终点</b>→在视图里点两下，自动沿车道算路（只在必要时变道，终点会自动选与起点同向的车道，避免不必要掉头）。</div>
                         <div class="button-row">
                             <button id="reloadRoadLanesBtn" class="btn btn-secondary btn-block">重新加载车道列表</button>
                         </div>
@@ -1180,9 +1183,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260925o"></script>
-    <script src="app.js?v=20260925o"></script>
+    <script src="viewer3d.js?v=20260925p"></script>
+    <script src="app.js?v=20260925p"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260925o"></script>
+    <script src="ui-panels.js?v=20260925p"></script>
 </body>
 </html>

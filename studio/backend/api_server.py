@@ -3820,14 +3820,21 @@ async def road_vehicle(request: RoadVehicleRequest):
 
 
 class RoadPickRequest(BaseModel):
-    """视图点选：世界坐标 (x,z) → 最近车道 + 弧长（用于选起终点）。"""
+    """视图点选：世界坐标 (x,z) → 最近车道 + 弧长（用于选起终点/选车道）。
+
+    `prefer_dir` 用于"方向优先吸附"：当若干条车道离点击点几乎一样近（差在
+    `prefer_dist_tol` 米内）时，优先挑**行驶方向与 prefer_dir 一致**的那条。否则会
+    因为对向车道中心线只近了 0.1m 就吸附到对向车道，导致路线必须掉头（不符合交通规则）。
+    """
     scene_id: str
     xz: List[float]
+    prefer_dir: Optional[List[float]] = None
+    prefer_dist_tol: float = 2.5
 
 
 @app.post("/api/road/nearest_lane")
 async def road_nearest_lane(request: RoadPickRequest):
-    """把一个世界坐标点吸附到最近的车道中心线，返回 lane_id / 弧长 / 距离。"""
+    """把一个世界坐标点吸附到最近的车道中心线，返回 lane_id / 弧长 / 距离 / 行驶方向。"""
     import road_rules
     from road_rules import project_arc
     renderer = get_scene_or_404(request.scene_id)
@@ -3835,7 +3842,9 @@ async def road_nearest_lane(request: RoadPickRequest):
     if rm is None or not getattr(rm, "available", False):
         raise HTTPException(status_code=400, detail="本场景没有可用的高精地图")
     q = np.asarray(request.xz, dtype=np.float64)[:2]
-    best, best_d, best_pt = None, 1e18, None
+
+    # 1) 收集每条车道的最近点（距离、索引、方向）
+    cands = []          # (dist, lid, P, j)
     for lid in rm.lane_ids():
         P = rm.lane_pts(lid)
         if P is None or len(P) < 2:
@@ -3843,14 +3852,48 @@ async def road_nearest_lane(request: RoadPickRequest):
         P = np.asarray(P, dtype=np.float64)
         dd = np.linalg.norm(P[:, [0, 2]] - q, axis=1)
         j = int(np.argmin(dd))
-        if float(dd[j]) < best_d:
-            best, best_d, best_pt = lid, float(dd[j]), P
-    if best is None:
+        cands.append((float(dd[j]), lid, P, j))
+    if not cands:
         raise HTTPException(status_code=400, detail="附近没有车道")
-    return {"success": True, "lane_id": str(best), "dist_m": round(best_d, 2),
-            "arc": round(float(project_arc(best_pt, q)), 2),
-            "length_m": round(float(rm.lane_length(best)), 1),
-            "snap": [round(float(v), 2) for v in best_pt[int(np.argmin(np.linalg.norm(best_pt[:, [0, 2]] - q, axis=1)))][:3]]}
+    best_d = min(c[0] for c in cands)
+
+    # 2) 方向优先：在"几乎一样近"的车道里挑与 prefer_dir 同向的
+    def _dir_of(c):
+        _d, _lid, P, j = c
+        i0 = max(0, j - 3)
+        i1 = min(len(P) - 1, j + 3)
+        v = P[i1][[0, 2]] - P[i0][[0, 2]]
+        n = float(np.linalg.norm(v))
+        return (v / n) if n > 1e-6 else np.array([1.0, 0.0])
+
+    chosen, note = None, None
+    if request.prefer_dir is not None and len(request.prefer_dir) >= 2:
+        pd = np.asarray(request.prefer_dir, dtype=np.float64)[:2]
+        n = float(np.linalg.norm(pd))
+        if n > 1e-6:
+            pd = pd / n
+            near = [c for c in cands if c[0] <= best_d + float(request.prefer_dist_tol)]
+            scored = sorted(near, key=lambda c: (-float(np.dot(_dir_of(c), pd)), c[0]))
+            if scored:
+                chosen = scored[0]
+                if chosen[0] > best_d + 1e-6:
+                    note = ("方向优先吸附：在 %.1fm 内优先选了与起点同向的车道 %s"
+                            "（最近的 %s 为对向/异向车道，直取会导致掉头）"
+                            % (float(request.prefer_dist_tol), chosen[1],
+                               min(near, key=lambda c: c[0])[1]))
+    if chosen is None:
+        chosen = min(cands, key=lambda c: c[0])
+    best_d, best, best_pt, best_j = chosen[0], chosen[1], chosen[2], chosen[3]
+    dvec = _dir_of(chosen)
+    out = {"success": True, "lane_id": str(best), "dist_m": round(best_d, 2),
+           "arc": round(float(project_arc(best_pt, q)), 2),
+           "length_m": round(float(rm.lane_length(best)), 1),
+           "dir": [round(float(dvec[0]), 3), round(float(dvec[1]), 3)],
+           "lane_pts": [[round(float(v), 2) for v in p[:3]] for p in np.asarray(best_pt)[::2]],
+           "snap": [round(float(v), 2) for v in best_pt[best_j][:3]]}
+    if note:
+        out["note"] = note
+    return out
 
 
 class RoadRouteRequest(BaseModel):

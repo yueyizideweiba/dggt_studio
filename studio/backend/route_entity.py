@@ -260,10 +260,57 @@ def _smooth_polyline(P: np.ndarray, passes: int = 3, window: int = 12) -> np.nda
     return p
 
 
+def _lane_mean_dir(road_model, lid):
+    """车道的整体行驶方向（单位向量，XZ 平面）。曲线车道取各段方向的平均，比端点方向稳。"""
+    try:
+        P = road_model.lane_pts(lid)
+        if P is None or len(P) < 2:
+            return None
+        P = np.asarray(P, dtype=np.float64)
+        v = np.diff(P[:, [0, 2]], axis=0)
+        n = np.linalg.norm(v, axis=1, keepdims=True)
+        v = np.divide(v, np.maximum(n, 1e-9))
+        s = v.sum(axis=0)
+        sl = float(np.linalg.norm(s))
+        return (s / sl) if sl > 1e-6 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _lane_conn(road_model, a, b):
+    """后继边 a→b 的几何连续性：(gap, dot)；(gap, dot) 判定失败返回 (None, None)。
+
+    gap = a 末点到 b 首点的距离；dot = 两段方向余弦（1=直行，-1=掉头/反向车道）。
+
+    地图的 `exit_lanes` 有时会把**平行的相邻车道**也列成后继（例如 81→85 其实是并排的
+    两条车道），硬接会得到"开到末端再倒回 50m"的 177° 折角，这里用 dot 否决掉。
+    """
+    try:
+        PA = road_model.lane_pts(a)
+        PB = road_model.lane_pts(b)
+        if PA is None or PB is None or len(PA) < 2 or len(PB) < 2:
+            return None, None
+        PA = np.asarray(PA, dtype=np.float64)
+        PB = np.asarray(PB, dtype=np.float64)
+        gap = float(np.linalg.norm(PA[-1][[0, 2]] - PB[0][[0, 2]]))
+        dot = float(np.dot(_dir_at_end(PA), _dir_at_start(PB)))
+        return gap, dot
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = True,
-                 max_lanes: int = 25, lane_change_cost: float = 14.0,
-                 turn_penalty: float = 8.0):
+                 max_lanes: int = 25, lane_change_cost: float = 30.0,
+                 turn_penalty: float = 8.0, lane_change_len: float = 18.0,
+                 gap_penalty: float = 0.5):
     """车道图最短路：节点=车道；边 = 后继（含转弯代价）+ 邻道变道（变道代价）。
+
+    **代价必须"按米记账"**（这是本函数的关键约束）：
+      后继边 a→b 代价 ≈ 走完整条车道 a 的真实行驶距离 `lane_length(a)`；
+      变道边 a→b 代价 ≈ 变道横向过渡实际前进的 `lane_change_len` 米 + 变道机动惩罚。
+    早期版本把变道代价写成常数 14、而后继代价是整条车道长度（几十米），于是 A* 会
+    **为了省掉车道长度而疯狂变道**（"从起点一路变道变到终点"），完全脱离道路走向。
+    现在变道每米的代价恒高于直行 → 只有"必要变道"（目标车道不连通）才会被选中。
 
     返回 ([(lane_id, edge_kind), ...], cost)；不可达返回 (None, None)。
     """
@@ -272,41 +319,32 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
     if a == b:
         return [(a, "start")], 0.0
 
-    def lane_mid(lid):
+    def lane_pts2(lid):
         P = road_model.lane_pts(lid)
         if P is None or len(P) == 0:
             return None
-        return np.asarray(P, dtype=np.float64)[len(P) // 2][[0, 2]]
+        return np.asarray(P, dtype=np.float64)
 
-    tgt = lane_mid(b)
+    Pb = lane_pts2(b)
+    tgt = Pb[len(Pb) // 2][[0, 2]] if Pb is not None else None
+
+    _hcache: Dict[str, float] = {}
 
     def h(lid):
-        m = lane_mid(lid)
-        if m is None or tgt is None:
-            return 0.0
-        return float(np.linalg.norm(m - tgt)) * 0.3   # 轻量启发
+        """可采纳启发：本车道任意点到目标车道中点的最小欧氏距离 × 0.9。
 
-    def _geom_ok(a, b):
-        """后继边几何连续性：a 的末点要靠近 b 的首点，且两者方向一致。
-
-        地图的 `exit_lanes` 有时会把**平行的相邻车道**也列成后继（例如 81→85 其实是并排的
-        两条车道），硬接会得到"开到末端再倒回 50m"的 177° 折角。这里用几何否决掉。
+        任何从本车道到目标的路线至少要走过这段直线距离，所以不会高估。
         """
-        try:
-            PA = road_model.lane_pts(a)
-            PB = road_model.lane_pts(b)
-            if PA is None or PB is None or len(PA) < 2 or len(PB) < 2:
-                return False
-            PA = np.asarray(PA, dtype=np.float64)
-            PB = np.asarray(PB, dtype=np.float64)
-            gap = float(np.linalg.norm(PA[-1][[0, 2]] - PB[0][[0, 2]]))
-            if gap > 22.0:
-                return False
-            da = _dir_at_end(PA)
-            db = _dir_at_start(PB)
-            return float(np.dot(da, db)) > 0.3
-        except Exception:  # noqa: BLE001
-            return False
+        if tgt is None:
+            return 0.0
+        if lid in _hcache:
+            return _hcache[lid]
+        P = lane_pts2(lid)
+        val = 0.0
+        if P is not None:
+            val = float(np.min(np.linalg.norm(P[:, [0, 2]] - tgt, axis=1))) * 0.9
+        _hcache[lid] = val
+        return val
 
     def edges(lid):
         out = []
@@ -314,9 +352,13 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
             for nxt in road_model.successors(lid):
                 if str(nxt) == lid:
                     continue
-                if not _geom_ok(lid, str(nxt)):
+                gap, dot = _lane_conn(road_model, lid, str(nxt))
+                if gap is None or gap > 22.0 or dot <= 0.3:
                     continue           # 几何不连续 → 不是真正的后继（多半是平行邻道）
-                out.append((str(nxt), float(road_model.lane_length(lid)) + float(turn_penalty), "successor"))
+                # 实际行驶距离 = 整条车道；转弯按角度加惩罚；路口连接缺口越长越可疑
+                turn = float(turn_penalty) * float(1.0 - dot)
+                cost = float(road_model.lane_length(lid)) + turn + float(gap_penalty) * gap
+                out.append((str(nxt), cost, "successor"))
         except Exception:  # noqa: BLE001
             pass
         if allow_lane_change:
@@ -325,8 +367,18 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
                     nb = road_model.neighbor_lane(lid, side)
                 except Exception:  # noqa: BLE001
                     nb = None
-                if nb and nb.get("lane"):
-                    out.append((str(nb["lane"]), float(lane_change_cost), "lane_change:" + side))
+                if not (nb and nb.get("lane")):
+                    continue
+                nb_id = str(nb["lane"])
+                # 变道只能并入**同向**车道：双向道路的"左邻道"往往是对向车道，
+                # 并入它等于逆行，而且几何上会出现 180° 掉头尖点（发卡弯）。
+                da = _lane_mean_dir(road_model, lid)
+                db = _lane_mean_dir(road_model, nb_id)
+                if da is None or db is None or float(np.dot(da, db)) <= 0.3:
+                    continue
+                # 变道只前进 lane_change_len 米 → 代价按"米 + 机动惩罚"记账
+                out.append((nb_id, float(lane_change_len) + float(lane_change_cost),
+                            "lane_change:" + side))
         return out
 
     pq = [(h(a), 0.0, a, [])]
@@ -345,6 +397,42 @@ def _astar_lanes(road_model, start_lane, end_lane, allow_lane_change: bool = Tru
                 best[nxt] = nc
                 heapq.heappush(pq, (nc + h(nxt), nc, nxt, path + [(nxt, kind)]))
     return None, None
+
+
+def _remove_backtracks(P: np.ndarray, max_turn_deg: float = 150.0, passes: int = 4) -> np.ndarray:
+    """删除折线里的"折返尖点"（发卡弯）。
+
+    路口附近车道中心线可能首尾相接得很别扭（A 的末点在 B 上更靠后、或两条邻道几乎反向），
+    拼接后会出现"往前十几厘米又倒回来"的尖点：既不合法（等于掉头），也会让轨迹曲率爆表。
+    这里把转角 > `max_turn_deg` 的顶点删掉——真实路口转弯不会超过这个角度，
+    而且折返必然使路径变长，删掉一定更短。
+    """
+    p = [np.asarray(v, dtype=np.float64) for v in np.asarray(P, dtype=np.float64)]
+    if len(p) < 4:
+        return np.asarray(p, dtype=np.float64)
+    thr = math.cos(math.radians(float(max_turn_deg)))
+    for _ in range(max(1, int(passes))):
+        if len(p) < 4:
+            break
+        out = [p[0]]
+        removed = 0
+        i = 1
+        while i < len(p) - 1:
+            a, b, c = out[-1], p[i], p[i + 1]
+            v1 = b[[0, 2]] - a[[0, 2]]
+            v2 = c[[0, 2]] - b[[0, 2]]
+            n1, n2 = float(np.linalg.norm(v1)), float(np.linalg.norm(v2))
+            if n1 > 1e-6 and n2 > 1e-6 and float(np.dot(v1, v2)) / (n1 * n2) < thr:
+                removed += 1          # 折返尖点 → 跳过 b
+                i += 1
+                continue
+            out.append(b)
+            i += 1
+        out.append(p[-1])
+        p = out
+        if not removed:
+            break
+    return np.asarray(p, dtype=np.float64)
 
 
 def _smoothstep(u: float) -> float:
@@ -368,21 +456,23 @@ def _append_pts(pts: List[np.ndarray], seg: np.ndarray, sample_step: float):
 
 def plan_route(road_model, start_lane, start_arc: float, end_lane, end_arc: float,
                allow_lane_change: bool = True, max_lanes: int = 25,
-               lane_change_cost: float = 14.0, turn_penalty: float = 8.0,
+               lane_change_cost: float = 30.0, turn_penalty: float = 8.0,
                lane_change_len: float = 18.0,
-               sample_step: float = 1.0, smooth_passes: int = 4,
-               smooth_window: int = 20) -> Optional[Dict[str, Any]]:
+               sample_step: float = 1.0, smooth_passes: int = 3,
+               smooth_window: int = 12) -> Optional[Dict[str, Any]]:
     """起终点自动算路：给定起/终点所在车道与弧长，规划一条**严格沿车道中心线**的路线。
 
-    车道图 = 后继边（含转弯代价）+ 邻道变道边（`left/right_neighbors`，带几何复核）。
-    关键：**变道在"当前位置"做横向平滑过渡**（不是走到车道末端再硬接），所以变道是 S 形；
+    车道图 = 后继边（代价=真实行驶距离，含转弯/连接缺口惩罚）+ 邻道变道边（代价=变道前进
+    距离 + 机动惩罚）。**变道每米代价高于直行**，因此只有目标车道不连通时才会变道。
+    变道在"当前位置"做横向平滑过渡（不是走到车道末端再硬接），所以变道是 S 形；
     路口转弯由后继车道自然衔接，最后统一重采样 + 平滑，折角被磨圆。
     """
     if road_model is None or not getattr(road_model, "available", False):
         return None
     path, cost = _astar_lanes(road_model, start_lane, end_lane,
                               allow_lane_change=allow_lane_change, max_lanes=max_lanes,
-                              lane_change_cost=lane_change_cost, turn_penalty=turn_penalty)
+                              lane_change_cost=lane_change_cost, turn_penalty=turn_penalty,
+                              lane_change_len=lane_change_len)
     if path is None:
         return None
     pts: List[np.ndarray] = []
@@ -409,6 +499,10 @@ def plan_route(road_model, start_lane, start_arc: float, end_lane, end_arc: floa
                 L = min(float(lane_change_len), max(8.0, a_total - cur_arc), max(8.0, total))
                 segA = _trim_lane(PA, cur_arc, min(a_total, cur_arc + L))
                 s0B = project_arc(P, segA[0][[0, 2]]) if segA is not None else 0.0
+                # 最后一条边就是变道时：变道不要"冲过头"跑到用户点的终点之后
+                # （否则车会停在终点前方几米到十几米处）
+                if is_last:
+                    L = min(L, max(3.0, float(end_arc) - float(s0B)))
                 segB = _trim_lane(P, s0B, min(total, s0B + L))
                 if segA is not None and segB is not None and len(segA) >= 2 and len(segB) >= 2:
                     n = min(len(segA), len(segB))
@@ -443,7 +537,16 @@ def plan_route(road_model, start_lane, start_arc: float, end_lane, end_arc: floa
         cur_lane, cur_arc = lid, (0.0 if a1 >= total - 0.3 else a1)
     if len(pts) < 2:
         return None
-    P = _resample(np.asarray(pts, dtype=np.float64), sample_step)
+    # 目标车道可能因为"最后一段太短/经变道衔接"而没被记入 lane_ids，这里补上末尾车道，
+    # 保证 lane_ids 的首尾就是实际起点/终点所在车道。
+    last_lane = str(path[-1][0])
+    if not lane_ids or str(lane_ids[-1]) != last_lane:
+        lane_ids.append(last_lane)
+    # 先去折返尖点（只删真正的反向折返），再重采样 + 平滑。
+    # 注意：**不要在平滑之后再删顶点**——删点会让相邻转角变得更尖锐，反而制造新的尖点。
+    P = _remove_backtracks(np.asarray(pts, dtype=np.float64))
+    P = _dedup_polyline(P)
+    P = _resample(np.asarray(P, dtype=np.float64), sample_step)
     P = _smooth_polyline(P, smooth_passes, smooth_window)
     return {"pts": P, "lane_ids": lane_ids, "num_lanes": len(lane_ids),
             "cost": round(float(cost), 1), "length_m": round(polyline_total(P), 1)}

@@ -1666,6 +1666,8 @@ class DGGTStudio {
         if (roadVehicleBtn) roadVehicleBtn.addEventListener('click', () => this.createRoadVehicle());
         const pickStartBtn = document.getElementById('roadPickStartBtn');
         if (pickStartBtn) pickStartBtn.addEventListener('click', () => this._startRoadPick('start'));
+        const pickLaneBtn = document.getElementById('roadPickLaneBtn');
+        if (pickLaneBtn) pickLaneBtn.addEventListener('click', () => this._startRoadPick('lane'));
         const pickEndBtn = document.getElementById('roadPickEndBtn');
         if (pickEndBtn) pickEndBtn.addEventListener('click', () => this._startRoadPick('end'));
         const routeBtn = document.getElementById('roadRouteBtn');
@@ -2165,41 +2167,75 @@ class DGGTStudio {
         if (el) el.textContent = msg || '';
     }
 
-    // 进入视图拾取模式：下一次在 3D 视图点击地面 → 吸附最近车道
+    // 进入视图拾取模式：'start' / 'end' 选起终点，'lane' 直接交互选车道
     _startRoadPick(mode) {
         if (!this.viewer3d) return;
         this._roadPicks = this._roadPicks || { start: null, end: null };
         this.viewer3d.setPickMode(mode);
-        this._setRoadStatus(mode === 'start'
-            ? '请在 3D 视图中点击「起点」位置（会吸附到最近的车道中心线）'
-            : '请在 3D 视图中点击「终点」位置（会吸附到最近的车道中心线）');
+        const msg = {
+            start: '请在 3D 视图中点击「起点」位置（会吸附到最近的车道中心线）',
+            end: '请在 3D 视图中点击「终点」位置（会自动选与起点同向的车道，避免掉头）',
+            lane: '请在 3D 视图中点击目标车道（吸附到最近车道中心线并同步到上方下拉框）'
+        };
+        this._setRoadStatus(msg[mode] || '');
     }
 
-    // 视图拾取回调：世界点 → /api/road/nearest_lane → 记录起点/终点
+    // 视图拾取回调：世界点 → /api/road/nearest_lane → 选车道 或 记录起点/终点
     async _onRoadPick(mode, worldPt) {
         this._roadPicks = this._roadPicks || { start: null, end: null };
         const x = Number(worldPt[0]), z = Number(worldPt[2]);
-        this._setRoadStatus(`已拾取 ${mode === 'start' ? '起点' : '终点'} (${x.toFixed(1)}, ${z.toFixed(1)})，正在吸附车道…`);
+        this._setRoadStatus(`已拾取 (${x.toFixed(1)}, ${z.toFixed(1)})，正在吸附车道…`);
         try {
+            const body = { scene_id: this.state.sceneId, xz: [x, z] };
+            // 终点：方向优先吸附（与起点同向），避免因对向车道近 0.1m 就吸附到对向车道
+            if (mode === 'end' && this._roadPicks.start && this._roadPicks.start.dir) {
+                body.prefer_dir = this._roadPicks.start.dir;
+            }
             const r = await fetch(`${API_BASE}/road/nearest_lane`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ scene_id: this.state.sceneId, xz: [x, z] })
+                body: JSON.stringify(body)
             });
             const d = await r.json();
             if (!d.success) { this._setRoadStatus('吸附车道失败: ' + (d.detail || '未知错误')); return; }
             const snap = d.snap || [];
-            const pick = { xz: [snap[0], snap[2]], lane_id: String(d.lane_id), arc: d.arc, dist: d.dist_m };
+            const pick = {
+                xz: [snap[0], snap[2]], lane_id: String(d.lane_id), arc: d.arc,
+                dist: d.dist_m, dir: d.dir || null, len: d.length_m
+            };
+            if (mode === 'lane') {
+                // 交互选车道：同步到下拉框，之后可直接"在选中的车道上放置车辆"
+                const sel = document.getElementById('roadLaneSelect');
+                if (sel) {
+                    if (!Array.from(sel.options).some(o => o.value === pick.lane_id)) {
+                        const op = document.createElement('option');
+                        op.value = pick.lane_id;
+                        op.textContent = `车道 ${pick.lane_id} · ${pick.len}m · （视图拾取）`;
+                        sel.appendChild(op);
+                    }
+                    sel.value = pick.lane_id;
+                }
+                this._roadPicks.lane = pick;
+                if (this.viewer3d && d.lane_pts && d.lane_pts.length > 1) {
+                    this.viewer3d.setRoutePreview(d.lane_pts, null);   // 高亮选中的车道中心线
+                }
+                this._setRoadStatus(
+                    `已选中车道 ${pick.lane_id}（长 ${pick.len}m，横向偏差 ${pick.dist}m，弧长 ${pick.arc}m）` +
+                    '　→ 点「在选中的车道上放置车辆」即可放置' + (d.note ? '\n' + d.note : ''));
+                return;
+            }
             this._roadPicks[mode] = pick;
-            this._refreshRoadPicks();
+            this._refreshRoadPicks(d.note);
         } catch (e) {
             this._setRoadStatus('吸附车道失败: ' + e.message);
         }
     }
 
-    _refreshRoadPicks() {
+    _refreshRoadPicks(note) {
         const p = this._roadPicks || {};
         const fmt = (q) => q ? `车道${q.lane_id}@${Number(q.arc).toFixed(1)}m(偏${Number(q.dist).toFixed(1)}m)` : '未选';
-        this._setRoadStatus(`起点：${fmt(p.start)}　终点：${fmt(p.end)}${p.start && p.end ? '　→ 可点「自动算路并放置」' : ''}`);
+        let msg = `起点：${fmt(p.start)}　终点：${fmt(p.end)}${p.start && p.end ? '　→ 可点「自动算路并放置」' : ''}`;
+        if (note) msg += '\n' + note;
+        this._setRoadStatus(msg);
         // 若两端都有，先用 /road/route (create=false) 预览路线
         if (p.start && p.end) this._previewRoute();
     }
