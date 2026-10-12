@@ -3760,6 +3760,65 @@ async def scene_map_endpoint(scene_id: str, kinds: Optional[str] = None,
     return payload
 
 
+class RoadVehicleRequest(BaseModel):
+    """在指定车道上放置一辆"严格沿路线行驶"的车辆。"""
+    scene_id: str
+    lane_id: str
+    direction: str = "forward"        # forward | backward
+    speed_mps: float = 8.0
+    start_frame: int = 0
+    num_frames: int = 30
+    fps: float = 10.0
+    extend_m: float = 0.0             # >0：沿后继车道继续延伸路线
+    model: str = "default"            # default（主车备用模型）| custom（指定 ply）
+    ply_path: Optional[str] = None
+    dims: Optional[List[float]] = None
+    scale: Optional[float] = None
+    type_name: Optional[str] = None
+
+
+@app.get("/api/road/lanes")
+async def road_lanes(scene_id: str, min_len: float = 6.0, include_pts: bool = True,
+                     limit: int = 600):
+    """列出场景高精地图里可选的车道（供前端选路线）。"""
+    import route_entity, road_rules
+    renderer = get_scene_or_404(scene_id)
+    scene_path = getattr(renderer, "scene_path", None)
+    rm = road_rules.get_road_model(scene_path) if scene_path else None
+    lanes = route_entity.list_lanes(rm, min_len=min_len, include_pts=include_pts, limit=limit)
+    return {"success": True, "scene_id": scene_id,
+            "available": bool(rm is not None and getattr(rm, "available", False)),
+            "num": len(lanes), "lanes": lanes}
+
+
+@app.post("/api/road/vehicle")
+async def road_vehicle(request: RoadVehicleRequest):
+    """在指定车道上放置一辆"严格沿路线行驶"的车辆（默认模型 = 主车那个备用模型）。
+
+    自然语言生成模型请走 `/api/text2entity/generate` 并带 `route_lane_id`（复用整条文生实体链路）。
+    """
+    import route_entity, road_rules
+    renderer = get_scene_or_404(request.scene_id)
+    tm = get_track_manager_or_404(request.scene_id)
+    tm.fps = float(request.fps or 10.0)
+    scene_path = getattr(renderer, "scene_path", None)
+    rm = road_rules.get_road_model(scene_path) if scene_path else None
+    if rm is None or not getattr(rm, "available", False):
+        raise HTTPException(status_code=400, detail="本场景没有可用的高精地图，无法按路线放置")
+    try:
+        res = route_entity.create_route_vehicle(
+            tm, rm, request.lane_id, direction=request.direction,
+            speed_mps=request.speed_mps, start_frame=request.start_frame,
+            num_frames=request.num_frames, fps=request.fps, extend_m=request.extend_m,
+            model=request.model, ply_path=request.ply_path, dims=request.dims,
+            scale=request.scale, type_name=request.type_name, source="road_default")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"按路线放置失败: {e}")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("reason", "创建失败"))
+    return {"success": True, **res}
+
+
 @app.get("/api/scene3d/{scene_id}/frame/{frame_idx}")
 async def get_scene3d(scene_id: str, frame_idx: int):
     """获取某一帧的 3D 场景元信息（用于自由视角浏览/编辑）。
@@ -5297,6 +5356,11 @@ class Text2EntityRequest(BaseModel):
     lane_ref: Optional[int] = None          # 初始车道参照车
     lane_offset: float = 0.0                # 相对参照车右向量的横向偏移（±3.5 = 旁边一条车道）
     impact_frame: Optional[int] = None      # 期望撞击帧（相对场景帧号），用于轨迹收口
+    # ---- "在指定车道上严格沿路线行驶"：给了 route_lane_id 就按高精地图车道铺轨迹 ----
+    route_lane_id: Optional[str] = None     # 目标车道 id（来自 /api/road/lanes）
+    route_direction: str = "forward"        # forward | backward
+    route_speed_mps: Optional[float] = None # 沿路线速度（None=用 request.speed 或车道限速）
+    route_extend_m: float = 0.0             # >0：沿后继车道继续延伸路线
 
 
 class Text2EntityReplanRequest(BaseModel):
@@ -5485,7 +5549,29 @@ async def text2entity_generate(request: Text2EntityRequest):
             if cid is not None and len(tm.get_track_frames(int(cid))) > 0:
                 rel_ref = int(cid)
                 break
-        if rel_ref is not None:
+        if getattr(request, "route_lane_id", None):
+            # 指定了车道 → **严格沿高精地图路线**铺轨迹（不走"相对参照车/自车"的老逻辑）
+            import route_entity, road_rules as _rr
+            _sp = getattr(renderer, "scene_path", None)
+            rm = _rr.get_road_model(_sp) if _sp else None
+            route = route_entity.build_route(
+                rm, request.route_lane_id,
+                extend_m=float(getattr(request, "route_extend_m", 0.0) or 0.0))
+            if route is None or len(route) < 2:
+                raise HTTPException(status_code=400, detail="指定车道没有可用中心线（或地图不可用）")
+            rframes = list(range(int(request.frame_idx), int(request.frame_idx) + int(num_frames) + 1))
+            rspeed = getattr(request, "route_speed_mps", None)
+            if rspeed is None:
+                rspeed = float(request.speed) if float(request.speed or 0.0) > 0 else float(rm.speed_limit_mps(request.route_lane_id))
+            rposes = route_entity.route_poses(
+                tm, route, rframes, 10.0, float(rspeed),
+                backward=str(getattr(request, "route_direction", "forward")).lower() in ("backward", "back", "reverse"),
+                ground=getattr(tm, "ground_y_at", None))
+            if len(rposes) < 2:
+                raise HTTPException(status_code=400, detail="路线太短或速度过慢，生成的帧不足 2 帧")
+            plan = {"ok": True, "poses": rposes}
+            mode_used = "route(lane %s %s)" % (request.route_lane_id, getattr(request, "route_direction", "forward"))
+        elif rel_ref is not None:
             plan = await asyncio.to_thread(
                 nl.plan_relative_collision_free, tm, dims_tight,
                 ref_track=int(rel_ref), same_dir=bool(getattr(request, "same_dir", True)),

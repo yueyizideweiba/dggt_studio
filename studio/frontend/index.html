@@ -9,7 +9,7 @@
     <meta http-equiv="Expires" content="0">
     <title>DGGT Studio - 4DGS动态物体编辑画布</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260925m">
+    <link rel="stylesheet" href="styles.css?v=20260925n">
 </head>
 <body>
     <div id="app">
@@ -224,6 +224,61 @@
                         </div>
                         <div id="cornerCaseStatus" class="cc-status"></div>
                         <div id="cornerPhasePanel" class="cc-phase-panel"></div>
+                    </div>
+                </div>
+
+                <div class="panel-section panel-road-vehicle">
+                    <div class="panel-header">
+                        <h3>道路车辆（沿路线行驶）</h3>
+                    </div>
+                    <div class="corner-case-panel">
+                        <div class="form-group">
+                            <label>路线（高精地图车道中心线）</label>
+                            <select id="roadLaneSelect" class="cc-select">
+                                <option value="">（加载车道中…）</option>
+                            </select>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group half">
+                                <label>行驶方向</label>
+                                <select id="roadDirection" class="cc-select">
+                                    <option value="forward">正向（沿车道）</option>
+                                    <option value="backward">反向</option>
+                                </select>
+                            </div>
+                            <div class="form-group half">
+                                <label>速度 m/s</label>
+                                <input type="number" id="roadSpeed" value="8" min="0.5" max="35" step="0.5">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group half">
+                                <label>延伸 m（沿后继车道）</label>
+                                <input type="number" id="roadExtend" value="0" min="0" max="300" step="10">
+                            </div>
+                            <div class="form-group half">
+                                <label>帧数</label>
+                                <input type="number" id="roadNumFrames" value="30" min="2" max="600">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>外观模型</label>
+                            <select id="roadModel" class="cc-select">
+                                <option value="default">默认模型（主车备用模型）</option>
+                                <option value="nl">自然语言生成</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="roadPromptWrap" style="display:none;">
+                            <label>自然语言描述</label>
+                            <input type="text" id="roadPrompt" placeholder="例如 一辆白色厢式货车 / 一辆红色轿车">
+                        </div>
+                        <div class="button-row">
+                            <button id="roadVehicleBtn" class="btn btn-primary btn-block">在选中的车道上放置车辆</button>
+                        </div>
+                        <div class="button-row">
+                            <button id="reloadRoadLanesBtn" class="btn btn-secondary btn-block">重新加载车道列表</button>
+                        </div>
+                        <div id="roadVehicleStatus" class="cc-status"></div>
                     </div>
                 </div>
 
@@ -1116,9 +1171,9 @@
 
     <script src="https://cdn.jsdelivr.net/npm/vue@3.3.4/dist/vue.global.prod.js"></script>
     <!-- 3D 自由视角视图（服务端渲染，无需 WebGL 高斯库） -->
-    <script src="viewer3d.js?v=20260925m"></script>
-    <script src="app.js?v=20260925m"></script>
+    <script src="viewer3d.js?v=20260925n"></script>
+    <script src="app.js?v=20260925n"></script>
     <!-- 可折叠面板：只包裹既有 DOM，不改 id，放在 app.js 之后自初始化 -->
-    <script src="ui-panels.js?v=20260925m"></script>
+    <script src="ui-panels.js?v=20260925n"></script>
 </body>
 </html>

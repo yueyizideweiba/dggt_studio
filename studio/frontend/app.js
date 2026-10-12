@@ -766,6 +766,7 @@ class DGGTStudio {
                 this.loadEgoInfo();
                 this.loadSceneMap();          // 高精地图（道路）图层
                 this._loadPairwiseZones(0, this.state.totalFrames);   // 全局两两相态（常驻）
+                this._loadRoadLanes();                                 // 道路车辆：可选车道列表
                 this.updateStatus(`场景已加载: ${this.state.sceneId}`);
             }
         } catch (error) {
@@ -1659,6 +1660,16 @@ class DGGTStudio {
         if (evadeBtn) evadeBtn.addEventListener('click', () => this.evadeSelected());
         const applyPairwiseBtn = document.getElementById('applyPairwiseSelectionBtn');
         if (applyPairwiseBtn) applyPairwiseBtn.addEventListener('click', () => this.applyPairwiseSelection());
+        // 道路车辆（沿路线行驶）
+        const roadVehicleBtn = document.getElementById('roadVehicleBtn');
+        if (roadVehicleBtn) roadVehicleBtn.addEventListener('click', () => this.createRoadVehicle());
+        const reloadRoadLanesBtn = document.getElementById('reloadRoadLanesBtn');
+        if (reloadRoadLanesBtn) reloadRoadLanesBtn.addEventListener('click', () => this._loadRoadLanes());
+        const roadModelSel = document.getElementById('roadModel');
+        if (roadModelSel) roadModelSel.addEventListener('change', () => {
+            const wrap = document.getElementById('roadPromptWrap');
+            if (wrap) wrap.style.display = roadModelSel.value === 'nl' ? '' : 'none';
+        });
         const clearBtn = document.getElementById('clearCornerCaseBtn');
         if (clearBtn) clearBtn.addEventListener('click', () => this.clearCornerCase());
         const jumpBtn = document.getElementById('jumpCriticalFrameBtn');
@@ -2056,6 +2067,83 @@ class DGGTStudio {
         const statusEl = document.getElementById('cornerCaseStatus');
         if (statusEl) {
             statusEl.innerHTML = `<div class="cc-phase-story">${stories.map(s => this._escapeHtml(s)).join('<br>')}</div>`;
+        }
+    }
+
+    async _loadRoadLanes() {
+        const sel = document.getElementById('roadLaneSelect');
+        const statusEl = document.getElementById('roadVehicleStatus');
+        if (!sel || !this.state.sceneId) return;
+        sel.innerHTML = '<option value="">（加载中…）</option>';
+        try {
+            const r = await fetch(`${API_BASE}/road/lanes?scene_id=${encodeURIComponent(this.state.sceneId)}&min_len=6`);
+            const d = await r.json();
+            if (!d.success || !d.available || !(d.lanes || []).length) {
+                sel.innerHTML = '<option value="">（本场景无可用高精地图车道）</option>';
+                if (statusEl) statusEl.textContent = d.available ? '没有足够长的车道（<6m）' : '本场景没有高精地图';
+                return;
+            }
+            sel.innerHTML = d.lanes.map(l =>
+                `<option value="${l.lane_id}">车道 ${l.lane_id} · ${l.length_m}m · 限速${l.speed_limit_mps}m/s</option>`).join('');
+            if (statusEl) statusEl.textContent = `已加载 ${d.lanes.length} 条车道，选一条即可放置沿路线行驶的车辆`;
+        } catch (e) {
+            sel.innerHTML = '<option value="">（加载失败）</option>';
+            if (statusEl) statusEl.textContent = '加载车道失败: ' + e.message;
+        }
+    }
+
+    async createRoadVehicle() {
+        const laneSel = document.getElementById('roadLaneSelect');
+        const statusEl = document.getElementById('roadVehicleStatus');
+        const laneId = laneSel ? laneSel.value : '';
+        if (!laneId) { alert('请先选择一条车道'); return; }
+        const direction = (document.getElementById('roadDirection') || {}).value || 'forward';
+        const speed = parseFloat((document.getElementById('roadSpeed') || {}).value) || 8.0;
+        const extend = parseFloat((document.getElementById('roadExtend') || {}).value) || 0.0;
+        const numFrames = parseInt((document.getElementById('roadNumFrames') || {}).value) || 30;
+        const model = (document.getElementById('roadModel') || {}).value || 'default';
+        const prompt = ((document.getElementById('roadPrompt') || {}).value || '').trim();
+        const startFrame = this.state.currentFrame;
+        if (statusEl) statusEl.textContent = '创建中…（自然语言生成需要数十秒）';
+        try {
+            let d;
+            if (model === 'nl') {
+                if (!prompt) { alert('请填写自然语言描述'); return; }
+                const r = await fetch(`${API_BASE}/text2entity/generate`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.state.sceneId, prompt: prompt, frame_idx: startFrame,
+                        num_frames: numFrames, speed: speed,
+                        route_lane_id: laneId, route_direction: direction,
+                        route_speed_mps: speed, route_extend_m: extend
+                    })
+                });
+                d = await r.json();
+                if (statusEl) statusEl.textContent = d.success
+                    ? `已用自然语言生成模型并沿车道 ${laneId} 放置` : ('失败: ' + (d.detail || '未知错误'));
+            } else {
+                const r = await fetch(`${API_BASE}/road/vehicle`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        scene_id: this.state.sceneId, lane_id: laneId, direction: direction,
+                        speed_mps: speed, start_frame: startFrame, num_frames: numFrames,
+                        extend_m: extend, model: 'default'
+                    })
+                });
+                d = await r.json();
+                if (d.success) {
+                    if (statusEl) statusEl.textContent =
+                        `已在车道 ${d.lane_id} 放置车辆 T${d.track_id}（${d.direction}，${d.speed_mps}m/s，${d.num_frames}帧，路线${d.route_len_m}m）`;
+                    this.updateStatus(`道路车辆 T${d.track_id} 已放置`);
+                } else {
+                    if (statusEl) statusEl.textContent = '失败: ' + (d.detail || '未知错误');
+                }
+            }
+            this.state.renderCache.clear();
+            if (this.viewer3d) this.viewer3d._invalidateCache();
+            await this.loadFrame(this.state.currentFrame);
+        } catch (e) {
+            if (statusEl) statusEl.textContent = '创建失败: ' + e.message;
         }
     }
 
