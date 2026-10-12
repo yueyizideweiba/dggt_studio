@@ -307,19 +307,35 @@ class TrackManager:
             return int(self.num_frames)
 
     def _pose_for_composite(self, composite_id, frame_idx):
-        """超范围帧：把渲染器的复合 object id 反查回 track，再取该帧位姿。"""
+        """把渲染器的复合 object id 反查回 track，再取该帧位姿。
+
+        **关键（修闪烁）**：动态 PLY 里的 `object_id` 是**逐帧的检测序号**，同一个物体在不同帧
+        的 raw id 会变（实测 scene 018 的 T3 在帧 3/5/7/8/9/11 的 raw id 依次是 2/1/2/3/2/2）。
+        所以反查必须用**逐帧**映射 `frame_obj_to_track[(frame, id)]`；而 `_view_raw_to_track`
+        是"每个 track 用**末帧** raw id 建的单值映射"，多个 track 的末帧 raw id 会互相撞车
+        （实测 raw 2→T7、raw 4→T12……），于是一帧里 raw 2 明明是 T3，却被当成 T7 取了 T7 的
+        位姿 → T3 被挪到别处/判定为 None → 画面上就是"这几帧 T3 闪一下没了"。
+        `_view_raw_to_track` 仅作为**超出数据帧**（没有逐帧元数据）时的兜底。
+        """
         try:
             cid = int(composite_id)
         except (TypeError, ValueError):
             return None
-        nv = int(getattr(self.renderer, "num_views", 1) or 1)
-        view, raw = (cid // VIEW_ID_STRIDE, cid % VIEW_ID_STRIDE) if nv > 1 else (0, cid)
-        tid = self._view_raw_to_track.get((view, raw))
+        fi = int(frame_idx)
+        # 1) 逐帧映射：数据帧一律走这里（frame_obj_to_track 的键就是渲染器给的复合 id）
+        tid = self.frame_obj_to_track.get((fi, cid))
+        # 2) 兜底：超出数据帧 / 多视角下键的编码差异
+        if tid is None:
+            nv = int(getattr(self.renderer, "num_views", 1) or 1)
+            view, raw = (cid // VIEW_ID_STRIDE, cid % VIEW_ID_STRIDE) if nv > 1 else (0, cid)
+            tid = self.frame_obj_to_track.get((fi, raw))
+            if tid is None:
+                tid = self._view_raw_to_track.get((view, raw))
         if tid is None:
             return None
         if tid in self.track_deleted or tid in self.track_replaced:
             return None
-        pose = self.get_track_pose(tid, int(frame_idx))
+        pose = self.get_track_pose(tid, fi)
         if pose is None:
             return None
         return np.asarray(pose, dtype=np.float32)
@@ -2011,15 +2027,29 @@ class TrackManager:
             # 普通合成参与者：克隆 donor 高斯
             donor_track_id = s.get("donor_track_id")
             donor_raw_id = None
+            # donor 的 raw id 是**逐帧**的检测序号，必须连同"它是哪一帧的 id"一起记下来，
+            # 渲染器才知道该去加载哪一帧的外观（同一 raw id 在别的帧可能是另一个物体）。
+            donor_frame = None
             if donor_track_id is not None:
-                donor_raw_id = self.get_raw_object_id(donor_track_id, frame_idx)
+                fm = self.track_to_frames.get(int(donor_track_id)) or {}
+                if frame_idx in fm:
+                    donor_raw_id = fm[frame_idx]
+                    donor_frame = int(frame_idx)
+                elif fm:
+                    # 该帧没有 donor：退回"最后一次检测"的 raw id + 那一帧
+                    f_last = max(fm.keys())
+                    donor_raw_id = fm[f_last]
+                    donor_frame = int(f_last)
             if donor_raw_id is None:
                 donor_raw_id = s.get("donor_object_id")
-            extras.append({
+            ex = {
                 "donor_object_id": int(donor_raw_id),
                 "transform": torch.tensor(transform, device=device, dtype=torch.float32),
                 "synth_track_id": int(sid),
-            })
+            }
+            if donor_frame is not None:
+                ex["donor_frame"] = int(donor_frame)
+            extras.append(ex)
 
         # ---- 资产化：补回"这一帧漏检、但 track 仍应存在"的真实物体 ----
         # 单目检测偶发漏掉某一帧，导致那帧的逐帧元数据里没有该物体。这里用
@@ -2049,16 +2079,22 @@ class TrackManager:
             # 已经在 `_obj_appearance` 缓存里。别用 `_track_render_raw`（那是**末次**检测的
             # id，可能还没渲染到，缓存里没有 → 回退失败）。
             donor_raw = None
+            donor_frame = None
             for f2 in sorted(frames_map.keys(), reverse=True):
                 if f2 <= frame_idx:
                     donor_raw = frames_map[f2]
+                    donor_frame = int(f2)
                     break
             if donor_raw is None:
-                donor_raw = frames_map[min(frames_map.keys())]
+                donor_frame = int(min(frames_map.keys()))
+                donor_raw = frames_map[donor_frame]
             if donor_raw is None:
                 continue
             extras.append({
                 "donor_object_id": int(donor_raw),
+                # raw id 是**逐帧**序号：必须把"该 raw id 属于哪一帧"一起带上，
+                # 渲染器才能去加载正确的那一帧外观（否则可能克隆到别的物体）
+                "donor_frame": donor_frame,
                 "transform": torch.tensor(np.asarray(pose, dtype=np.float32),
                                           device=device, dtype=torch.float32),
                 "synth_track_id": None,      # 不是合成物体，别被 ego/synth 过滤误伤

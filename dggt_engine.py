@@ -515,29 +515,42 @@ class DGGTRenderer:
                         dtype=torch.int64) for uid, part in cached], dim=0)
         return cached, True, synth
 
-    def _load_donor_part(self, view: int, donor_raw: int, real_frame: int, max_tries: int = 160):
-        """取 donor 物体的外观（高斯切片），保证任何渲染顺序都能拿到。
+    def _load_donor_part(self, view: int, donor_raw: int, real_frame: int,
+                         donor_frame=None, max_tries: int = 160):
+        """取 donor 物体的外观（高斯切片），保证"帧正确 + 任何渲染顺序都能拿到"。
 
-        渲染器按帧加载 PLY 并顺手缓存外观（`_obj_appearance`），缓存**按渲染顺序**长大。
-        合成参与者 / "漏检补帧"物体是克隆 donor 外观渲染的，若用户直接跳到补帧帧
-        （其 donor 的检测帧还没被渲染过），缓存未命中 → 该物体整帧被跳过，逐帧播放时
-        表现就是"某些帧物体闪一下消失、下一帧又出现"。
+        **为什么不能只按 raw id 查缓存**：动态 PLY 的 `object_id` 是**逐帧的检测序号**，
+        同一物体跨帧会变（实测 scene 018 的 T3 在帧 3/5/7/8/9/11 的 raw id 是 2/1/2/3/2/2），
+        所以 `(view, raw_id) -> 外观` 的缓存里，同一个 key 在不同帧可能指向**不同的物体**。
+        因此优先用 `donor_frame`（这个 raw id 真正所属的那一帧）去加载外观；只有在没有
+        `donor_frame` 时才退化为"从当前帧由近到远扫描"。
 
-        这里在缓存未命中时按"离当前帧由近到远"扫描同视角的动态 PLY（全帧范围、最多
-        `max_tries` 次），找到含该 raw id 的帧就把外观缓存下来并返回。因为补帧用的 donor
-        raw id 一定来自某个真实检测帧，所以只要检测帧在范围内就一定能解析到。
+        另外，缓存是**按渲染顺序**长大的：若用户直接跳到补帧（donor 的检测帧还没渲染过），
+        缓存会未命中 → 该物体整帧被跳过（逐帧播放时就是"闪一下消失"）。所以未命中时就地
+        扫描补进缓存。
         """
         key = (int(view), int(donor_raw))
+        n_real = int(getattr(self, "num_real_frames", 0) or 0)
+        # 1) 首选：donor 自己那一帧（语义正确）
+        if donor_frame is not None:
+            try:
+                self._appearance_objects(int(donor_frame), int(view))
+            except Exception:  # noqa: BLE001
+                pass
+            part = self._obj_appearance.get(key)
+            if part is not None:
+                return part
+        # 2) 缓存命中
         part = self._obj_appearance.get(key)
         if part is not None:
             return part
-        n_real = int(getattr(self, "num_real_frames", 0) or 0)
+        # 3) 兜底：从当前帧由近到远扫描（保证任何渲染顺序都能拿到外观）
         if n_real <= 0:
             return None
-        # 全帧范围按"离当前帧的距离"排序（先往前、再往后：历史检测帧更可能有外观）
+        base = int(real_frame)
         order = []
         for d in range(0, n_real):
-            for f in (int(real_frame) - d, int(real_frame) + d):
+            for f in (base - d, base + d):
                 if 0 <= f < n_real and f not in order:
                     order.append(f)
             if len(order) >= int(max_tries):
@@ -1075,11 +1088,11 @@ class DGGTRenderer:
                         dyn_cols.append(dyn_gs["colors"][mask])
                         continue
                 # 资产化兜底：这一帧的逐帧 PLY 里没有这个 donor（检测漏帧 / 超范围帧），
-                # 回退到"该物体最后一次出现"的外观。**注意**：缓存是按渲染顺序长大的，
-                # 若用户直接跳到补帧（其 donor 的检测帧还没被渲染过），缓存会未命中 →
-                # 该帧物体就"闪一下消失"。所以这里改成 `_load_donor_part`：未命中时
-                # 就近视扫描同视角的动态 PLY 把外观补进缓存，保证任何渲染顺序都能渲染。
-                part = self._load_donor_part(int(donor_view), int(donor_raw), int(t))
+                # 回退到"该物体最后一次出现"的外观。**注意**：raw id 是逐帧序号，
+                # 必须按 extras 里带的 `donor_frame`（这个 raw id 真正属于的那一帧）去取外观，
+                # 否则同一 raw id 在别的帧可能是另一个物体；缓存按渲染顺序长大时也要能补。
+                part = self._load_donor_part(int(donor_view), int(donor_raw), int(t),
+                                             donor_frame=ex.get("donor_frame"))
                 if part is None:
                     continue
                 p_world, q_world = self._transform_gaussians(part["means"], part["quats"], transform)
