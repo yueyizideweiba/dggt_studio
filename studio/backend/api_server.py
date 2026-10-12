@@ -3932,7 +3932,20 @@ async def road_route(request: RoadRouteRequest):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"算路失败: {e}")
     if not route:
-        raise HTTPException(status_code=400, detail="无法规划到终点的路线（车道图不连通或起终点不可达）")
+        # 给出更有用的失败原因：起终点反向（需要掉头，但地图里可能没有掉头车道） vs 真不连通
+        hint = ""
+        try:
+            da = route_entity._lane_mean_dir(rm, str(request.start_lane))
+            db = route_entity._lane_mean_dir(rm, str(request.end_lane))
+            if da is not None and db is not None:
+                dot = float(np.dot(da, db))
+                if dot < -0.3:
+                    hint = ("；起点与终点在**相反方向**车道（需要掉头），但该路口/路段的高精地图里没有掉头车道"
+                            "——请把终点选到与起点同向的车道上，或选到有掉头/左转匝道的路口")
+        except Exception:  # noqa: BLE001
+            pass
+        raise HTTPException(status_code=400,
+                            detail="无法规划到终点的路线（车道图不连通或起终点不可达）" + hint)
     out: Dict[str, Any] = {
         "success": True, "lane_ids": route["lane_ids"], "num_lanes": route["num_lanes"],
         "length_m": route["length_m"], "cost": route["cost"],
